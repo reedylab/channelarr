@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Channelarr</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
+</head>
+<body class="theme-dark">
+  <!-- Header -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="logo">&#128250;</span>
+      <span>Channelarr</span>
+    </div>
+    <div class="header-actions">
+      <div class="header-group">
+        <span class="header-group-label">LIVE</span>
+        <span id="live-badge" class="badge badge-stopped">0 channels</span>
+        <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Shell -->
+  <div class="app-shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <nav class="nav">
+        <button class="nav-item active" data-view="channels">
+          <span class="nav-ic">&#128250;</span> Channels
+        </button>
+        <button class="nav-item" data-view="media">
+          <span class="nav-ic">&#127910;</span> Media
+        </button>
+        <button class="nav-item" data-view="bumps">
+          <span class="nav-ic">&#127917;</span> Bumps
+        </button>
+        <button class="nav-item" data-view="logs">
+          <span class="nav-ic">&#128220;</span> Logs
+        </button>
+        <button class="nav-item" data-view="system">
+          <span class="nav-ic">&#128200;</span> System
+        </button>
+        <button class="nav-item nav-item-parent" data-view="settings">
+          <span class="nav-ic">&#9881;</span> Settings
+          <span class="nav-arrow">&#9662;</span>
+        </button>
+        <div id="settings-subnav" class="nav-subnav"></div>
+      </nav>
+      <div class="sidebar-info">
+        <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
+        <div><strong>Live:</strong> <span id="sidebar-live">0</span></div>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="content">
+
+      <!-- CHANNELS -->
+      <section id="view-channels" class="view visible">
+        <div class="channel-grid" id="channel-grid">
+          <div class="empty-state"><div class="empty-icon">&#128250;</div>No channels yet. Create one to get started.</div>
+        </div>
+      </section>
+
+      <!-- MEDIA -->
+      <section id="view-media" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Media Library</h3>
+            <div class="panel-actions">
+              <button class="btn btn-ghost media-tab active" data-tab="movies">Movies</button>
+              <button class="btn btn-ghost media-tab" data-tab="tv">TV Shows</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <input type="text" id="media-search" class="media-search" placeholder="Search..." />
+            <div id="media-list" class="media-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- BUMPS -->
+      <section id="view-bumps" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Bump Clips</h3>
+            <div class="panel-actions">
+              <button id="rescan-bumps" class="btn btn-ghost">Rescan</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <div class="bump-download-form">
+              <h4>Download from YouTube</h4>
+              <div class="bump-dl-row">
+                <input type="text" id="bump-dl-url" class="media-search" placeholder="YouTube URL..." style="margin-bottom:0;flex:2" />
+                <input type="text" id="bump-dl-folder" class="media-search" placeholder="Folder name (e.g. nature)" style="margin-bottom:0;flex:1" />
+                <select id="bump-dl-res" style="margin-bottom:0">
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                </select>
+                <button id="bump-dl-btn" class="btn btn-primary">Download</button>
+              </div>
+            </div>
+            <div id="bumps-grid" class="bump-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- LOGS -->
+      <section id="view-logs" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Recent Logs</h3>
+            <div class="panel-actions">
+              <button id="clear-log" class="btn btn-ghost">Clear View</button>
+            </div>
+          </div>
+          <div class="log-container">
+            <pre id="log-output"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- SYSTEM -->
+      <section id="view-system" class="view">
+        <div class="stats-grid">
+          <div class="stat-card" id="cpu-card">
+            <div class="stat-card-header"><h4>CPU</h4><span class="stat-live" id="cpu-live">--%</span></div>
+            <div class="stat-chart" id="cpu-chart"></div>
+          </div>
+          <div class="stat-card" id="ram-card">
+            <div class="stat-card-header"><h4>Memory</h4><span class="stat-live" id="ram-live">--%</span></div>
+            <div class="stat-chart" id="ram-chart"></div>
+          </div>
+          <div class="stat-card" id="disk-card">
+            <div class="stat-card-header"><h4>Disk</h4><span class="stat-live" id="disk-live">--</span></div>
+            <div class="stat-chart" id="disk-chart"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHART MODAL -->
+      <div id="chart-modal-overlay" class="modal-overlay hidden">
+        <div class="modal chart-modal">
+          <div class="modal-header">
+            <h3 id="chart-modal-title">CPU</h3>
+            <button class="btn-close" id="chart-modal-close">&times;</button>
+          </div>
+          <div class="chart-modal-ranges" id="chart-modal-ranges"></div>
+          <div class="chart-modal-chart" id="chart-modal-chart"></div>
+        </div>
+      </div>
+
+      <!-- SETTINGS -->
+      <section id="view-settings" class="view">
+        <div class="settings-panel">
+          <div class="settings-main">
+            <div class="settings-header">
+              <h2 id="settings-section-title">Settings</h2>
+              <div class="settings-actions">
+                <span id="settings-status" class="settings-status"></span>
+                <button id="save-settings" type="button" class="btn btn-primary">Save</button>
+              </div>
+            </div>
+            <div id="settings-container" class="settings-content"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Channel Editor Modal -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">New Channel</h3>
+        <button id="modal-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-field">
+          <label>Channel Name</label>
+          <input type="text" id="ch-name" placeholder="Movie Night" />
+        </div>
+
+        <div class="setting-field ch-logo-field">
+          <label>Channel Logo</label>
+          <div class="ch-logo-row">
+            <img id="ch-logo-preview" class="ch-logo-thumb" style="display:none" alt="Logo" />
+            <input type="file" id="ch-logo-input" accept="image/png,image/jpeg" />
+            <button type="button" class="btn btn-sm btn-danger" id="ch-logo-delete" style="display:none" onclick="channelarr.deleteLogo()">Remove</button>
+          </div>
+        </div>
+
+        <div class="modal-two-col">
+          <!-- Left: current items -->
+          <div class="modal-col">
+            <h4>Content <span id="ch-item-count" class="muted">(0)</span></h4>
+            <div id="ch-items" class="ch-items-list"></div>
+          </div>
+          <!-- Right: media picker -->
+          <div class="modal-col">
+            <h4>Add Content</h4>
+            <div class="picker-tabs">
+              <button class="btn btn-ghost picker-tab active" data-ptab="movies">Movies</button>
+              <button class="btn btn-ghost picker-tab" data-ptab="tv">TV</button>
+            </div>
+            <input type="text" id="picker-search" class="media-search" placeholder="Search..." />
+            <div id="picker-list" class="picker-list"></div>
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <h4>Bumps</h4>
+          <div class="bump-cfg">
+            <label class="toggle-label">
+              <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="ch-bump-start" /> Play bumps at start
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="ch-bump-next" /> Show "Up Next" overlay
+            </label>
+            <div class="bump-cfg-row">
+              <div class="setting-field">
+                <label>Folders</label>
+                <div id="ch-bump-folders" class="bump-folders-checklist"></div>
+              </div>
+              <div class="setting-field">
+                <label>Frequency</label>
+                <select id="ch-bump-freq">
+                  <option value="between">Between each</option>
+                  <option value="2">Every 2</option>
+                  <option value="3">Every 3</option>
+                </select>
+              </div>
+              <div class="setting-field">
+                <label>Count</label>
+                <input type="number" id="ch-bump-count" value="1" min="1" max="5" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <h4>Options</h4>
+          <div class="ch-options">
+            <label class="toggle-label"><input type="checkbox" id="ch-shuffle" /> Shuffle</label>
+            <label class="toggle-label"><input type="checkbox" id="ch-loop" checked /> Loop</label>
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <h4>Schedule Preview</h4>
+          <div id="ch-schedule" class="schedule-preview"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="modal-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="modal-save" class="btn btn-primary">Save Channel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Player Modal -->
+  <div id="player-overlay" class="modal-overlay hidden">
+    <div class="modal player-modal">
+      <div class="modal-header">
+        <h3 id="player-title">Watch</h3>
+        <button id="player-close" class="btn-close">&times;</button>
+      </div>
+      <div class="player-wrap">
+        <video id="player-video" controls autoplay></video>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.API_BASE = "{{ api_base | default('/api') }}";
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="/static/ui.js?v=14"></script>
+</body>
+</html>
