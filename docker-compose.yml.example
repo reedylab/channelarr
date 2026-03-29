@@ -1,0 +1,20 @@
+services:
+  channelarr:
+    build: .
+    container_name: channelarr
+    restart: unless-stopped
+    ports:
+      - "5045:5045"
+    volumes:
+      - /path/to/media:/media:ro
+      - /path/to/bumps:/bumps
+      - /path/to/m3u:/m3u
+      - channelarr-data:/app/data
+      - channelarr-logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BASE_URL=http://your-server-ip:5045
+
+volumes:
+  channelarr-data:
+  channelarr-logs:

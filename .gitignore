@@ -1,0 +1,8 @@
+/.idea/
+/docker-compose.yml
+__pycache__/
+*.pyc
+*.log
+data/
+.env*
+.DS_Store
