@@ -1,26 +1,49 @@
-"""Channel CRUD, scheduling, and concat file generation."""
+"""Channel CRUD, schedule materialization, and position calculation."""
 
 import json
 import os
 import random
 import logging
+import subprocess
+import tempfile
+import threading
 import uuid
+from datetime import datetime, timedelta, timezone
+
+from core.nfo import read_nfo_title, read_nfo_plot
 
 CHANNELS_FILE = os.getenv("CHANNELS_FILE", "/app/data/channels.json")
 
+_file_lock = threading.Lock()
+
+# Duration cache: {filepath: seconds} — avoids re-probing unchanged files
+_duration_cache = {}
+
 
 def _load() -> list:
-    try:
-        with open(CHANNELS_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    with _file_lock:
+        try:
+            with open(CHANNELS_FILE, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
 
 
 def _save(channels: list):
-    os.makedirs(os.path.dirname(CHANNELS_FILE), exist_ok=True)
-    with open(CHANNELS_FILE, "w") as f:
-        json.dump(channels, f, indent=2)
+    with _file_lock:
+        dir_name = os.path.dirname(CHANNELS_FILE)
+        os.makedirs(dir_name, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(channels, f, indent=2, default=str)
+            os.replace(tmp_path, CHANNELS_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 class ChannelManager:
@@ -77,17 +100,52 @@ class ChannelManager:
         logging.info("[CHANNELS] Deleted channel %s", channel_id)
         return True
 
+    def save_channel(self, channel: dict):
+        """Persist an updated channel dict back to the store."""
+        channels = _load()
+        for i, ch in enumerate(channels):
+            if ch["id"] == channel["id"]:
+                channels[i] = channel
+                _save(channels)
+                return
+        # Channel not found — append it
+        channels.append(channel)
+        _save(channels)
+
+
+# ---------------------------------------------------------------------------
+# ffprobe duration
+# ---------------------------------------------------------------------------
+
+def ffprobe_duration(filepath: str) -> float:
+    """Probe file duration in seconds via ffprobe. Results are cached."""
+    if filepath in _duration_cache:
+        return _duration_cache[filepath]
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", filepath],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(result.stdout)
+        dur = float(info["format"]["duration"])
+        _duration_cache[filepath] = dur
+        return dur
+    except Exception as e:
+        logging.warning("[PROBE] ffprobe failed for %s: %s", filepath, e)
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Bump cycle helper
+# ---------------------------------------------------------------------------
 
 def _make_bump_cycle(all_clips: list, total_needed: int) -> list:
-    """Shuffle the full bump pool and tile it to fill all insertion slots.
-
-    This guarantees maximum variety — every bump plays before any repeats.
-    """
+    """Shuffle the full bump pool and tile it to fill all insertion slots."""
     if not all_clips:
         return []
     pool = list(all_clips)
     random.shuffle(pool)
-    # Tile the shuffled pool to cover total_needed picks
     result = []
     while len(result) < total_needed:
         batch = list(pool)
@@ -96,13 +154,20 @@ def _make_bump_cycle(all_clips: list, total_needed: int) -> list:
     return result[:total_needed]
 
 
+# ---------------------------------------------------------------------------
+# Transient schedule generation (ordering only, no timestamps)
+# ---------------------------------------------------------------------------
+
 def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
-    """Build the playback schedule, interleaving bumps if configured."""
+    """Build the playback schedule, interleaving bumps if configured.
+
+    Returns a list of dicts with type/path/title — no durations or timestamps.
+    Used internally by materialize_schedule().
+    """
     raw_items = list(channel.get("items", []))
     if not raw_items:
         return []
 
-    # Expand show items into individual episodes
     items = []
     for item in raw_items:
         if item.get("type") == "show" and media_library:
@@ -125,7 +190,6 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
         random.shuffle(items)
 
     bump_cfg = channel.get("bump_config", {})
-    # Backward compat: old "folder" (string) → wrap in list
     folders = bump_cfg.get("folders") or []
     if not folders and bump_cfg.get("folder"):
         folders = [bump_cfg["folder"]]
@@ -137,7 +201,7 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
     freq = bump_cfg.get("frequency", "between")
     start_bumps = bump_cfg.get("start_bumps", False)
 
-    # Figure out how many insertion points we have
+    n_insertions = 0
     if freq == "between":
         n_insertions = max(0, len(items) - 1)
     else:
@@ -147,11 +211,9 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
             n = 1
         n_insertions = sum(1 for i in range(1, len(items)) if i % n == 0)
 
-    # Add start bumps to total
     if start_bumps:
         n_insertions += 1
 
-    # Gather clips from ALL folders into one pool
     all_clips = []
     for folder in folders:
         all_clips.extend(bump_manager.get_clips(folder))
@@ -164,7 +226,6 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
 
     schedule = []
 
-    # Insert bumps at start if configured
     if start_bumps and bump_cycle:
         for _ in range(count):
             if bump_idx < len(bump_cycle):
@@ -201,49 +262,142 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
     return schedule
 
 
-def start_channel_stream(channel_id, channel_mgr, bump_mgr, media_lib, streamer_mgr, get_setting_fn):
-    """Generate schedule + concat, start FFmpeg. Returns (ok, msg)."""
-    ch = channel_mgr.get_channel(channel_id)
-    if not ch:
-        return False, "Channel not found"
-    if not ch.get("items"):
-        return False, "Channel has no content"
+# ---------------------------------------------------------------------------
+# Schedule materialization — the heart of the EPG system
+# ---------------------------------------------------------------------------
 
-    schedule = generate_schedule(ch, bump_mgr, media_library=media_lib)
+def materialize_schedule(channel: dict, bump_manager, media_library=None) -> dict:
+    """Build and persist a materialized schedule with real timestamps.
+
+    Returns the updated channel dict with:
+      - materialized_schedule: list of entries with type/path/title/desc/duration/start/stop
+      - schedule_epoch: ISO timestamp when the schedule was generated
+      - schedule_cycle_duration: total seconds for one complete cycle
+    """
+    ordered = generate_schedule(channel, bump_manager, media_library=media_library)
+    if not ordered:
+        channel["materialized_schedule"] = []
+        channel["schedule_epoch"] = datetime.now(timezone.utc).isoformat()
+        channel["schedule_cycle_duration"] = 0
+        return channel
+
+    epoch = datetime.now(timezone.utc)
+    elapsed = 0.0
+    materialized = []
+
+    for entry in ordered:
+        filepath = entry["path"]
+        duration = ffprobe_duration(filepath)
+        if duration <= 0:
+            logging.warning("[MATERIALIZE] Skipping %s — could not determine duration", filepath)
+            continue
+
+        start_time = epoch + timedelta(seconds=elapsed)
+        stop_time = start_time + timedelta(seconds=duration)
+
+        # Build title and description from NFO
+        title = entry.get("title", "") or os.path.basename(filepath)
+        desc = ""
+        if entry["type"] != "bump":
+            title = read_nfo_title(filepath)
+            desc = read_nfo_plot(filepath)
+
+        materialized.append({
+            "type": entry["type"],
+            "path": filepath,
+            "title": title,
+            "desc": desc,
+            "duration": duration,
+            "start": start_time.isoformat(),
+            "stop": stop_time.isoformat(),
+        })
+        elapsed += duration
+
+    channel["materialized_schedule"] = materialized
+    channel["schedule_epoch"] = epoch.isoformat()
+    channel["schedule_cycle_duration"] = elapsed
+
+    logging.info("[MATERIALIZE] Channel %s: %d entries, %.1f seconds (%.1f hours)",
+                 channel.get("name", channel["id"]),
+                 len(materialized), elapsed, elapsed / 3600)
+    return channel
+
+
+def materialize_all_channels(channel_mgr, bump_mgr, media_lib):
+    """Materialize schedules for all channels and persist."""
+    channels = channel_mgr.list_channels()
+    for ch in channels:
+        materialize_schedule(ch, bump_mgr, media_library=media_lib)
+        channel_mgr.save_channel(ch)
+    logging.info("[MATERIALIZE] All %d channels materialized", len(channels))
+
+
+# ---------------------------------------------------------------------------
+# Schedule position calculation
+# ---------------------------------------------------------------------------
+
+def find_schedule_position(channel: dict) -> tuple:
+    """Determine what should be playing right now and how far into it.
+
+    Returns (entry_index, seek_offset_seconds) or (None, None) if nothing to play.
+    """
+    schedule = channel.get("materialized_schedule", [])
     if not schedule:
-        return False, "Empty schedule"
+        return (None, None)
 
-    hls_base = get_setting_fn("HLS_OUTPUT_PATH", "/app/data/hls")
-    concat_path = os.path.join(hls_base, channel_id, "concat.txt")
-    generate_concat_file(schedule, concat_path)
+    epoch_str = channel.get("schedule_epoch")
+    cycle_dur = channel.get("schedule_cycle_duration", 0)
+    if not epoch_str or cycle_dur <= 0:
+        return (None, None)
 
-    def on_finished(cid):
-        ch2 = channel_mgr.get_channel(cid)
-        if not ch2:
-            return None
-        sched2 = generate_schedule(ch2, bump_mgr, media_library=media_lib)
-        if not sched2:
-            return None
-        return generate_concat_file(sched2, concat_path)
+    epoch = datetime.fromisoformat(epoch_str)
+    now = datetime.now(timezone.utc)
+    elapsed_since_epoch = (now - epoch).total_seconds()
 
-    bump_cfg = ch.get("bump_config", {})
-    ok = streamer_mgr.start_channel(
-        channel_id, concat_path,
-        loop=ch.get("loop", True),
-        on_finished=on_finished,
-        show_next=bump_cfg.get("show_next", False),
-    )
-    return ok, "Started" if ok else "Already running"
+    if not channel.get("loop", True):
+        if elapsed_since_epoch >= cycle_dur:
+            return (None, None)
+        position_in_cycle = elapsed_since_epoch
+    else:
+        position_in_cycle = elapsed_since_epoch % cycle_dur
+
+    accumulated = 0.0
+    for i, entry in enumerate(schedule):
+        entry_end = accumulated + entry["duration"]
+        if position_in_cycle < entry_end:
+            seek_offset = position_in_cycle - accumulated
+            return (i, seek_offset)
+        accumulated = entry_end
+
+    # Edge case: floating point at exact end — wrap to first
+    return (0, 0.0)
 
 
-def generate_concat_file(schedule: list, output_path: str) -> str:
-    """Write FFmpeg concat demuxer file with type metadata. Returns the file path."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w") as f:
-        for entry in schedule:
-            entry_type = entry.get("type", "content")
-            f.write(f"# type={entry_type}\n")
-            escaped = entry["path"].replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-    logging.info("[CHANNELS] Wrote concat file: %s (%d entries)", output_path, len(schedule))
-    return output_path
+def get_now_playing(channel: dict) -> dict | None:
+    """Get what's currently playing on a channel with progress info.
+
+    Returns dict with current entry + progress, or None.
+    """
+    idx, seek = find_schedule_position(channel)
+    if idx is None:
+        return None
+
+    schedule = channel.get("materialized_schedule", [])
+    entry = schedule[idx]
+    progress = seek / entry["duration"] if entry["duration"] > 0 else 0
+
+    result = {
+        "index": idx,
+        "entry": entry,
+        "seek_offset": seek,
+        "progress": min(progress, 1.0),
+    }
+
+    # Next entry
+    next_idx = idx + 1
+    if next_idx >= len(schedule) and channel.get("loop", True):
+        next_idx = 0
+    if next_idx < len(schedule):
+        result["next"] = schedule[next_idx]
+
+    return result

@@ -424,4 +424,83 @@ body.theme-dark{
   .stats-grid{grid-template-columns:1fr}
   .chart-modal-chart{height:280px}
   .bump-grid{grid-template-columns:1fr}
+  .guide-channel-label{min-width:100px;font-size:12px}
+  .guide-container{min-height:200px}
 }
+
+/* Header */
+.header-actions{display:flex;align-items:center;gap:8px}
+.output-links{display:flex;gap:6px;align-items:center}
+.output-link{
+  padding:5px 10px;border-radius:6px;font-size:12px;font-weight:600;text-decoration:none;
+  background:var(--bg-soft);border:1px solid var(--border);color:var(--muted);transition:all 0.15s;
+}
+.output-link:hover{color:var(--accent);border-color:var(--accent);background:rgba(90,169,255,.1)}
+.copy-btn{
+  background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:2px 4px;
+  margin-left:-2px;margin-right:4px;border-radius:4px;transition:color 0.15s;
+}
+.copy-btn:hover{color:var(--accent)}
+.copy-btn.copied{color:var(--ok)}
+
+/* Now Playing on channel cards */
+.ch-now-playing{
+  padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:6px;
+}
+.ch-now-label{font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--accent);margin-bottom:2px}
+.ch-now-title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ch-now-remaining{font-size:11px;color:var(--muted);margin-top:2px}
+.ch-progress-bar{
+  height:3px;background:var(--bg);border-radius:2px;margin-top:6px;overflow:hidden;
+}
+.ch-progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width 1s linear}
+.badge-schedule{background:rgba(90,169,255,.12);color:var(--accent);font-size:11px;padding:2px 8px;border-radius:4px}
+
+/* Guide view — manifold-style grid */
+.guide-controls{display:flex;align-items:center;gap:10px}
+.guide-range.active{background:var(--accent);border-color:var(--accent);color:white}
+.guide-container{overflow:hidden;position:relative}
+.guide-grid{display:grid;grid-template-columns:240px 1fr;min-height:300px}
+.guide-channels{display:flex;flex-direction:column;border-right:1px solid var(--border);position:sticky;left:0;z-index:2;background:var(--bg-elev)}
+.guide-ch-row{display:flex;align-items:center;gap:10px;padding:8px 12px;height:80px;border-bottom:1px solid var(--border);overflow:hidden}
+.guide-ch-logo{width:50px;height:50px;border-radius:6px;object-fit:contain;background:var(--bg-soft);flex-shrink:0}
+.guide-ch-logo.no-logo{display:none}
+.guide-ch-name{font-size:13px;font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.3}
+.guide-timeline{overflow-x:auto;overflow-y:hidden}
+.guide-time-header{display:flex;height:36px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-elev);z-index:1}
+.guide-time-mark{font-size:13px;color:var(--muted);padding:8px 10px;border-left:1px solid var(--border);flex-shrink:0}
+.guide-rows{position:relative}
+.guide-row{display:flex;height:80px;border-bottom:1px solid var(--border);position:relative}
+.guide-prog{
+  height:100%;display:flex;align-items:center;gap:6px;padding:0 8px;
+  font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  border-right:1px solid rgba(0,0,0,.15);cursor:pointer;transition:filter 0.1s;
+  flex-shrink:0;border-radius:3px;
+}
+.guide-prog:hover{filter:brightness(1.2)}
+.guide-prog.gp-movie{background:rgba(90,169,255,.25);color:var(--accent)}
+.guide-prog.gp-episode,.guide-prog.gp-tv{background:rgba(139,92,246,.25);color:var(--accent-2)}
+.guide-prog.gp-default{background:var(--bg-soft);color:var(--text)}
+.guide-prog.gp-now{outline:2px solid var(--accent);outline-offset:-2px}
+.gp-icon{height:28px;width:auto;border-radius:3px;object-fit:cover;flex-shrink:0}
+.gp-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.guide-now-line{position:absolute;top:0;bottom:0;width:2px;background:var(--danger);z-index:3;pointer-events:none}
+.guide-empty{grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)}
+
+/* Guide programme detail popover */
+#guide-prog-detail{
+  position:fixed;z-index:200;
+  background:var(--bg-elev);border:1px solid var(--border);
+  border-radius:10px;padding:14px 16px;
+  max-width:420px;min-width:240px;
+  box-shadow:0 12px 32px rgba(0,0,0,.5);
+  animation:gpd-in .15s ease;
+}
+@keyframes gpd-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.gpd-inner{display:flex;gap:14px;align-items:flex-start}
+.gpd-poster{width:70px;height:auto;border-radius:6px;object-fit:cover;flex-shrink:0;background:var(--bg-soft)}
+.gpd-info{min-width:0;flex:1}
+.gpd-title{font-weight:600;font-size:15px;margin-bottom:4px}
+.gpd-time{font-size:12px;color:var(--muted);margin-bottom:8px}
+.gpd-desc{font-size:13px;line-height:1.5;color:var(--text)}
+.gpd-nodesc{color:var(--muted);font-style:italic}

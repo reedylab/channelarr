@@ -11,14 +11,15 @@ let channels = [];
 let movies = [];
 let tvShows = [];
 let bumpData = {};
-let editingChannel = null; // null = new, otherwise channel obj
+let editingChannel = null;
 let editorItems = [];
 let pickerTab = "movies";
-let pickerShowEpisodes = null; // {path, title, episodes[]}
+let pickerShowEpisodes = null;
 let settingsSchema = {};
 let settingsOriginal = {};
 let settingsModified = {};
 let activeSettingsSection = "";
+let guideHours = 3;
 
 // Log state
 let tailPos = 0, tailInode = null;
@@ -36,7 +37,6 @@ $$(".nav-item").forEach(btn => {
       if (isExp) {
         settingsSubnav.classList.remove("expanded");
         par.classList.remove("expanded");
-        // go to channels
         switchView("channels");
       } else {
         settingsSubnav.classList.add("expanded");
@@ -65,6 +65,7 @@ function switchView(view) {
   $$(".view").forEach(v => v.classList.toggle("visible", v.id === `view-${view}`));
 
   if (view === "channels") loadChannels();
+  if (view === "guide") loadGuide();
   if (view === "media") loadMediaView();
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
@@ -86,14 +87,65 @@ async function updateStatus() {
   try {
     const r = await fetch(`${API}/status`);
     const d = await r.json();
-    const running = d.channels_running || 0;
+    const streaming = d.channels_streaming || 0;
     const total = d.channels_total || 0;
-    $("#live-badge").textContent = `${running} live`;
-    $("#live-badge").className = running > 0 ? "badge badge-running" : "badge badge-stopped";
     $("#sidebar-total").textContent = total;
-    $("#sidebar-live").textContent = running;
+    $("#sidebar-streaming").textContent = streaming;
   } catch(e) {}
 }
+
+// ─── Header buttons ───
+$("#soft-refresh-btn").addEventListener("click", async () => {
+  try {
+    const r = await fetch(`${API}/schedule/refresh`, {method: "POST"});
+    const d = await r.json();
+    toast("success", d.message || "Refreshed");
+  } catch(e) { toast("error", "Refresh failed"); }
+});
+
+$("#hard-regen-btn").addEventListener("click", async () => {
+  if (!confirm("Regenerate all channel schedules? This stops any running streams.")) return;
+  const btn = $("#hard-regen-btn");
+  try {
+    btn.disabled = true;
+    btn.textContent = "Working...";
+    const r = await fetch(`${API}/schedule/regenerate`, {method: "POST"});
+    const d = await r.json();
+    toast("success", d.message || "Regenerated");
+    loadChannels();
+    if ($("#view-guide").classList.contains("visible")) loadGuide();
+  } catch(e) {
+    toast("error", "Regeneration failed");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Regenerate";
+  }
+});
+
+// Copy URL buttons (matches manifold behavior)
+function copyToClipboard(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
+$$("[data-copy-path]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const path = btn.dataset.copyPath;
+    const url = window.location.protocol + "//" + window.location.host + path;
+    copyToClipboard(url);
+    btn.classList.add("copied");
+    btn.textContent = "\u2713";
+    setTimeout(() => { btn.classList.remove("copied"); btn.innerHTML = "\u2398"; }, 1500);
+    toast("success", "Copied: " + url);
+  });
+});
 
 // ─── Channels ───
 async function loadChannels() {
@@ -111,12 +163,7 @@ function renderChannels() {
     return;
   }
   grid.innerHTML = channels.map(ch => {
-    const st = ch.status || {};
-    const running = st.running;
-    const uptimeStr = running ? formatUptime(st.uptime || 0) : "";
-    const statusBadge = running
-      ? `<span class="badge status-live">Live ${uptimeStr}</span>`
-      : `<span class="badge status-off">Off</span>`;
+    const np = ch.now_playing;
     const items = ch.items || [];
     const bc = ch.bump_config || {};
     const meta = [];
@@ -126,6 +173,32 @@ function renderChannels() {
     if (ch.shuffle) meta.push("Shuffle");
     if (ch.loop) meta.push("Loop");
     const logoUrl = `${API}/logo/${ch.id}`;
+
+    // Now playing info
+    let nowPlayingHtml = "";
+    if (np && np.entry) {
+      const pct = Math.round((np.progress || 0) * 100);
+      const title = np.entry.title || "Unknown";
+      const remaining = np.entry.duration ? formatDuration(np.entry.duration - np.seek_offset) : "";
+      nowPlayingHtml = `
+        <div class="ch-now-playing">
+          <div class="ch-now-label">NOW PLAYING</div>
+          <div class="ch-now-title">${esc(title)}</div>
+          ${remaining ? `<div class="ch-now-remaining">${remaining} remaining</div>` : ""}
+          <div class="ch-progress-bar"><div class="ch-progress-fill" style="width:${pct}%"></div></div>
+        </div>`;
+    } else {
+      nowPlayingHtml = `<div class="ch-now-playing"><div class="ch-now-label">NO SCHEDULE</div></div>`;
+    }
+
+    // Schedule info
+    const cycleDur = ch.schedule_cycle_duration || 0;
+    const schedInfo = cycleDur > 0
+      ? `Cycle: ${formatDuration(cycleDur)}`
+      : "";
+    const schedEntries = (ch.materialized_schedule || []).length;
+    if (schedEntries > 0) meta.push(`${schedEntries} scheduled`);
+
     return `
       <div class="channel-card" data-id="${ch.id}">
         <div class="channel-card-logo-row">
@@ -134,14 +207,12 @@ function renderChannels() {
         <div class="channel-card-body">
           <div class="channel-card-header">
             <h3>${esc(ch.name)}</h3>
-            ${statusBadge}
+            ${schedInfo ? `<span class="badge badge-schedule">${schedInfo}</span>` : ""}
           </div>
+          ${nowPlayingHtml}
           <div class="channel-card-meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>
           <div class="channel-card-actions">
-            ${running
-              ? `<button class="btn btn-sm btn-danger" onclick="channelarr.stopChannel('${ch.id}')">Stop</button>
-                 <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>`
-              : `<button class="btn btn-sm" onclick="channelarr.startChannel('${ch.id}')">Start</button>`}
+            <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
             <button class="btn btn-sm" onclick="channelarr.editChannel('${ch.id}')">Edit</button>
             <button class="btn btn-sm" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
           </div>
@@ -156,27 +227,16 @@ function formatUptime(s) {
   return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
 }
 
+function formatDuration(s) {
+  s = Math.round(s);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  return `${h}h ${m}m`;
+}
+
 window.channelarr = {};
-
-channelarr.startChannel = async function(id) {
-  try {
-    const r = await fetch(`${API}/channels/${id}/start`, {method:"POST"});
-    const d = await r.json();
-    toast(d.ok ? "success" : "error", d.message);
-    loadChannels();
-    updateStatus();
-  } catch(e) { toast("error", "Failed to start channel"); }
-};
-
-channelarr.stopChannel = async function(id) {
-  try {
-    const r = await fetch(`${API}/channels/${id}/stop`, {method:"POST"});
-    const d = await r.json();
-    toast(d.ok ? "success" : "info", d.message);
-    loadChannels();
-    updateStatus();
-  } catch(e) { toast("error", "Failed to stop channel"); }
-};
 
 channelarr.deleteChannel = async function(id) {
   if (!confirm("Delete this channel?")) return;
@@ -216,7 +276,6 @@ function openEditor(ch) {
   $("#ch-shuffle").checked = ch ? !!ch.shuffle : false;
   $("#ch-loop").checked = ch ? !!ch.loop : true;
 
-  // Logo preview
   const logoPreview = $("#ch-logo-preview");
   const logoInput = $("#ch-logo-input");
   const logoDelete = $("#ch-logo-delete");
@@ -232,7 +291,6 @@ function openEditor(ch) {
     logoDelete.style.display = "none";
   }
 
-  // Populate bump folder checkboxes
   const selectedFolders = bc.folders || (bc.folder ? [bc.folder] : []);
   loadBumpFolders(selectedFolders);
 
@@ -354,7 +412,6 @@ async function renderPicker() {
   const q = ($("#picker-search").value || "").toLowerCase();
 
   if (pickerShowEpisodes) {
-    // Show episodes for a show
     let eps = pickerShowEpisodes.episodes;
     if (q) eps = eps.filter(e => (e.label || "").toLowerCase().includes(q));
     list.innerHTML = `<button class="picker-back" onclick="channelarr.pickerBack()">&#8592; Back to shows</button>` +
@@ -399,18 +456,15 @@ async function renderPicker() {
         <button class="btn-add picker-show-btn" data-idx="${idx}">Episodes &rarr;</button>
       </div>
     `).join("") || '<div class="empty-state">No shows found</div>';
-    // Bind drill click via delegation — avoids inline string escaping issues
     list.querySelectorAll(".picker-show").forEach(el => {
       const idx = parseInt(el.dataset.idx);
       const s = filtered[idx];
       const drillHandler = (e) => { e.stopPropagation(); channelarr.drillShow(s.path, s.title); };
       el.querySelector(".picker-show-btn").addEventListener("click", drillHandler);
-      // "Add Show" adds the whole show as a single item
       el.querySelector(".picker-addshow-btn").addEventListener("click", (e) => {
         e.stopPropagation();
         channelarr.addToChannel({type:"show", path:s.path, title:s.title});
       });
-      // Click on the row itself drills into episodes
       el.addEventListener("click", drillHandler);
     });
   }
@@ -440,7 +494,6 @@ function updateSchedulePreview() {
     container.innerHTML = '<div class="empty-state">Add content to see schedule</div>';
     return;
   }
-  // Simple preview: interleave bumps if enabled
   const bumpEnabled = $("#ch-bump-enabled").checked;
   const bumpFolders = getSelectedBumpFolders();
   const bumpFreq = $("#ch-bump-freq").value;
@@ -448,20 +501,14 @@ function updateSchedulePreview() {
   const startBumps = $("#ch-bump-start").checked;
 
   let sched = [];
-
-  // Bumps at start
   if (bumpEnabled && bumpFolders.length && startBumps) {
-    for (let b = 0; b < bumpCount; b++) {
-      sched.push({ type: "bump", title: `[bump]` });
-    }
+    for (let b = 0; b < bumpCount; b++) sched.push({ type: "bump", title: `[bump]` });
   }
 
   editorItems.forEach((item, i) => {
     if (bumpEnabled && bumpFolders.length && i > 0) {
       if (bumpFreq === "between" || (parseInt(bumpFreq) && i % parseInt(bumpFreq) === 0)) {
-        for (let b = 0; b < bumpCount; b++) {
-          sched.push({ type: "bump", title: `[bump]` });
-        }
+        for (let b = 0; b < bumpCount; b++) sched.push({ type: "bump", title: `[bump]` });
       }
     }
     if (item.type === "show") {
@@ -481,7 +528,6 @@ function updateSchedulePreview() {
   }).join("");
 }
 
-// Update preview on bump config changes
 ["ch-bump-enabled", "ch-bump-freq", "ch-bump-count", "ch-bump-start", "ch-bump-next"].forEach(id => {
   $(`#${id}`).addEventListener("change", updateSchedulePreview);
 });
@@ -512,19 +558,157 @@ async function saveChannel() {
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(data),
       });
-      toast("success", "Channel updated");
+      toast("success", "Channel updated — schedule regenerated");
     } else {
       await fetch(`${API}/channels`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(data),
       });
-      toast("success", "Channel created");
+      toast("success", "Channel created — schedule generated");
     }
     closeEditor();
     loadChannels();
     updateStatus();
   } catch(e) { toast("error", "Failed to save channel"); }
+}
+
+// ─── Guide View ───
+$$(".guide-range").forEach(btn => {
+  btn.addEventListener("click", () => {
+    guideHours = parseInt(btn.dataset.hours);
+    $$(".guide-range").forEach(b => b.classList.toggle("active", b === btn));
+    loadGuide();
+  });
+});
+
+async function loadGuide() {
+  try {
+    const r = await fetch(`${API}/epg/guide?hours=${guideHours}`);
+    const data = await r.json();
+    renderGuide(data);
+  } catch(e) { toast("error", "Failed to load guide"); }
+}
+
+function renderGuide(data) {
+  const grid = $("#guide-grid");
+
+  if (!data.channels || !data.channels.length) {
+    grid.innerHTML = '<div class="guide-empty">No guide data. Create channels and click Regenerate.</div>';
+    return;
+  }
+
+  const wStart = new Date(data.start).getTime();
+  const wEnd = new Date(data.end).getTime();
+  const wDur = wEnd - wStart;
+  const pxPerMs = 4000 / wDur;
+  const now = Date.now();
+
+  // Channel sidebar column
+  let chHtml = '<div class="guide-channels">';
+  chHtml += '<div class="guide-ch-row" style="height:36px"></div>'; // spacer for time header
+  data.channels.forEach(ch => {
+    const logoUrl = `${API}/logo/${ch.id}`;
+    chHtml += `<div class="guide-ch-row">
+      <img class="guide-ch-logo" src="${logoUrl}" alt="" onerror="this.classList.add('no-logo')" />
+      <span class="guide-ch-name" title="${esc(ch.name)}">${esc(ch.name)}</span>
+    </div>`;
+  });
+  chHtml += '</div>';
+
+  // Timeline column
+  let tlHtml = '<div class="guide-timeline" id="guide-tl"><div class="guide-time-header">';
+  const hourMs = 3600000;
+  const firstHour = new Date(Math.ceil(wStart / hourMs) * hourMs);
+  for (let t = firstHour.getTime(); t < wEnd; t += hourMs) {
+    const w = Math.min(hourMs, wEnd - t) * pxPerMs;
+    const label = new Date(t).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+    tlHtml += `<div class="guide-time-mark" style="width:${w}px">${label}</div>`;
+  }
+  tlHtml += '</div><div class="guide-rows" id="guide-rows" style="position:relative">';
+
+  data.channels.forEach(ch => {
+    tlHtml += '<div class="guide-row">';
+    (ch.entries || []).forEach(entry => {
+      const pStart = Math.max(new Date(entry.start).getTime(), wStart);
+      const pStop = Math.min(new Date(entry.stop).getTime(), wEnd);
+      const left = (pStart - wStart) * pxPerMs;
+      const width = Math.max(2, (pStop - pStart) * pxPerMs);
+      const isNow = now >= pStart && now < pStop;
+      const cls = entry.type === "movie" ? "gp-movie" : entry.type === "episode" ? "gp-episode" : "gp-default";
+
+      const startT = new Date(entry.start).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+      const stopT = new Date(entry.stop).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+      const posterUrl = entry.path ? `${API}/media/poster?path=${encodeURIComponent(entry.path)}` : "";
+      const imgTag = posterUrl && width > 44 ? `<img class="gp-icon" src="${posterUrl}" onerror="this.remove()">` : "";
+      const titleSpan = width > (posterUrl && width > 44 ? 80 : 60) ? `<span class="gp-title">${esc(entry.title)}</span>` : "";
+
+      const safeDesc = (entry.desc || "").replace(/"/g, "&quot;");
+      const safeTitle = (entry.title || "").replace(/"/g, "&quot;");
+      const safePoster = posterUrl.replace(/"/g, "&quot;");
+
+      tlHtml += `<div class="guide-prog ${cls} ${isNow ? "gp-now" : ""}"
+        style="position:absolute;left:${left}px;width:${width}px"
+        data-prog-title="${safeTitle}"
+        data-desc="${safeDesc}"
+        data-time="${startT} - ${stopT}"
+        data-poster="${safePoster}"
+        data-ch-id="${ch.id}" data-ch-name="${esc(ch.name)}"
+        >${imgTag}${titleSpan}</div>`;
+    });
+    tlHtml += '</div>';
+  });
+
+  // Now line
+  const nowPos = (now - wStart) * pxPerMs;
+  tlHtml += `<div class="guide-now-line" id="guide-now" style="left:${nowPos}px"></div>`;
+  tlHtml += '</div></div>';
+
+  grid.innerHTML = chHtml + tlHtml;
+
+  // Click popover on programme blocks
+  document.querySelectorAll(".guide-prog").forEach(el => {
+    el.addEventListener("click", e => {
+      e.stopPropagation();
+      const old = document.getElementById("guide-prog-detail");
+      if (old) old.remove();
+      const t = el.getAttribute("data-prog-title") || "";
+      if (!t) return;
+      const d = el.getAttribute("data-desc") || "";
+      const tm = el.getAttribute("data-time") || "";
+      const poster = el.getAttribute("data-poster") || "";
+      const chId = el.getAttribute("data-ch-id") || "";
+      const chName = el.getAttribute("data-ch-name") || "";
+
+      const pop = document.createElement("div");
+      pop.id = "guide-prog-detail";
+      pop.innerHTML = `<div class="gpd-inner">`
+        + (poster ? `<img class="gpd-poster" src="${poster}" onerror="this.remove()">` : "")
+        + `<div class="gpd-info"><div class="gpd-title">${t}</div>`
+        + `<div class="gpd-time">${tm}</div>`
+        + (d ? `<div class="gpd-desc">${d}</div>` : `<div class="gpd-desc gpd-nodesc">No description</div>`)
+        + `<button class="btn btn-sm" style="margin-top:8px" onclick="channelarr.watchChannel('${chId}','${chName.replace(/'/g,"\\'")}')">Watch</button>`
+        + `</div></div>`;
+      document.body.appendChild(pop);
+
+      const rect = el.getBoundingClientRect();
+      pop.style.top = Math.min(rect.bottom + 6, window.innerHeight - pop.offsetHeight - 10) + "px";
+      pop.style.left = Math.min(rect.left, window.innerWidth - pop.offsetWidth - 10) + "px";
+    });
+  });
+  document.addEventListener("click", () => {
+    const p = document.getElementById("guide-prog-detail");
+    if (p) p.remove();
+  });
+
+  // Scroll to now
+  const tl = $("#guide-tl");
+  if (tl) tl.scrollLeft = Math.max(0, nowPos - 200);
+}
+
+function formatTime(d) {
+  if (typeof d === "number") d = new Date(d);
+  return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 }
 
 // ─── Media Browse View ───
@@ -658,8 +842,6 @@ channelarr.previewBump = function(path, name) {
   const playerOverlay = $("#player-overlay");
   const playerVideo = $("#player-video");
   playerOverlay.classList.remove("hidden");
-
-  // Direct MP4 playback — no HLS needed
   if (activeHls) { activeHls.destroy(); activeHls = null; }
   playerVideo.src = url;
   playerVideo.play().catch(() => {});
@@ -874,8 +1056,8 @@ channelarr.watchChannel = function(id, name) {
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (data.fatal) {
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          toast("error", "Stream not available yet — retrying...");
-          setTimeout(() => hls.startLoad(), 2000);
+          toast("error", "Stream starting — please wait...");
+          setTimeout(() => hls.startLoad(), 3000);
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           hls.recoverMediaError();
         } else {
@@ -886,7 +1068,6 @@ channelarr.watchChannel = function(id, name) {
     });
     activeHls = hls;
   } else if (playerVideo.canPlayType("application/vnd.apple.mpegurl")) {
-    // Safari native HLS
     playerVideo.src = url;
     playerVideo.play();
   } else {
@@ -976,7 +1157,6 @@ function renderLineChart(containerId, timestamps, values, opts) {
   const color = opts.color || "var(--accent)";
   const maxVal = 100;
 
-  // Grid lines
   let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:100%">`;
   for (let g = 0; g <= 4; g++) {
     const y = pad.t + (ch * (1 - g / 4));
@@ -984,7 +1164,6 @@ function renderLineChart(containerId, timestamps, values, opts) {
     svg += `<text x="${pad.l - 4}" y="${y + 3}" class="chart-label" text-anchor="end">${g * 25}%</text>`;
   }
 
-  // Data points
   const n = values.length;
   const pts = values.map((v, i) => {
     const x = pad.l + (i / Math.max(1, n - 1)) * cw;
@@ -992,14 +1171,12 @@ function renderLineChart(containerId, timestamps, values, opts) {
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
 
-  // Area fill
   const firstX = pad.l;
   const lastX = (pad.l + ((n - 1) / Math.max(1, n - 1)) * cw).toFixed(1);
   const bottom = (pad.t + ch).toFixed(1);
   svg += `<polygon class="chart-area" fill="${color}" points="${firstX},${bottom} ${pts.join(" ")} ${lastX},${bottom}"/>`;
   svg += `<polyline class="chart-line" stroke="${color}" points="${pts.join(" ")}"/>`;
 
-  // Time labels
   const labelCount = Math.min(6, n);
   for (let li = 0; li < labelCount; li++) {
     const idx = Math.round(li * (n - 1) / Math.max(1, labelCount - 1));
@@ -1010,12 +1187,9 @@ function renderLineChart(containerId, timestamps, values, opts) {
   }
 
   svg += "</svg>";
-
-  // Tooltip layer
   svg += `<div class="chart-tooltip" style="display:none" id="${containerId}-tip"></div>`;
   container.innerHTML = svg;
 
-  // Mouse tooltip
   const svgEl = container.querySelector("svg");
   const tip = container.querySelector(`#${containerId}-tip`);
   svgEl.addEventListener("mousemove", (e) => {
@@ -1161,6 +1335,7 @@ loadSettings();
 setInterval(tick, 3000);
 setInterval(() => {
   if ($("#view-channels").classList.contains("visible")) loadChannels();
+  if ($("#view-guide").classList.contains("visible")) loadGuide();
 }, 10000);
 
 })();

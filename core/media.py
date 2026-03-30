@@ -82,7 +82,12 @@ class MediaLibrary:
                 m = _SE_RE.search(f)
                 season = int(m.group(1)) if m else 0
                 episode = int(m.group(2)) if m else 0
-                label = f"S{season:02d}E{episode:02d} - {name}" if m else name
+                if m:
+                    # Strip SxxExx prefix from filename to avoid duplication
+                    ep_title = _SE_RE.sub("", name).strip(" -")
+                    label = f"S{season:02d}E{episode:02d}" + (f" - {ep_title}" if ep_title else "")
+                else:
+                    label = name
                 episodes.append({
                     "id": None,
                     "season": season,

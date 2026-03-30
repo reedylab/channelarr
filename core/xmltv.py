@@ -1,80 +1,220 @@
-"""Generate XMLTV EPG for Channelarr channels."""
+"""Generate XMLTV EPG for Channelarr channels using materialized schedules.
+
+Each channel's materialized_schedule contains entries with real start/stop
+timestamps. For looping channels the schedule is projected forward to fill
+a configurable time window (default 48 hours).
+"""
 
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from xml.etree.ElementTree import Element, SubElement, ElementTree, indent
 
-BLOCK_HOURS = 4
-TOTAL_HOURS = 48
+WINDOW_HOURS = 48
 
 
 def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
-    """Write channelarr.xml with channel definitions and rolling programme blocks."""
+    """Write channelarr.xml with real programme data from materialized schedules."""
     tv = Element("tv", attrib={
         "generator-info-name": "Channelarr",
         "generator-info-url": base_url,
     })
 
     now = datetime.now(timezone.utc)
+    horizon = now + timedelta(hours=WINDOW_HOURS)
 
+    # Channel definitions
     for ch in channels:
         cid = ch["id"]
         name = ch["name"]
-
-        # <channel>
         chan_el = SubElement(tv, "channel", id=cid)
         dn = SubElement(chan_el, "display-name", lang="en")
         dn.text = name
         logo_url = f"{base_url}/api/logo/{cid}"
         SubElement(chan_el, "icon", src=logo_url)
 
+    # Programme entries
+    total_programmes = 0
     for ch in channels:
         cid = ch["id"]
-        name = ch["name"]
-        items = ch.get("items", [])
+        schedule = ch.get("materialized_schedule", [])
+        epoch_str = ch.get("schedule_epoch")
+        cycle_dur = ch.get("schedule_cycle_duration", 0)
 
-        # Build description from content items
-        desc_parts = []
-        for item in items:
-            title = item.get("title") or os.path.basename(item.get("path", ""))
-            if title:
-                desc_parts.append(title)
-        desc_text = ", ".join(desc_parts) if desc_parts else "24/7 Channel"
+        if not schedule or not epoch_str or cycle_dur <= 0:
+            # No schedule — generate placeholder blocks
+            total_programmes += _generate_placeholder_programmes(
+                tv, cid, ch["name"], now, horizon, base_url
+            )
+            continue
 
-        logo_url = f"{base_url}/api/logo/{cid}"
+        # Collect content entries, absorbing bump gaps so programmes are seamless
+        content_entries = _merge_bump_gaps(
+            _iterate_schedule_window(schedule, epoch_str, cycle_dur,
+                                      ch.get("loop", True), now, horizon)
+        )
 
-        # Generate rolling programme blocks
-        n_blocks = TOTAL_HOURS // BLOCK_HOURS
-        for b in range(n_blocks):
-            start = now + timedelta(hours=b * BLOCK_HOURS)
-            stop = start + timedelta(hours=BLOCK_HOURS)
-
+        count = 0
+        for entry in content_entries:
             prog = SubElement(tv, "programme", attrib={
-                "start": _xmltv_ts(start),
-                "stop": _xmltv_ts(stop),
+                "start": _xmltv_ts(entry["start"]),
+                "stop": _xmltv_ts(entry["stop"]),
                 "channel": cid,
             })
+
             title_el = SubElement(prog, "title", lang="en")
-            title_el.text = name
-            desc_el = SubElement(prog, "desc", lang="en")
-            desc_el.text = desc_text
+            title_el.text = entry.get("title", "")
+
+            desc = entry.get("desc", "")
+            if desc:
+                desc_el = SubElement(prog, "desc", lang="en")
+                desc_el.text = desc
+
             cat_el = SubElement(prog, "category", lang="en")
-            cat_el.text = "Channelarr"
+            if entry["type"] == "episode":
+                cat_el.text = "Series"
+            else:
+                cat_el.text = "Movie"
+
+            logo_url = f"{base_url}/api/logo/{cid}"
             SubElement(prog, "icon", src=logo_url)
+
+            count += 1
+
+        total_programmes += count
 
     indent(tv, space="  ")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    tree = ElementTree(tv)
-    with open(output_path, "wb") as f:
-        f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
-        tree.write(f, encoding="unicode" if False else "UTF-8", xml_declaration=False)
+    # Atomic write
+    dir_name = os.path.dirname(output_path)
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+            f.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
+            tree = ElementTree(tv)
+            tree.write(f, encoding="UTF-8", xml_declaration=False)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
-    logging.info("[XMLTV] Generated %s with %d channels", output_path, len(channels))
+    logging.info("[XMLTV] Generated %s: %d channels, %d programmes",
+                 output_path, len(channels), total_programmes)
 
 
-def _xmltv_ts(dt: datetime) -> str:
+def _merge_bump_gaps(entries_iter):
+    """Filter out bumps and extend each content entry's stop to the next content start.
+
+    This eliminates gaps in EPG/guide data caused by bump clips between programmes.
+    """
+    content = []
+    for entry in entries_iter:
+        if entry["type"] == "bump":
+            continue
+        content.append(dict(entry))
+
+    # Extend each entry's stop to the next entry's start
+    for i in range(len(content) - 1):
+        content[i]["stop"] = content[i + 1]["start"]
+
+    return content
+
+
+def _iterate_schedule_window(schedule: list, epoch_str: str, cycle_dur: float,
+                              loop: bool, window_start: datetime, window_end: datetime):
+    """Yield schedule entries (with projected timestamps) that overlap a time window.
+
+    For looping channels, the schedule is repeated forward from the epoch,
+    yielding entries until we exceed window_end.
+    """
+    epoch = datetime.fromisoformat(epoch_str)
+
+    if not loop:
+        # Non-looping: just yield entries that fall within the window
+        for entry in schedule:
+            entry_start = datetime.fromisoformat(entry["start"])
+            entry_stop = datetime.fromisoformat(entry["stop"])
+            if entry_stop <= window_start:
+                continue
+            if entry_start >= window_end:
+                break
+            yield {
+                **entry,
+                "start": entry_start,
+                "stop": entry_stop,
+            }
+        return
+
+    # Looping: calculate which cycle iteration contains window_start
+    elapsed_to_window_start = (window_start - epoch).total_seconds()
+    if elapsed_to_window_start < 0:
+        start_cycle = 0
+    else:
+        start_cycle = int(elapsed_to_window_start // cycle_dur)
+
+    # Start one cycle earlier to catch entries that span the window boundary
+    start_cycle = max(0, start_cycle - 1)
+
+    cycle_num = start_cycle
+    max_cycles = start_cycle + int((WINDOW_HOURS * 3600) / cycle_dur) + 3
+
+    while cycle_num <= max_cycles:
+        cycle_offset = timedelta(seconds=cycle_num * cycle_dur)
+        for entry in schedule:
+            entry_start = datetime.fromisoformat(entry["start"]) + cycle_offset - (epoch - epoch)
+            # Recalculate from epoch + cycle offset + entry offset within cycle
+            original_start = datetime.fromisoformat(entry["start"])
+            offset_in_cycle = (original_start - epoch).total_seconds()
+            projected_start = epoch + timedelta(seconds=cycle_num * cycle_dur + offset_in_cycle)
+            projected_stop = projected_start + timedelta(seconds=entry["duration"])
+
+            if projected_stop <= window_start:
+                continue
+            if projected_start >= window_end:
+                return
+
+            yield {
+                **entry,
+                "start": projected_start,
+                "stop": projected_stop,
+            }
+        cycle_num += 1
+
+
+def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: str,
+                                      start: datetime, end: datetime, base_url: str) -> int:
+    """Generate 30-minute placeholder blocks for channels without a schedule."""
+    block = timedelta(minutes=30)
+    current = start
+    count = 0
+    while current < end:
+        stop = current + block
+        prog = SubElement(tv_element, "programme", attrib={
+            "start": _xmltv_ts(current),
+            "stop": _xmltv_ts(stop),
+            "channel": channel_id,
+        })
+        title_el = SubElement(prog, "title", lang="en")
+        title_el.text = channel_name
+        desc_el = SubElement(prog, "desc", lang="en")
+        desc_el.text = f"{channel_name} — Scheduled Programming"
+        cat_el = SubElement(prog, "category", lang="en")
+        cat_el.text = "General"
+        logo_url = f"{base_url}/api/logo/{channel_id}"
+        SubElement(prog, "icon", src=logo_url)
+        current = stop
+        count += 1
+    return count
+
+
+def _xmltv_ts(dt) -> str:
     """Format datetime as XMLTV timestamp: YYYYMMDDHHmmss +0000."""
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
     return dt.strftime("%Y%m%d%H%M%S") + " +0000"

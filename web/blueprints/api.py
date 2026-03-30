@@ -13,7 +13,10 @@ import psutil
 LOGO_DIR = os.getenv("LOGO_DIR", "/app/data/logos")
 
 from core.config import get_setting, get_all_settings, save_settings
-from core.channels import generate_schedule, generate_concat_file, start_channel_stream
+from core.channels import (
+    generate_schedule, materialize_schedule, materialize_all_channels,
+    find_schedule_position, get_now_playing,
+)
 from core.xmltv import generate_channelarr_xmltv
 
 api_bp = Blueprint("api", __name__)
@@ -143,7 +146,7 @@ def _media():
 
 
 def _regenerate_m3u():
-    """Regenerate the M3U playlist file for Jellyfin."""
+    """Regenerate the M3U playlist file and XMLTV EPG."""
     m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
     base_url = get_setting("BASE_URL", "http://192.168.20.34:5045")
     channels = _channels().list_channels()
@@ -153,14 +156,15 @@ def _regenerate_m3u():
 
     with open(out, "w") as f:
         f.write("#EXTM3U\n")
-        for ch in channels:
+        for i, ch in enumerate(channels):
             cid = ch["id"]
             name = ch["name"]
+            chno = i + 1
             logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
             logo_tag = ""
             if os.path.isfile(logo_path):
                 logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
-            f.write(f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{name}"{logo_tag} group-title="Channelarr",{name}\n')
+            f.write(f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} group-title="Channelarr",{name}\n')
             f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
 
     logging.info("[M3U] Regenerated %s with %d channels", out, len(channels))
@@ -170,13 +174,6 @@ def _regenerate_m3u():
     generate_channelarr_xmltv(channels, xmltv_out, base_url)
 
 
-def _start_channel_stream(channel_id: str):
-    """Thin wrapper — delegates to shared start_channel_stream()."""
-    return start_channel_stream(
-        channel_id, _channels(), _bumps(), _media(), _streamer(), get_setting
-    )
-
-
 # ----------------------- status -----------------------
 @api_bp.get("/status")
 def api_status():
@@ -184,7 +181,7 @@ def api_status():
     running = _streamer().running_count()
     return jsonify({
         "channels_total": len(channels),
-        "channels_running": running,
+        "channels_streaming": running,
     })
 
 
@@ -195,7 +192,10 @@ def api_list_channels():
     statuses = _streamer().get_all_status()
     for ch in channels:
         st = statuses.get(ch["id"], {"running": False, "uptime": 0})
-        ch["status"] = st
+        ch["stream_status"] = st
+        # Include now-playing from schedule
+        now_playing = get_now_playing(ch)
+        ch["now_playing"] = now_playing
     return jsonify(channels)
 
 
@@ -203,6 +203,9 @@ def api_list_channels():
 def api_create_channel():
     data = request.get_json() or {}
     ch = _channels().create_channel(data)
+    # Materialize schedule for the new channel
+    materialize_schedule(ch, _bumps(), media_library=_media())
+    _channels().save_channel(ch)
     _regenerate_m3u()
     return jsonify(ch), 201
 
@@ -212,8 +215,8 @@ def api_get_channel(channel_id):
     ch = _channels().get_channel(channel_id)
     if not ch:
         return jsonify({"error": "Not found"}), 404
-    ch["status"] = _streamer().get_status(channel_id)
-    ch["schedule"] = generate_schedule(ch, _bumps(), media_library=_media())
+    ch["stream_status"] = _streamer().get_status(channel_id)
+    ch["now_playing"] = get_now_playing(ch)
     return jsonify(ch)
 
 
@@ -223,6 +226,11 @@ def api_update_channel(channel_id):
     ch = _channels().update_channel(channel_id, data)
     if not ch:
         return jsonify({"error": "Not found"}), 404
+    # Re-materialize schedule after content changes
+    materialize_schedule(ch, _bumps(), media_library=_media())
+    _channels().save_channel(ch)
+    # Stop running stream so it picks up new schedule on next request
+    _streamer().stop_channel(channel_id)
     _regenerate_m3u()
     return jsonify(ch)
 
@@ -237,17 +245,147 @@ def api_delete_channel(channel_id):
     return jsonify({"status": "deleted"})
 
 
-@api_bp.post("/channels/<channel_id>/start")
-def api_start_channel(channel_id):
-    ok, msg = _start_channel_stream(channel_id)
-    code = 200 if ok else 400
-    return jsonify({"ok": ok, "message": msg}), code
+# ----------------------- EPG / Schedule -----------------------
+@api_bp.get("/epg/now")
+def api_epg_now():
+    """Return what's currently playing on all channels."""
+    channels = _channels().list_channels()
+    result = {}
+    for ch in channels:
+        np = get_now_playing(ch)
+        if np:
+            result[ch["id"]] = {
+                "channel_name": ch["name"],
+                "now": {
+                    "title": np["entry"].get("title", ""),
+                    "desc": np["entry"].get("desc", ""),
+                    "type": np["entry"].get("type", ""),
+                    "start": np["entry"].get("start", ""),
+                    "stop": np["entry"].get("stop", ""),
+                    "duration": np["entry"].get("duration", 0),
+                    "progress": np["progress"],
+                    "seek_offset": np["seek_offset"],
+                },
+                "next": None,
+            }
+            if "next" in np:
+                result[ch["id"]]["next"] = {
+                    "title": np["next"].get("title", ""),
+                    "desc": np["next"].get("desc", ""),
+                    "type": np["next"].get("type", ""),
+                    "start": np["next"].get("start", ""),
+                    "stop": np["next"].get("stop", ""),
+                    "duration": np["next"].get("duration", 0),
+                }
+    return jsonify(result)
 
 
-@api_bp.post("/channels/<channel_id>/stop")
-def api_stop_channel(channel_id):
-    ok = _streamer().stop_channel(channel_id)
-    return jsonify({"ok": ok, "message": "Stopped" if ok else "Not running"})
+@api_bp.get("/epg/guide")
+def api_epg_guide():
+    """Return schedule entries for all channels for the next N hours.
+
+    Query params: hours (default 6)
+    """
+    from datetime import datetime, timedelta, timezone
+    from core.xmltv import _iterate_schedule_window, _merge_bump_gaps
+
+    hours = int(request.args.get("hours", "6"))
+    hours = min(hours, 48)
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=1)
+    horizon = now + timedelta(hours=hours)
+
+    channels = _channels().list_channels()
+    guide = []
+    for ch in channels:
+        schedule = ch.get("materialized_schedule", [])
+        epoch_str = ch.get("schedule_epoch")
+        cycle_dur = ch.get("schedule_cycle_duration", 0)
+
+        entries = []
+        if schedule and epoch_str and cycle_dur > 0:
+            merged = _merge_bump_gaps(
+                _iterate_schedule_window(schedule, epoch_str, cycle_dur,
+                                          ch.get("loop", True), window_start, horizon)
+            )
+            for entry in merged:
+                entries.append({
+                    "title": entry.get("title", ""),
+                    "desc": entry.get("desc", ""),
+                    "type": entry.get("type", ""),
+                    "path": entry.get("path", ""),
+                    "start": entry["start"].isoformat() if hasattr(entry["start"], "isoformat") else entry["start"],
+                    "stop": entry["stop"].isoformat() if hasattr(entry["stop"], "isoformat") else entry["stop"],
+                    "duration": entry.get("duration", 0),
+                })
+
+        guide.append({
+            "id": ch["id"],
+            "name": ch["name"],
+            "entries": entries,
+        })
+
+    # Start window 1 hour ago so user can see recent past
+    window_start = now - timedelta(hours=1)
+    window_end = now + timedelta(hours=hours)
+    return jsonify({
+        "now": now.isoformat(),
+        "start": window_start.isoformat(),
+        "end": window_end.isoformat(),
+        "hours": hours,
+        "channels": guide,
+    })
+
+
+@api_bp.post("/schedule/refresh")
+def api_schedule_refresh():
+    """Soft refresh: regenerate M3U + XMLTV from existing schedules."""
+    _regenerate_m3u()
+    return jsonify({"status": "ok", "message": "M3U and EPG refreshed."})
+
+
+@api_bp.post("/schedule/regenerate")
+def api_schedule_regenerate():
+    """Hard regenerate: re-materialize all schedules, then regen M3U + XMLTV.
+
+    Stops any running streams (they restart on next client request with the new schedule).
+    """
+    _streamer().stop_all()
+    materialize_all_channels(_channels(), _bumps(), _media())
+    _regenerate_m3u()
+    channels = _channels().list_channels()
+    return jsonify({
+        "status": "ok",
+        "message": f"Regenerated schedules for {len(channels)} channels.",
+        "channels": len(channels),
+    })
+
+
+# ----------------------- export -----------------------
+@api_bp.get("/export/m3u")
+def api_export_m3u():
+    """Serve the M3U playlist file for download."""
+    m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
+    filepath = os.path.join(m3u_path, "channelarr.m3u")
+    if not os.path.isfile(filepath):
+        _regenerate_m3u()
+    if not os.path.isfile(filepath):
+        return jsonify({"error": "M3U not yet generated"}), 404
+    return send_file(filepath, mimetype="application/octet-stream",
+                     as_attachment=True, download_name="channelarr.m3u")
+
+
+@api_bp.get("/export/xmltv")
+def api_export_xmltv():
+    """Serve the XMLTV EPG file for download."""
+    m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
+    filepath = os.path.join(m3u_path, "channelarr.xml")
+    if not os.path.isfile(filepath):
+        _regenerate_m3u()
+    if not os.path.isfile(filepath):
+        return jsonify({"error": "XMLTV not yet generated"}), 404
+    return send_file(filepath, mimetype="application/octet-stream",
+                     as_attachment=True, download_name="channelarr.xml")
 
 
 # ----------------------- media -----------------------
@@ -267,7 +405,6 @@ def api_tv_episodes():
     if not path:
         return jsonify({"error": "path is required"}), 400
     media_path = get_setting("MEDIA_PATH", "/media")
-    # Normalize both paths for comparison (resolve ../ etc but not symlinks)
     norm_path = os.path.normpath(path)
     norm_media = os.path.normpath(media_path)
     if not norm_path.startswith(norm_media + os.sep) and norm_path != norm_media:
@@ -345,11 +482,10 @@ def api_upload_logo(channel_id):
     data = f.read()
     if not data:
         return jsonify({"error": "Empty file"}), 400
-    # Validate PNG or JPEG magic bytes
     if data[:4] == b"\x89PNG":
-        pass  # valid PNG
+        pass
     elif data[:2] in (b"\xff\xd8",):
-        pass  # valid JPEG
+        pass
     else:
         return jsonify({"error": "Only PNG or JPEG allowed"}), 400
     os.makedirs(LOGO_DIR, exist_ok=True)
@@ -375,7 +511,6 @@ def api_delete_logo(channel_id):
 # ----------------------- media poster -----------------------
 @api_bp.get("/media/poster")
 def api_media_poster():
-    """Serve poster image for a media file by its path."""
     from core.nfo import find_poster
     path = request.args.get("path", "").strip()
     if not path:
@@ -390,12 +525,10 @@ def api_media_poster():
 # ----------------------- bump thumbnail -----------------------
 @api_bp.get("/bumps/thumbnail")
 def api_bump_thumbnail():
-    """Generate and serve a thumbnail frame from a bump video clip."""
     import subprocess as sp
     path = request.args.get("path", "").strip()
     if not path or not os.path.isfile(path):
         return "", 404
-    # Validate path is under BUMPS_PATH
     bumps_path = get_setting("BUMPS_PATH", "/bumps")
     if not os.path.normpath(path).startswith(os.path.normpath(bumps_path)):
         return jsonify({"error": "Invalid path"}), 403
@@ -503,10 +636,3 @@ def api_system_stats():
             "ram": list(_ram_history),
         },
     })
-
-
-# ----------------------- m3u -----------------------
-@api_bp.post("/m3u/regenerate")
-def api_m3u_regenerate():
-    _regenerate_m3u()
-    return jsonify({"status": "ok", "message": "M3U regenerated."})

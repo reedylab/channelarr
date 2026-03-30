@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -14,11 +14,12 @@
       <span>Channelarr</span>
     </div>
     <div class="header-actions">
-      <div class="header-group">
-        <span class="header-group-label">LIVE</span>
-        <span id="live-badge" class="badge badge-stopped">0 channels</span>
-        <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
+      <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
+      <div class="output-links">
+        <a href="/api/export/m3u" target="_blank" class="output-link" title="M3U Playlist URL">M3U</a><button class="copy-btn" data-copy-path="/api/export/m3u" title="Copy M3U URL">&#x2398;</button>
+        <a href="/api/export/xmltv" target="_blank" class="output-link" title="XMLTV EPG URL">EPG</a><button class="copy-btn" data-copy-path="/api/export/xmltv" title="Copy EPG URL">&#x2398;</button>
       </div>
+      <button id="soft-refresh-btn" class="btn btn-ghost btn-sm-header" title="Refresh M3U + EPG from current schedules">Refresh</button>
     </div>
   </header>
 
@@ -29,6 +30,9 @@
       <nav class="nav">
         <button class="nav-item active" data-view="channels">
           <span class="nav-ic">&#128250;</span> Channels
+        </button>
+        <button class="nav-item" data-view="guide">
+          <span class="nav-ic">&#128218;</span> Guide
         </button>
         <button class="nav-item" data-view="media">
           <span class="nav-ic">&#127910;</span> Media
@@ -50,7 +54,7 @@
       </nav>
       <div class="sidebar-info">
         <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
-        <div><strong>Live:</strong> <span id="sidebar-live">0</span></div>
+        <div><strong>Streaming:</strong> <span id="sidebar-streaming">0</span></div>
       </div>
     </aside>
 
@@ -61,6 +65,31 @@
       <section id="view-channels" class="view visible">
         <div class="channel-grid" id="channel-grid">
           <div class="empty-state"><div class="empty-icon">&#128250;</div>No channels yet. Create one to get started.</div>
+        </div>
+      </section>
+
+      <!-- GUIDE -->
+      <section id="view-guide" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>TV Guide</h3>
+            <div class="panel-actions guide-controls">
+              <button class="btn btn-ghost guide-range active" data-hours="3">3h</button>
+              <button class="btn btn-ghost guide-range" data-hours="6">6h</button>
+              <button class="btn btn-ghost guide-range" data-hours="12">12h</button>
+              <button class="btn btn-ghost guide-range" data-hours="24">24h</button>
+              <button id="hard-regen-btn" class="btn btn-primary btn-sm-header" title="Regenerate all channel schedules">Regenerate</button>
+            </div>
+          </div>
+          <div class="guide-container">
+            <div class="guide-grid" id="guide-grid">
+              <div class="guide-channels" id="guide-channels"></div>
+              <div class="guide-timeline" id="guide-timeline">
+                <div class="guide-time-header" id="guide-time-header"></div>
+                <div class="guide-rows" id="guide-rows"></div>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -282,6 +311,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=14"></script>
+  <script src="/static/ui.js?v=16"></script>
 </body>
 </html>

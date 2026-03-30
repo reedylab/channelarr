@@ -49,6 +49,23 @@ def read_nfo_title(video_path: str) -> str:
         return os.path.splitext(os.path.basename(video_path))[0]
 
 
+def read_nfo_plot(video_path: str) -> str:
+    """Read the NFO sidecar for a video file and return the plot/description.
+
+    Returns the <plot> element text, or empty string if not found.
+    """
+    nfo_path = _find_nfo(video_path)
+    if not nfo_path:
+        return ""
+    try:
+        tree = ET.parse(nfo_path)
+        root = tree.getroot()
+        return _text(root, "plot") or _text(root, "outline") or ""
+    except Exception as e:
+        logging.warning("[NFO] Failed to parse plot from %s: %s", nfo_path, e)
+        return ""
+
+
 def find_poster(video_path: str) -> str | None:
     """Find a poster image near the video file.
 
