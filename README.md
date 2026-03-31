@@ -111,12 +111,16 @@ All endpoints are under `/api`:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/health` | Health check |
 | GET | `/api/status` | Channel count and streaming count |
 | GET | `/api/channels` | List all channels with now-playing info |
 | POST | `/api/channels` | Create channel (auto-materializes schedule) |
 | GET | `/api/channels/<id>` | Get channel with schedule and now-playing |
 | PUT | `/api/channels/<id>` | Update channel (re-materializes schedule) |
 | DELETE | `/api/channels/<id>` | Delete channel |
+| GET | `/api/logo/<id>` | Get channel logo |
+| POST | `/api/logo/<id>` | Upload channel logo |
+| DELETE | `/api/logo/<id>` | Delete channel logo |
 | GET | `/api/epg/now` | Current programme on all channels |
 | GET | `/api/epg/guide?hours=6` | TV guide data for next N hours |
 | POST | `/api/schedule/refresh` | Regenerate M3U + XMLTV (soft) |
@@ -126,12 +130,16 @@ All endpoints are under `/api`:
 | GET | `/api/media/movies` | List movies |
 | GET | `/api/media/tv` | List TV shows |
 | GET | `/api/media/tv/episodes?path=...` | List episodes for a show |
+| GET | `/api/media/poster?path=...` | Get poster image for a media item |
 | GET | `/api/bumps` | List all bump folders and clips |
 | POST | `/api/bumps/scan` | Rescan bumps directory |
+| DELETE | `/api/bumps/clip` | Delete a bump clip |
 | POST | `/api/bumps/download` | Download a video as a bump clip |
+| GET | `/api/bumps/thumbnail?path=...` | Get thumbnail for a bump clip |
 | GET | `/api/settings` | Get settings schema and values |
 | POST | `/api/settings` | Save settings |
 | GET | `/api/system/stats` | CPU, RAM, disk stats + 24h history |
+| GET | `/api/logs/tail?pos=0` | Tail application log file |
 
 ## Architecture
 
@@ -146,11 +154,15 @@ channelarr/
     nfo.py         — NFO metadata parsing (titles, plots), poster discovery
     xmltv.py       — XMLTV EPG generation from materialized schedules
   web/
-    __init__.py    — Flask app factory, startup materialization, idle cleanup
-    app.py         — Gunicorn entry point
-    blueprints/
-      ui.py        — Web UI route
-      api.py       — REST API endpoints
+    app.py         — FastAPI application with lifespan (startup/shutdown)
+    shared_state.py — Module-level managers, stats collector, M3U regen
+    routers/
+      channels.py  — Channel CRUD + logo endpoints
+      epg.py       — EPG, schedule, and M3U/XMLTV export
+      media.py     — Media library endpoints
+      bumps.py     — Bump clip management
+      settings.py  — Settings endpoints
+      system.py    — System stats + log tail
       hls.py       — HLS playlist/segment serving + schedule-aware auto-start
     static/        — CSS, JS
     templates/     — HTML
@@ -171,11 +183,17 @@ Bump clips are included in the schedule for timing accuracy but excluded from EP
 
 Content files are encoded by FFmpeg to MPEG-TS and piped into an HLS segmenter. The pipe never breaks between files, so playback is seamless. The first file in a session may be seeked into (via `-ss`) to match the schedule position. Streams auto-stop after 5 minutes of inactivity.
 
+## Stack
+
+- **FastAPI** + **Uvicorn** (ASGI)
+- **Jinja2** templates + vanilla CSS + vanilla JS
+- **FFmpeg** for encoding (included in Docker image)
+- JSON file storage (no database)
+
 ## Requirements
 
 - Docker
 - A media library (movies/TV shows as video files)
-- FFmpeg (included in the Docker image)
 
 ## License
 
