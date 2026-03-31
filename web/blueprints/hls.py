@@ -78,25 +78,26 @@ def hls_playlist(channel_id):
 
     if need_start:
         lock = _get_boot_lock(channel_id)
-        if not lock.acquire(timeout=20):
+        if not lock.acquire(timeout=35):
             abort(503)
         try:
-            # Double-check — another request may have started it
-            if not os.path.isfile(playlist):
+            # Double-check — another concurrent request may have started it
+            stream_status = streamer_mgr.get_status(channel_id)
+            if not stream_status.get("running", False):
                 logging.info("[HLS] Auto-starting channel %s from schedule", channel_id)
                 ok, msg = _start_from_schedule(channel_id)
                 if not ok:
                     logging.warning("[HLS] Auto-start failed for %s: %s", channel_id, msg)
                     abort(404)
-                # Wait for .m3u8 to appear
-                deadline = time.time() + 20
-                while time.time() < deadline:
-                    if os.path.isfile(playlist):
-                        break
-                    time.sleep(0.3)
-                else:
-                    logging.error("[HLS] Timed out waiting for playlist: %s", channel_id)
-                    abort(503)
+            # Wait for .m3u8 to appear (30s — deep seeks into large files need time)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if os.path.isfile(playlist):
+                    break
+                time.sleep(0.3)
+            else:
+                logging.error("[HLS] Timed out waiting for playlist: %s", channel_id)
+                abort(503)
         finally:
             lock.release()
 

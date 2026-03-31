@@ -265,6 +265,14 @@ class ChannelStream:
         ]
 
     def _run_loop(self):
+        try:
+            self._run_loop_inner()
+        finally:
+            # Always clean up HLS files when the loop exits for any reason
+            self._clean_hls_dir()
+            logging.info("[STREAM] Cleaned HLS files for channel %s", self.channel_id)
+
+    def _run_loop_inner(self):
         while not self._stop_event.is_set():
             schedule = self.schedule
             if not schedule:
@@ -404,7 +412,20 @@ class ChannelStream:
                         pass
         self._enc_proc = None
         self._hls_proc = None
+        # Clean up HLS files so stale segments don't get served
+        self._clean_hls_dir()
         logging.info("[STREAM] Stopped channel %s", self.channel_id)
+
+    def _clean_hls_dir(self):
+        """Remove all .ts, .m3u8, and concat.txt files from this channel's HLS dir."""
+        if not os.path.isdir(self.hls_dir):
+            return
+        for f in os.listdir(self.hls_dir):
+            if f.endswith(".ts") or f.endswith(".m3u8") or f == "concat.txt":
+                try:
+                    os.remove(os.path.join(self.hls_dir, f))
+                except OSError:
+                    pass
 
     def status(self) -> dict:
         alive = self._thread is not None and self._thread.is_alive()

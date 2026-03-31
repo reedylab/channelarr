@@ -91,6 +91,13 @@ async function updateStatus() {
     const total = d.channels_total || 0;
     $("#sidebar-total").textContent = total;
     $("#sidebar-streaming").textContent = streaming;
+    const badge = $("#streaming-badge");
+    if (streaming > 0) {
+      badge.textContent = `${streaming} streaming`;
+      badge.classList.remove("hidden");
+    } else {
+      badge.classList.add("hidden");
+    }
   } catch(e) {}
 }
 

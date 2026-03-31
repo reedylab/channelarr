@@ -443,6 +443,13 @@ body.theme-dark{
 .copy-btn:hover{color:var(--accent)}
 .copy-btn.copied{color:var(--ok)}
 
+/* Streaming badge */
+.streaming-badge{
+  padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;
+  background:rgba(34,197,94,.15);color:var(--ok);
+}
+.streaming-badge.hidden{display:none}
+
 /* Now Playing on channel cards */
 .ch-now-playing{
   padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:6px;
