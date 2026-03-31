@@ -23,7 +23,7 @@ def _clean_stale_hls():
         ch_dir = os.path.join(hls_base, name)
         if os.path.isdir(ch_dir):
             for f in os.listdir(ch_dir):
-                if f.endswith(".ts") or f.endswith(".m3u8"):
+                if f.endswith(".ts") or f.endswith(".m3u8") or f == "concat.txt":
                     os.remove(os.path.join(ch_dir, f))
     logging.info("[APP] Cleaned stale HLS files")
 
