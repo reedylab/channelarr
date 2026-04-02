@@ -13,7 +13,8 @@ Channels are always on standby. No manual start/stop — streams spin up on dema
 - **Persistent EPG Schedule** — Each channel gets a materialized schedule with real start/stop timestamps for every programme. The schedule loops continuously and drives the TV guide, XMLTV export, and stream positioning.
 - **Schedule-Aware Streaming** — When a client tunes in, FFmpeg seeks to the correct position in the schedule. If the guide says a movie is 45 minutes in, that's where playback begins.
 - **TV Guide** — Manifold-style EPG grid with channel logos, color-coded programme blocks (blue for movies, purple for episodes), click-to-view detail popovers with poster art and plot descriptions, and a red "now" line.
-- **Channel Builder** — Create channels from your movie and TV library. Add whole shows or individual episodes. Shuffle, loop, and configure per-channel.
+- **Channel Builder** — Create channels from your movie and TV library. Add whole shows or individual episodes. Configure shuffle mode, loop, and bumps per-channel.
+- **Advanced Shuffle Modes** — Four shuffle strategies: **None** (play in order), **Random** (full shuffle), **Round Robin** (alternate episodes across shows: A1, B1, A2, B2...), and **Weighted Random** (percentage-based split, e.g. 75% Show A / 25% Show B). Configurable from the UI or API.
 - **Bump System** — Insert short clips between content (station idents, transitions, promos). Organize bumps into folders, download from YouTube via yt-dlp, and configure frequency, count, and placement per channel.
 - **"Up Next" Overlays** — During bumps, display the next content's title and poster image with a countdown timer, just like real TV.
 - **HLS Streaming** — Pipe-based FFmpeg architecture for seamless, gapless playback. No stuttering at file boundaries. Outputs standard HLS (`.m3u8` + `.ts` segments).
@@ -65,7 +66,18 @@ Click **New Channel**, give it a name, and add content from your media library. 
 
 Place short video clips in folders under your bumps path. In the channel editor, enable bumps, select folders, and set frequency (between every item, or every N items). Enable "Show Next" to overlay upcoming content info during bumps.
 
-### 3. Watch
+### 3. Configure Shuffle Mode (Optional)
+
+In the channel editor under **Playback**, choose a shuffle mode:
+
+- **None** — Content plays in the order listed
+- **Random** — All episodes/movies are fully randomized
+- **Round Robin** — Episodes alternate across shows. With 2 shows, it's every-other (A1, B1, A2, B2...). Scales to any number of shows.
+- **Weighted Random** — Set a percentage per show (must total 100%). Episodes are distributed proportionally then randomized. E.g., 75% Show A / 25% Show B.
+
+For AI agent integration, `GET /api/channels/shuffle-modes` returns the full schema and example payloads for creating channels with any shuffle mode via the API.
+
+### 4. Watch
 
 Click **Watch** on any channel card. The stream auto-starts from the current schedule position. The stream URL for external clients is:
 
@@ -73,14 +85,14 @@ Click **Watch** on any channel card. The stream auto-starts from the current sch
 http://your-server-ip:5045/live/<channel-id>/stream.m3u8
 ```
 
-### 4. Add to IPTV Clients
+### 5. Add to IPTV Clients
 
 Copy the M3U and EPG URLs from the header bar (click the clipboard icon). Add them to Jellyfin, Threadfin, Manifold, or any IPTV client that supports M3U + XMLTV.
 
 - **M3U**: `http://your-server-ip:5045/api/export/m3u`
 - **EPG**: `http://your-server-ip:5045/api/export/xmltv`
 
-### 5. Guide & Schedule Management
+### 6. Guide & Schedule Management
 
 - **Guide** sidebar view shows the full TV guide grid across all channels
 - **Refresh** (header) regenerates M3U + XMLTV from existing schedules
@@ -118,6 +130,7 @@ All endpoints are under `/api`:
 | GET | `/api/channels/<id>` | Get channel with schedule and now-playing |
 | PUT | `/api/channels/<id>` | Update channel (re-materializes schedule) |
 | DELETE | `/api/channels/<id>` | Delete channel |
+| GET | `/api/channels/shuffle-modes` | Shuffle mode schemas and example payloads (for AI agents) |
 | GET | `/api/logo/<id>` | Get channel logo |
 | POST | `/api/logo/<id>` | Upload channel logo |
 | DELETE | `/api/logo/<id>` | Delete channel logo |
