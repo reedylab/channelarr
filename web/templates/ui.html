@@ -5,10 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=12" />
-  <script>
-    (function(){var c=localStorage.getItem('channelarr-accent');if(c)document.documentElement.style.setProperty('--accent',c)})();
-  </script>
+  <link rel="stylesheet" href="/static/style.css?v=13" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -66,17 +63,6 @@
         </button>
         <div id="settings-subnav" class="nav-subnav"></div>
       </nav>
-      <div class="sidebar-accent-picker">
-        <span class="accent-label">Accent</span>
-        <span class="accent-swatch" data-color="#8B5CF6" style="background:#8B5CF6" title="Purple"></span>
-        <span class="accent-swatch" data-color="#58a6ff" style="background:#58a6ff" title="Blue"></span>
-        <span class="accent-swatch" data-color="#2dd4bf" style="background:#2dd4bf" title="Teal"></span>
-        <span class="accent-swatch" data-color="#3fb950" style="background:#3fb950" title="Green"></span>
-        <span class="accent-swatch" data-color="#d29922" style="background:#d29922" title="Gold"></span>
-        <span class="accent-swatch" data-color="#db6d28" style="background:#db6d28" title="Orange"></span>
-        <span class="accent-swatch" data-color="#f472b6" style="background:#f472b6" title="Pink"></span>
-        <span class="accent-swatch" data-color="#f85149" style="background:#f85149" title="Red"></span>
-      </div>
       <div class="sidebar-info">
         <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
         <div><strong>Streaming:</strong> <span id="sidebar-streaming">0</span></div>
@@ -336,6 +322,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=17"></script>
+  <script src="/static/ui.js?v=18"></script>
 </body>
 </html>

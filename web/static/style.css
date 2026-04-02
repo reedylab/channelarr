@@ -5,7 +5,7 @@
   --bg-input:#0d1117;
   --text:#e6edf3;
   --text-muted:#7d8590;
-  --accent:#8B5CF6;
+  --accent:#58a6ff;
   --danger:#f85149;
   --ok:#3fb950;
   --warn:#d29922;
@@ -59,16 +59,6 @@ button,input,select,textarea{font-family:inherit}
 }
 .nav-subitem:hover{color:var(--text);background:rgba(255,255,255,0.03)}
 .nav-subitem.active{color:var(--accent);font-weight:500;border-left-color:var(--accent)}
-
-/* Sidebar color picker */
-.sidebar-accent-picker{padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.sidebar-accent-picker .accent-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);width:100%;margin-bottom:2px}
-.accent-swatch{
-  width:18px;height:18px;border-radius:50%;border:2px solid transparent;cursor:pointer;
-  transition:all 0.15s;flex-shrink:0;
-}
-.accent-swatch:hover{transform:scale(1.2)}
-.accent-swatch.active{border-color:var(--text);box-shadow:0 0 0 2px var(--bg-card)}
 
 .sidebar-info{padding:10px 14px;border-top:1px solid var(--border);color:var(--text-muted);font-size:12px}
 
@@ -437,7 +427,6 @@ button,input,select,textarea{font-family:inherit}
   .sidebar .nav-item span:not(.nav-ic){display:none}
   .sidebar .nav-arrow{display:none}
   .sidebar .sidebar-info{display:none}
-  .sidebar .sidebar-accent-picker .accent-label{display:none}
   .sidebar .brand-logo{height:24px}
   .nav-item{justify-content:center;padding:8px 0;border-left:3px solid transparent}
   .nav-ic{width:auto;font-size:16px}
