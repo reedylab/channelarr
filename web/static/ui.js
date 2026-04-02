@@ -13,6 +13,7 @@ let tvShows = [];
 let bumpData = {};
 let editingChannel = null;
 let editorItems = [];
+let editorWeights = {};
 let pickerTab = "movies";
 let pickerShowEpisodes = null;
 let settingsSchema = {};
@@ -177,7 +178,13 @@ function renderChannels() {
     meta.push(`${items.length} item${items.length !== 1 ? "s" : ""}`);
     const bFolders = bc.folders || (bc.folder ? [bc.folder] : []);
     if (bc.enabled && bFolders.length) meta.push(`Bumps: ${bFolders.join(", ")}`);
-    if (ch.shuffle) meta.push("Shuffle");
+    const sc = ch.shuffle_config;
+    if (sc && sc.mode && sc.mode !== "none") {
+      const modeLabels = {random: "Shuffle", round_robin: "Round Robin", weighted: "Weighted"};
+      meta.push(modeLabels[sc.mode] || sc.mode);
+    } else if (ch.shuffle) {
+      meta.push("Shuffle");
+    }
     if (ch.loop) meta.push("Loop");
     const logoUrl = `${API}/logo/${ch.id}`;
 
@@ -280,7 +287,17 @@ function openEditor(ch) {
   $("#ch-bump-next").checked = !!bc.show_next;
   $("#ch-bump-freq").value = bc.frequency || "between";
   $("#ch-bump-count").value = bc.count || 1;
-  $("#ch-shuffle").checked = ch ? !!ch.shuffle : false;
+  // Shuffle config
+  const sc = ch ? ch.shuffle_config : null;
+  if (sc && sc.mode) {
+    $("#ch-shuffle-mode").value = sc.mode;
+  } else if (ch && ch.shuffle) {
+    $("#ch-shuffle-mode").value = "random";
+  } else {
+    $("#ch-shuffle-mode").value = "none";
+  }
+  editorWeights = (sc && sc.weights) ? Object.assign({}, sc.weights) : {};
+  updateWeightsUI();
   $("#ch-loop").checked = ch ? !!ch.loop : true;
 
   const logoPreview = $("#ch-logo-preview");
@@ -371,6 +388,67 @@ function getSelectedBumpFolders() {
   return Array.from($$(".ch-bump-folder-cb:checked")).map(cb => cb.value);
 }
 
+// ─── Shuffle weights UI ───
+$("#ch-shuffle-mode").addEventListener("change", () => {
+  updateWeightsUI();
+  updateSchedulePreview();
+});
+
+function updateWeightsUI() {
+  const mode = $("#ch-shuffle-mode").value;
+  const section = $("#ch-weights-section");
+  if (mode !== "weighted") {
+    section.style.display = "none";
+    return;
+  }
+  section.style.display = "";
+  renderWeightRows();
+}
+
+function renderWeightRows() {
+  const list = $("#ch-weights-list");
+  const shows = editorItems.filter(it => it.type === "show");
+  if (!shows.length) {
+    list.innerHTML = '<div class="muted">Add TV shows to set weights</div>';
+    $("#ch-weights-total").textContent = "";
+    return;
+  }
+  // Initialize missing weights with even split
+  const evenPct = Math.floor(100 / shows.length);
+  shows.forEach((s, i) => {
+    if (editorWeights[s.path] === undefined) {
+      editorWeights[s.path] = i === shows.length - 1 ? 100 - evenPct * (shows.length - 1) : evenPct;
+    }
+  });
+  // Remove stale paths
+  const showPaths = new Set(shows.map(s => s.path));
+  Object.keys(editorWeights).forEach(k => { if (!showPaths.has(k)) delete editorWeights[k]; });
+
+  list.innerHTML = shows.map(s => `
+    <div class="ch-weight-row">
+      <span class="ch-weight-name" title="${esc(s.path)}">${esc(s.title || s.path)}</span>
+      <input type="number" min="0" max="100" value="${editorWeights[s.path] || 0}"
+        data-weight-path="${esc(s.path)}" class="ch-weight-input" />
+      <span class="ch-weight-pct">%</span>
+    </div>
+  `).join("");
+
+  list.querySelectorAll(".ch-weight-input").forEach(inp => {
+    inp.addEventListener("input", () => {
+      editorWeights[inp.dataset.weightPath] = parseInt(inp.value) || 0;
+      updateWeightsTotal();
+    });
+  });
+  updateWeightsTotal();
+}
+
+function updateWeightsTotal() {
+  const total = Object.values(editorWeights).reduce((a, b) => a + b, 0);
+  const el = $("#ch-weights-total");
+  el.textContent = `Total: ${total}%`;
+  el.className = "ch-weights-total " + (total === 100 ? "valid" : "invalid");
+}
+
 function renderEditorItems() {
   const list = $("#ch-items");
   $("#ch-item-count").textContent = `(${editorItems.length})`;
@@ -392,12 +470,14 @@ function renderEditorItems() {
 channelarr.removeItem = function(i) {
   editorItems.splice(i, 1);
   renderEditorItems();
+  if ($("#ch-shuffle-mode").value === "weighted") renderWeightRows();
   updateSchedulePreview();
 };
 
 channelarr.addToChannel = function(item) {
   editorItems.push(item);
   renderEditorItems();
+  if ($("#ch-shuffle-mode").value === "weighted") renderWeightRows();
   updateSchedulePreview();
   toast("info", `Added: ${item.title}`);
 };
@@ -506,13 +586,43 @@ function updateSchedulePreview() {
   const bumpFreq = $("#ch-bump-freq").value;
   const bumpCount = parseInt($("#ch-bump-count").value) || 1;
   const startBumps = $("#ch-bump-start").checked;
+  const shuffleMode = $("#ch-shuffle-mode").value;
+
+  // Reorder items based on shuffle mode for preview
+  let previewItems = editorItems.slice();
+  if (shuffleMode === "round_robin") {
+    // Show interleaved preview: rotate through shows in order
+    const groups = [];
+    const groupMap = {};
+    previewItems.forEach(item => {
+      const key = item.type === "show" ? item.path : "__standalone__" + item.path;
+      if (!groupMap[key]) { groupMap[key] = []; groups.push(groupMap[key]); }
+      groupMap[key].push(item);
+    });
+    previewItems = [];
+    let more = true;
+    let idx = 0;
+    while (more) {
+      more = false;
+      for (const g of groups) {
+        if (idx < g.length) { previewItems.push(g[idx]); more = true; }
+      }
+      idx++;
+    }
+  }
 
   let sched = [];
+  // Shuffle mode label
+  if (shuffleMode !== "none") {
+    const labels = {random: "Random shuffle", round_robin: "Round-robin interleave", weighted: "Weighted random"};
+    sched.push({ type: "info", title: labels[shuffleMode] || shuffleMode });
+  }
+
   if (bumpEnabled && bumpFolders.length && startBumps) {
     for (let b = 0; b < bumpCount; b++) sched.push({ type: "bump", title: `[bump]` });
   }
 
-  editorItems.forEach((item, i) => {
+  previewItems.forEach((item, i) => {
     if (bumpEnabled && bumpFolders.length && i > 0) {
       if (bumpFreq === "between" || (parseInt(bumpFreq) && i % parseInt(bumpFreq) === 0)) {
         for (let b = 0; b < bumpCount; b++) sched.push({ type: "bump", title: `[bump]` });
@@ -526,10 +636,13 @@ function updateSchedulePreview() {
   });
 
   container.innerHTML = sched.map((s, i) => {
+    if (s.type === "info") {
+      return `<div class="sched-item" style="background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);color:var(--accent);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;justify-content:center">${esc(s.title)}</div>`;
+    }
     const cls = s.type === "bump" ? "sched-bump" : s.type === "show" ? "sched-show" : "sched-content";
     return `
     <div class="sched-item ${cls}">
-      <span class="sched-num">${i + 1}</span>
+      <span class="sched-num">${i}</span>
       <span>${esc(s.title)}</span>
     </div>`;
   }).join("");
@@ -538,10 +651,19 @@ function updateSchedulePreview() {
 ["ch-bump-enabled", "ch-bump-freq", "ch-bump-count", "ch-bump-start", "ch-bump-next"].forEach(id => {
   $(`#${id}`).addEventListener("change", updateSchedulePreview);
 });
+// Note: ch-shuffle-mode change listener is set up in the shuffle weights UI section above
 
 async function saveChannel() {
   const name = $("#ch-name").value.trim();
   if (!name) { toast("error", "Channel name required"); return; }
+
+  const shuffleMode = $("#ch-shuffle-mode").value;
+  const shuffleConfig = { mode: shuffleMode };
+  if (shuffleMode === "weighted") {
+    const total = Object.values(editorWeights).reduce((a, b) => a + b, 0);
+    if (total !== 100) { toast("error", "Weights must total 100%"); return; }
+    shuffleConfig.weights = Object.assign({}, editorWeights);
+  }
 
   const data = {
     name,
@@ -554,7 +676,8 @@ async function saveChannel() {
       start_bumps: $("#ch-bump-start").checked,
       show_next: $("#ch-bump-next").checked,
     },
-    shuffle: $("#ch-shuffle").checked,
+    shuffle: shuffleMode === "random",
+    shuffle_config: shuffleConfig,
     loop: $("#ch-loop").checked,
   };
 

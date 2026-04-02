@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=13" />
+  <link rel="stylesheet" href="/static/style.css?v=14" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -286,9 +286,22 @@
         </div>
 
         <div class="modal-section">
-          <h4>Options</h4>
-          <div class="ch-options">
-            <label class="toggle-label"><input type="checkbox" id="ch-shuffle" /> Shuffle</label>
+          <h4>Playback</h4>
+          <div class="ch-playback-options">
+            <div class="setting-field">
+              <label>Shuffle Mode</label>
+              <select id="ch-shuffle-mode">
+                <option value="none">None (play in order)</option>
+                <option value="random">Random</option>
+                <option value="round_robin">Round Robin (alternate shows)</option>
+                <option value="weighted">Weighted Random</option>
+              </select>
+            </div>
+            <div id="ch-weights-section" class="ch-weights-section" style="display:none">
+              <label class="ch-weights-label">Weight per show (must total 100%)</label>
+              <div id="ch-weights-list" class="ch-weights-list"></div>
+              <div id="ch-weights-total" class="ch-weights-total"></div>
+            </div>
             <label class="toggle-label"><input type="checkbox" id="ch-loop" checked /> Loop</label>
           </div>
         </div>
@@ -322,6 +335,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=18"></script>
+  <script src="/static/ui.js?v=19"></script>
 </body>
 </html>

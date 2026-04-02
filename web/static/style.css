@@ -291,8 +291,28 @@ button,input,select,textarea{font-family:inherit}
 .bump-thumb.no-thumb{display:none}
 .bump-clip-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 
+/* Playback options */
+.ch-playback-options{display:flex;flex-direction:column;gap:12px}
+.ch-playback-options .setting-field{max-width:280px}
+.ch-weights-section{display:flex;flex-direction:column;gap:8px}
+.ch-weights-label{font-size:12px;color:var(--text-muted);font-weight:500}
+.ch-weights-list{display:flex;flex-direction:column;gap:6px}
+.ch-weight-row{
+  display:flex;align-items:center;gap:10px;
+  padding:6px 10px;background:var(--bg-hover);border:1px solid var(--border);border-radius:6px;font-size:12px;
+}
+.ch-weight-row .ch-weight-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ch-weight-row input[type="number"]{
+  width:64px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);
+  border-radius:4px;padding:3px 6px;font-size:12px;text-align:right;
+}
+.ch-weight-row input[type="number"]:focus{outline:none;border-color:var(--accent)}
+.ch-weight-row .ch-weight-pct{color:var(--text-muted);font-size:11px;min-width:16px}
+.ch-weights-total{font-size:11px;font-weight:600}
+.ch-weights-total.valid{color:var(--ok)}
+.ch-weights-total.invalid{color:var(--danger)}
+
 /* Channel options */
-.ch-options{display:flex;gap:18px}
 .toggle-label{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
 .toggle-label input[type="checkbox"]{accent-color:var(--accent);width:14px;height:14px}
 
