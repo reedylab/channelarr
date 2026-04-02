@@ -6,6 +6,22 @@ const API = window.API_BASE || "/api";
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+// ─── Accent Color Picker ───
+(function initAccentPicker(){
+  const swatches = $$(".accent-swatch");
+  const stored = localStorage.getItem("channelarr-accent");
+  swatches.forEach(s => {
+    if (s.dataset.color === (stored || "#8B5CF6")) s.classList.add("active");
+    s.addEventListener("click", () => {
+      const c = s.dataset.color;
+      document.documentElement.style.setProperty("--accent", c);
+      localStorage.setItem("channelarr-accent", c);
+      swatches.forEach(sw => sw.classList.remove("active"));
+      s.classList.add("active");
+    });
+  });
+})();
+
 // ─── State ───
 let channels = [];
 let movies = [];
@@ -1109,7 +1125,7 @@ async function updateSystemStats() {
     statsData = await r.json();
     renderStatGauges();
     renderLineChart("cpu-chart", statsData.history.timestamps, statsData.history.cpu, {color:"var(--accent)", label:"CPU"});
-    renderLineChart("ram-chart", statsData.history.timestamps, statsData.history.ram, {color:"var(--accent-2)", label:"RAM"});
+    renderLineChart("ram-chart", statsData.history.timestamps, statsData.history.ram, {color:"var(--accent)", label:"RAM"});
     renderDiskGauge();
   } catch(e) {}
 }
@@ -1258,7 +1274,7 @@ function renderModalChart() {
 
   const ts = h.timestamps.slice(idxStart);
   const vals = chartModalType === "cpu" ? h.cpu.slice(idxStart) : h.ram.slice(idxStart);
-  const color = chartModalType === "cpu" ? "var(--accent)" : "var(--accent-2)";
+  const color = chartModalType === "cpu" ? "var(--accent)" : "var(--accent)";
   const label = chartModalType === "cpu" ? "CPU" : "RAM";
 
   const container = $("#chart-modal-chart");
