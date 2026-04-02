@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from core.nfo import read_nfo_title, read_nfo_plot
@@ -71,6 +72,7 @@ class ChannelManager:
                 "show_next": False,
             }),
             "shuffle": data.get("shuffle", False),
+            "shuffle_config": data.get("shuffle_config", None),
             "loop": data.get("loop", True),
         }
         channels.append(channel)
@@ -82,7 +84,7 @@ class ChannelManager:
         channels = _load()
         for i, ch in enumerate(channels):
             if ch["id"] == channel_id:
-                for key in ("name", "items", "bump_config", "shuffle", "loop"):
+                for key in ("name", "items", "bump_config", "shuffle", "shuffle_config", "loop"):
                     if key in data:
                         ch[key] = data[key]
                 channels[i] = ch
@@ -155,6 +157,98 @@ def _make_bump_cycle(all_clips: list, total_needed: int) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Shuffle config helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_shuffle_config(channel: dict) -> dict:
+    """Return a shuffle_config dict, converting legacy boolean if needed."""
+    cfg = channel.get("shuffle_config")
+    if cfg and isinstance(cfg, dict):
+        return cfg
+    # Legacy boolean fallback
+    if channel.get("shuffle"):
+        return {"mode": "random"}
+    return {"mode": "none"}
+
+
+def _group_by_source(items: list, raw_items: list) -> list:
+    """Group expanded episodes back by their source show/item.
+
+    Returns list of (source_key, [items]) in original item order.
+    Each movie/standalone item is its own group.
+    """
+    groups = OrderedDict()
+    # Build a mapping of episode path prefix → source show path
+    show_paths = [it["path"] for it in raw_items if it.get("type") == "show"]
+
+    for item in items:
+        # Find which show this episode belongs to
+        source = None
+        for sp in show_paths:
+            if item["path"].startswith(sp):
+                source = sp
+                break
+        if source is None:
+            # Standalone item (movie or non-show) — its own group
+            source = item["path"]
+        groups.setdefault(source, []).append(item)
+
+    return list(groups.items())
+
+
+def _shuffle_round_robin(grouped: list) -> list:
+    """Interleave items across groups in round-robin order."""
+    queues = [list(items) for _, items in grouped]
+    result = []
+    while any(queues):
+        for q in queues:
+            if q:
+                result.append(q.pop(0))
+    return result
+
+
+def _shuffle_weighted(grouped: list, weights: dict, total_episodes: int) -> list:
+    """Build a weighted random schedule from grouped episodes.
+
+    weights maps source path → integer percentage.
+    """
+    if total_episodes == 0:
+        return []
+
+    result = []
+    remaining_slots = total_episodes
+    remaining_pct = 100
+
+    for source, episodes in grouped:
+        pct = weights.get(source, 0)
+        if pct <= 0:
+            continue
+        # Calculate target count, distributing rounding to last group
+        if remaining_pct > 0:
+            target = round(pct / remaining_pct * remaining_slots)
+        else:
+            target = 0
+        target = min(target, len(episodes))
+        target = max(target, 0)
+        result.extend(episodes[:target])
+        remaining_slots -= target
+        remaining_pct -= pct
+
+    # If rounding left slots unfilled, add remaining episodes from largest groups
+    if remaining_slots > 0:
+        for source, episodes in grouped:
+            already = sum(1 for r in result if r in episodes)
+            for ep in episodes[already:]:
+                if remaining_slots <= 0:
+                    break
+                result.append(ep)
+                remaining_slots -= 1
+
+    random.shuffle(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Transient schedule generation (ordering only, no timestamps)
 # ---------------------------------------------------------------------------
 
@@ -186,8 +280,18 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
     if not items:
         return []
 
-    if channel.get("shuffle"):
+    shuffle_cfg = _normalize_shuffle_config(channel)
+    mode = shuffle_cfg.get("mode", "none")
+
+    if mode == "random":
         random.shuffle(items)
+    elif mode == "round_robin":
+        grouped = _group_by_source(items, raw_items)
+        items = _shuffle_round_robin(grouped)
+    elif mode == "weighted":
+        grouped = _group_by_source(items, raw_items)
+        weights = shuffle_cfg.get("weights", {})
+        items = _shuffle_weighted(grouped, weights, len(items))
 
     bump_cfg = channel.get("bump_config", {})
     folders = bump_cfg.get("folders") or []

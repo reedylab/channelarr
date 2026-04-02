@@ -22,6 +22,70 @@ def api_status():
     }
 
 
+@router.get("/channels/shuffle-modes")
+def api_shuffle_modes():
+    """Describe available shuffle modes and example payloads for AI agents."""
+    return {
+        "modes": {
+            "none": {
+                "description": "No shuffling, items play in listed order",
+            },
+            "random": {
+                "description": "Fully random shuffle of all items",
+            },
+            "round_robin": {
+                "description": "Interleave episodes across shows in alternating order (A1,B1,A2,B2,...). Scales to any number of shows.",
+            },
+            "weighted": {
+                "description": "Random shuffle weighted by per-show percentages",
+                "parameters": {
+                    "weights": "Object mapping show paths to integer percentages. Must sum to 100.",
+                },
+            },
+        },
+        "usage": {
+            "field": "shuffle_config",
+            "location": "Channel create/update payload body",
+            "schema": {
+                "mode": "string (required) — one of: none, random, round_robin, weighted",
+                "weights": "object (required for weighted mode) — {show_path: percentage}",
+            },
+        },
+        "example_payloads": {
+            "round_robin": {
+                "name": "Alternating Shows",
+                "items": [
+                    {"type": "show", "path": "/media/tv/ShowA", "title": "Show A"},
+                    {"type": "show", "path": "/media/tv/ShowB", "title": "Show B"},
+                ],
+                "shuffle_config": {"mode": "round_robin"},
+                "loop": True,
+            },
+            "weighted": {
+                "name": "Mostly Show A",
+                "items": [
+                    {"type": "show", "path": "/media/tv/ShowA", "title": "Show A"},
+                    {"type": "show", "path": "/media/tv/ShowB", "title": "Show B"},
+                ],
+                "shuffle_config": {
+                    "mode": "weighted",
+                    "weights": {"/media/tv/ShowA": 75, "/media/tv/ShowB": 25},
+                },
+                "loop": True,
+            },
+            "random": {
+                "name": "Random Mix",
+                "items": [
+                    {"type": "show", "path": "/media/tv/ShowA", "title": "Show A"},
+                    {"type": "show", "path": "/media/tv/ShowB", "title": "Show B"},
+                ],
+                "shuffle_config": {"mode": "random"},
+                "loop": True,
+            },
+        },
+    }
+
+
 @router.get("/channels")
 def api_list_channels():
     channels = shared_state.channel_mgr.list_channels()
