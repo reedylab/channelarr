@@ -155,14 +155,14 @@ button,input,select,textarea{font-family:inherit}
   padding:14px 18px;border-bottom:1px solid var(--border);
 }
 .modal-header h3{margin:0;font-size:13px;font-weight:600}
-.modal-body{padding:18px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:14px}
+.modal-body{padding:14px 18px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px}
 .modal-footer{
   display:flex;justify-content:flex-end;gap:8px;
   padding:12px 18px;border-top:1px solid var(--border);
 }
 .modal-two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px;min-height:220px}
 .modal-col h4{margin:0 0 8px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted)}
-.modal-section h4{margin:0 0 8px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted)}
+.modal-section h4{margin:0 0 4px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted)}
 .muted{color:var(--text-muted);font-weight:400}
 
 /* Channel items list */
@@ -247,9 +247,10 @@ button,input,select,textarea{font-family:inherit}
 .media-item-sub{font-size:12px;color:var(--text-muted)}
 
 /* Bump config */
-.bump-cfg{display:flex;flex-direction:column;gap:12px}
-.bump-cfg-row{display:flex;gap:14px;flex-wrap:wrap}
-.bump-cfg-row .setting-field{flex:1;min-width:130px}
+.bump-cfg{display:flex;flex-direction:column;gap:6px}
+.bump-cfg-toggles{display:flex;gap:14px;flex-wrap:wrap}
+.bump-cfg-row{display:flex;gap:10px}
+.bump-cfg-row .setting-field{flex:1;min-width:130px;max-width:200px}
 
 /* Bump folders checklist */
 .bump-folders-checklist{display:flex;flex-wrap:wrap;gap:8px}
@@ -356,6 +357,9 @@ button,input,select,textarea{font-family:inherit}
 .settings-status.success{color:var(--ok)}
 .settings-status.error{color:var(--danger)}
 .settings-content{padding:16px;flex:1;overflow-y:auto}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.settings-group{background:var(--bg-hover);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.settings-group h4{margin:0;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted)}
 .settings-fields{display:flex;flex-direction:column;gap:14px;max-width:700px}
 .setting-field{display:flex;flex-direction:column;gap:5px}
 .setting-field label{font-size:12px;color:var(--text-muted);font-weight:500}

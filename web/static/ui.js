@@ -27,31 +27,9 @@ let tailPos = 0, tailInode = null;
 const logOut = $("#log-output");
 
 // ─── Navigation ───
-const settingsSubnav = $("#settings-subnav");
-
 $$(".nav-item").forEach(btn => {
   btn.addEventListener("click", () => {
-    const view = btn.dataset.view;
-    if (view === "settings") {
-      const par = btn;
-      const isExp = settingsSubnav.classList.contains("expanded");
-      if (isExp) {
-        settingsSubnav.classList.remove("expanded");
-        par.classList.remove("expanded");
-        switchView("channels");
-      } else {
-        settingsSubnav.classList.add("expanded");
-        par.classList.add("expanded");
-        switchView("settings");
-        if (!activeSettingsSection && Object.keys(settingsSchema).length) {
-          showSettingsSection(Object.keys(settingsSchema)[0]);
-        }
-      }
-      return;
-    }
-    settingsSubnav.classList.remove("expanded");
-    $$(".nav-item-parent").forEach(p => p.classList.remove("expanded"));
-    switchView(view);
+    switchView(btn.dataset.view);
   });
 });
 
@@ -1039,95 +1017,67 @@ async function loadSettings() {
     settingsSchema = data.schema;
     settingsOriginal = {...data.values};
     settingsModified = {...data.values};
-    renderSettingsNav();
-    if (Object.keys(settingsSchema).length) {
-      showSettingsSection(Object.keys(settingsSchema)[0]);
-    }
+    renderAllSettings();
   } catch(e) {}
 }
 
-function renderSettingsNav() {
-  settingsSubnav.innerHTML = "";
-  for (const [key, section] of Object.entries(settingsSchema)) {
-    const btn = document.createElement("button");
-    btn.className = "nav-subitem";
-    btn.textContent = section.label;
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      showSettingsSection(key);
-    });
-    settingsSubnav.appendChild(btn);
-  }
-}
-
-function showSettingsSection(sectionKey) {
-  activeSettingsSection = sectionKey;
-  const section = settingsSchema[sectionKey];
-  if (!section) return;
-  $("#settings-section-title").textContent = section.label;
-
-  $$(".nav-subitem").forEach((btn, i) => {
-    btn.classList.toggle("active", Object.keys(settingsSchema)[i] === sectionKey);
-  });
-
+function renderAllSettings() {
+  $("#settings-section-title").textContent = "Settings";
   const container = $("#settings-container");
   container.innerHTML = "";
-  const fields = document.createElement("div");
-  fields.className = "settings-fields";
+  const grid = document.createElement("div");
+  grid.className = "settings-grid";
 
-  for (const [fieldKey, field] of Object.entries(section.fields)) {
-    const isModified = settingsModified[fieldKey] !== settingsOriginal[fieldKey];
-    const div = document.createElement("div");
-    div.className = `setting-field${isModified ? " modified" : ""}`;
+  for (const [sectionKey, section] of Object.entries(settingsSchema)) {
+    const group = document.createElement("div");
+    group.className = "settings-group";
+    const heading = document.createElement("h4");
+    heading.textContent = section.label;
+    group.appendChild(heading);
 
-    const label = document.createElement("label");
-    label.textContent = field.label;
-    div.appendChild(label);
+    for (const [fieldKey, field] of Object.entries(section.fields)) {
+      const isModified = settingsModified[fieldKey] !== settingsOriginal[fieldKey];
+      const div = document.createElement("div");
+      div.className = `setting-field${isModified ? " modified" : ""}`;
 
-    if (field.type === "select") {
-      const sel = document.createElement("select");
-      (field.options || []).forEach(opt => {
-        const o = document.createElement("option");
-        o.value = opt.value;
-        o.textContent = opt.label;
-        sel.appendChild(o);
-      });
-      sel.value = settingsModified[fieldKey] || "";
-      sel.addEventListener("change", () => {
-        settingsModified[fieldKey] = sel.value;
-        div.classList.toggle("modified", settingsModified[fieldKey] !== settingsOriginal[fieldKey]);
-      });
-      div.appendChild(sel);
-    } else {
-      const wrap = document.createElement("div");
-      wrap.className = "input-wrap";
-      const inp = document.createElement("input");
-      inp.type = field.type || "text";
-      inp.placeholder = field.placeholder || "";
-      inp.value = settingsModified[fieldKey] || "";
-      inp.addEventListener("input", () => {
-        settingsModified[fieldKey] = inp.value;
-        div.classList.toggle("modified", settingsModified[fieldKey] !== settingsOriginal[fieldKey]);
-      });
-      wrap.appendChild(inp);
+      const label = document.createElement("label");
+      label.textContent = field.label;
+      div.appendChild(label);
 
-      if (field.type === "password") {
-        const reveal = document.createElement("button");
-        reveal.className = "btn-reveal";
-        reveal.textContent = "show";
-        reveal.addEventListener("click", () => {
-          inp.type = inp.type === "password" ? "text" : "password";
-          reveal.textContent = inp.type === "password" ? "show" : "hide";
+      if (field.type === "select") {
+        const sel = document.createElement("select");
+        (field.options || []).forEach(opt => {
+          const o = document.createElement("option");
+          o.value = opt.value;
+          o.textContent = opt.label;
+          sel.appendChild(o);
         });
-        wrap.appendChild(reveal);
+        sel.value = settingsModified[fieldKey] || "";
+        sel.addEventListener("change", () => {
+          settingsModified[fieldKey] = sel.value;
+          div.classList.toggle("modified", settingsModified[fieldKey] !== settingsOriginal[fieldKey]);
+        });
+        div.appendChild(sel);
+      } else {
+        const wrap = document.createElement("div");
+        wrap.className = "input-wrap";
+        const inp = document.createElement("input");
+        inp.type = field.type || "text";
+        inp.placeholder = field.placeholder || "";
+        inp.value = settingsModified[fieldKey] || "";
+        inp.addEventListener("input", () => {
+          settingsModified[fieldKey] = inp.value;
+          div.classList.toggle("modified", settingsModified[fieldKey] !== settingsOriginal[fieldKey]);
+        });
+        wrap.appendChild(inp);
+        div.appendChild(wrap);
       }
 
-      div.appendChild(wrap);
+      group.appendChild(div);
     }
-
-    fields.appendChild(div);
+    grid.appendChild(group);
   }
-  container.appendChild(fields);
+  container.appendChild(grid);
 }
 
 $("#save-settings").addEventListener("click", async () => {
@@ -1142,7 +1092,7 @@ $("#save-settings").addEventListener("click", async () => {
     status.textContent = d.message || "Saved";
     status.className = "settings-status success";
     settingsOriginal = {...settingsModified};
-    showSettingsSection(activeSettingsSection);
+    renderAllSettings();
     toast("success", "Settings saved");
   } catch(e) {
     status.textContent = "Save failed";

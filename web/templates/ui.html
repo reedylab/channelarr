@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=17" />
+  <link rel="stylesheet" href="/static/style.css?v=18" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -57,11 +57,9 @@
         <button class="nav-item" data-view="system" title="System">
           <span class="nav-ic">&#9673;</span> <span>System</span>
         </button>
-        <button class="nav-item nav-item-parent" data-view="settings" title="Settings">
+        <button class="nav-item" data-view="settings" title="Settings">
           <span class="nav-ic">&#9881;</span> <span>Settings</span>
-          <span class="nav-arrow">&#9662;</span>
         </button>
-        <div id="settings-subnav" class="nav-subnav"></div>
       </nav>
       <div class="sidebar-info">
         <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
@@ -255,20 +253,22 @@
         <div class="modal-section">
           <h4>Bumps</h4>
           <div class="bump-cfg">
-            <label class="toggle-label">
-              <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" id="ch-bump-start" /> Play bumps at start
-            </label>
-            <label class="toggle-label">
-              <input type="checkbox" id="ch-bump-next" /> Show "Up Next" overlay
-            </label>
+            <div class="bump-cfg-toggles">
+              <label class="toggle-label">
+                <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" id="ch-bump-start" /> Play bumps at start
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" id="ch-bump-next" /> Show "Up Next" overlay
+              </label>
+            </div>
+            <div class="setting-field">
+              <label>Folders</label>
+              <div id="ch-bump-folders" class="bump-folders-checklist"></div>
+            </div>
             <div class="bump-cfg-row">
-              <div class="setting-field">
-                <label>Folders</label>
-                <div id="ch-bump-folders" class="bump-folders-checklist"></div>
-              </div>
               <div class="setting-field">
                 <label>Frequency</label>
                 <select id="ch-bump-freq">
@@ -335,6 +335,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=19"></script>
+  <script src="/static/ui.js?v=20"></script>
 </body>
 </html>
