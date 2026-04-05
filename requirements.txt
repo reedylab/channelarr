@@ -2,6 +2,6 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 jinja2==3.1.6
 python-multipart==0.0.20
-requests
-yt-dlp
-psutil
+requests>=2.31.0
+yt-dlp>=2024.1.1
+psutil>=5.9.0

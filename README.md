@@ -8,6 +8,23 @@ Channelarr lets you build TV channels that feel like real broadcast television. 
 
 Channels are always on standby. No manual start/stop — streams spin up on demand and auto-stop when viewers disconnect.
 
+## Screenshots
+
+![Channel Dashboard](screenshots/channels.png)
+*Channel cards with now-playing info and progress bars*
+
+![TV Guide](screenshots/guide.png)
+*EPG grid with color-coded programme blocks and red "now" line*
+
+![Channel Editor](screenshots/editor.png)
+*Channel builder with media picker, shuffle modes, and bump configuration*
+
+![Bump Manager](screenshots/bumps.png)
+*Bump clip library with folder organization and YouTube downloads*
+
+![System Stats](screenshots/system.png)
+*CPU, RAM, and disk monitoring with 24-hour history charts*
+
 ## Features
 
 - **Persistent EPG Schedule** — Each channel gets a materialized schedule with real start/stop timestamps for every programme. The schedule loops continuously and drives the TV guide, XMLTV export, and stream positioning.
@@ -25,6 +42,10 @@ Channels are always on standby. No manual start/stop — streams spin up on dema
 - **Media Browser** — Scan your filesystem for movies and TV shows. Poster art detected automatically from sidecar files.
 - **Web UI** — Dark-themed single-page app with channel cards (now-playing + progress), TV guide, media picker, bump manager, live log tail, system stats (CPU/RAM/disk charts), and settings editor.
 - **Configurable Encoding** — x264 preset, CRF, thread count, audio bitrate — all tunable from the settings page.
+
+## Security
+
+Channelarr has no built-in authentication. It is designed for trusted private networks. If you need to expose it beyond your LAN, run it behind a reverse proxy (Traefik, Caddy, nginx) with authentication.
 
 ## Quick Start
 
@@ -92,6 +113,17 @@ Copy the M3U and EPG URLs from the header bar (click the clipboard icon). Add th
 - **M3U**: `http://your-server-ip:5045/api/export/m3u`
 - **EPG**: `http://your-server-ip:5045/api/export/xmltv`
 
+#### Plex (HDHomeRun)
+
+Channelarr emulates an HDHomeRun tuner, so Plex can discover it as a live TV source. In Plex, go to **Settings > Live TV & DVR**, click **Set Up Plex DVR**, and enter `http://your-server-ip:5045` when prompted for the device address. Plex will detect the tuner and import your channel lineup automatically.
+
+HDHomeRun endpoints:
+
+- `/discover.json` — Device discovery
+- `/lineup.json` — Channel lineup
+- `/lineup_status.json` — Scan status
+- `/device.xml` — UPnP device descriptor
+
 ### 6. Guide & Schedule Management
 
 - **Guide** sidebar view shows the full TV guide grid across all channels
@@ -115,7 +147,7 @@ All settings are configurable from the web UI under **Settings**:
 | FFMPEG_THREADS | `1` | FFmpeg threads |
 | X264_THREADS | `4` | x264 encoder threads |
 | AUDIO_BITRATE | `192k` | AAC audio bitrate |
-| BASE_URL | `http://192.168.20.34:5045` | Public base URL for M3U/EPG links |
+| BASE_URL | `http://localhost:5045` | Public base URL for M3U/EPG links |
 
 ## API
 
@@ -153,6 +185,10 @@ All endpoints are under `/api`:
 | POST | `/api/settings` | Save settings |
 | GET | `/api/system/stats` | CPU, RAM, disk stats + 24h history |
 | GET | `/api/logs/tail?pos=0` | Tail application log file |
+| GET | `/discover.json` | HDHomeRun device discovery |
+| GET | `/lineup.json` | HDHomeRun channel lineup |
+| GET | `/lineup_status.json` | HDHomeRun scan status |
+| GET | `/device.xml` | UPnP device descriptor |
 
 ## Architecture
 

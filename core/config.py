@@ -19,7 +19,7 @@ DEFAULTS = {
     "FFMPEG_THREADS": "1",
     "X264_THREADS": "4",
     "AUDIO_BITRATE": "192k",
-    "BASE_URL": "http://192.168.20.34:5045",
+    "BASE_URL": "http://localhost:5045",
     "LOG_FILE": "/app/logs/channelarr.log",
 }
 

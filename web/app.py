@@ -18,7 +18,7 @@ from core.channels import ChannelManager, materialize_schedule
 from core.streamer import StreamerManager
 
 from web import shared_state
-from web.routers import channels, epg, media, bumps, settings, system, hls
+from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr
 
 
 def _clean_stale_hls():
@@ -103,6 +103,7 @@ app.include_router(bumps.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.include_router(hls.router)
+app.include_router(hdhr.router)
 
 
 @app.get("/health")

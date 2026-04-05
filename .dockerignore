@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.pyc
+*.log
+.idea
+.env*
+data/
+lookout-design-system.md

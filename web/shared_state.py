@@ -49,7 +49,7 @@ SETTINGS_SCHEMA = {
                     {"value": "quiet", "label": "Quiet"},
                 ],
             },
-            "BASE_URL": {"label": "Base URL", "type": "text", "placeholder": "http://192.168.20.34:5045"},
+            "BASE_URL": {"label": "Base URL", "type": "text", "placeholder": "http://your-server-ip:5045"},
         },
     },
     "encoding": {
@@ -172,7 +172,7 @@ def get_stats_snapshot():
 # ── M3U + XMLTV regeneration ──
 def regenerate_m3u():
     m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
-    base_url = get_setting("BASE_URL", "http://192.168.20.34:5045")
+    base_url = get_setting("BASE_URL", "http://localhost:5045")
     channels = channel_mgr.list_channels()
 
     os.makedirs(m3u_path, exist_ok=True)
