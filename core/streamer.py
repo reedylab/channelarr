@@ -53,6 +53,10 @@ class ChannelStream:
         self._current_title = ""
         self._last_access = time.time()
 
+        # YouTube pre-fetch tracking
+        self._yt_downloads = {}   # yt_id -> threading.Event
+        self._yt_failures = set() # yt_ids that failed to download
+
     def touch(self):
         """Update last access time — called when clients request segments."""
         self._last_access = time.time()
@@ -264,6 +268,65 @@ class ChannelStream:
             playlist,
         ]
 
+    def _prefetch_yt(self, schedule: list, current_idx: int, lookahead: int = 2):
+        """Start background downloads for the next N YouTube entries."""
+        from core.youtube import yt_download
+        for offset in range(1, lookahead + 1):
+            next_idx = current_idx + offset
+            if next_idx >= len(schedule):
+                if self.loop:
+                    next_idx = next_idx % len(schedule)
+                else:
+                    break
+            entry = schedule[next_idx]
+            if entry.get("type") != "youtube":
+                continue
+            yt_id = entry.get("yt_id", "")
+            if not yt_id or yt_id in self._yt_downloads or yt_id in self._yt_failures:
+                continue
+            if os.path.isfile(entry["path"]):
+                continue
+            event = threading.Event()
+            self._yt_downloads[yt_id] = event
+
+            def _dl(e=entry, ev=event, vid=yt_id):
+                ok = yt_download(e.get("url", ""), e["path"])
+                if not ok:
+                    self._yt_failures.add(vid)
+                ev.set()
+
+            threading.Thread(target=_dl, daemon=True).start()
+            logging.info("[YT] Pre-fetching %s", yt_id)
+
+    def _ensure_yt_ready(self, entry: dict, timeout: float = 900) -> bool:
+        """Wait for a YouTube video to be downloaded. Returns True if ready."""
+        from core.youtube import yt_download
+        yt_id = entry.get("yt_id", "")
+        path = entry["path"]
+
+        if os.path.isfile(path):
+            return True
+        if yt_id in self._yt_failures:
+            return False
+
+        # Start download if not already in progress
+        if yt_id not in self._yt_downloads:
+            event = threading.Event()
+            self._yt_downloads[yt_id] = event
+
+            def _dl():
+                ok = yt_download(entry.get("url", ""), path)
+                if not ok:
+                    self._yt_failures.add(yt_id)
+                event.set()
+
+            threading.Thread(target=_dl, daemon=True).start()
+
+        event = self._yt_downloads.get(yt_id)
+        if event:
+            event.wait(timeout=timeout)
+        return os.path.isfile(path)
+
     def _run_loop(self):
         try:
             self._run_loop_inner()
@@ -295,12 +358,23 @@ class ChannelStream:
                 entry = schedule[i]
                 filepath = entry["path"]
                 is_bump = entry["type"] == "bump"
+                is_youtube = entry.get("type") == "youtube"
                 self._current_title = entry.get("title", os.path.basename(filepath))
                 seek = self.start_seek if is_first_file else 0.0
 
-                logging.info("[STREAM] Channel %s [%d/%d] (offset=%.1fs, seek=%.1fs%s): %s",
+                # YouTube: pre-fetch upcoming and wait for current
+                if is_youtube:
+                    self._prefetch_yt(schedule, i)
+                    if not self._ensure_yt_ready(entry):
+                        logging.warning("[STREAM] Skipping YouTube item %s — download failed",
+                                        entry.get("yt_id", ""))
+                        is_first_file = False
+                        continue
+
+                logging.info("[STREAM] Channel %s [%d/%d] (offset=%.1fs, seek=%.1fs%s%s): %s",
                              self.channel_id, i + 1, len(schedule), ts_offset, seek,
                              ", bump" if is_bump else "",
+                             ", yt" if is_youtube else "",
                              self._current_title)
 
                 bump_duration = 0.0
@@ -354,6 +428,16 @@ class ChannelStream:
                         ts_offset += file_elapsed
                         logging.info("[STREAM] Finished [%s] in %.1fs, next offset=%.1fs",
                                      self._current_title, file_elapsed, ts_offset)
+                        # Clean up YouTube file after successful encoding
+                        if is_youtube:
+                            yt_id = entry.get("yt_id", "")
+                            try:
+                                if os.path.isfile(filepath):
+                                    os.remove(filepath)
+                                    logging.info("[YT] Cleaned up after playback: %s", yt_id)
+                            except OSError as e:
+                                logging.warning("[YT] Cleanup failed for %s: %s", yt_id, e)
+                            self._yt_downloads.pop(yt_id, None)
                     self._enc_proc.stderr.close()
                 except Exception as e:
                     logging.error("[STREAM] Encoder failed for %s: %s", self._current_title, e)
@@ -375,6 +459,8 @@ class ChannelStream:
 
             if self.loop:
                 logging.info("[STREAM] Channel %s playlist ended, looping...", self.channel_id)
+                self._yt_downloads.clear()
+                self._yt_failures.clear()
                 # On loop, recalculate position from schedule
                 if self.channel_mgr:
                     from core.channels import find_schedule_position

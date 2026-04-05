@@ -252,6 +252,21 @@ def _shuffle_weighted(grouped: list, weights: dict, total_episodes: int) -> list
 # Transient schedule generation (ordering only, no timestamps)
 # ---------------------------------------------------------------------------
 
+def _schedule_entry(item: dict) -> dict:
+    """Build a schedule entry from a channel item, preserving YouTube fields."""
+    entry = {
+        "type": item.get("type", "content"),
+        "path": item.get("path", ""),
+        "title": item.get("title", ""),
+    }
+    if item.get("type") == "youtube":
+        entry["url"] = item.get("url", "")
+        entry["yt_id"] = item.get("yt_id", "")
+        entry["duration"] = item.get("duration", 0)
+        entry["thumbnail"] = item.get("thumbnail", "")
+    return entry
+
+
 def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
     """Build the playback schedule, interleaving bumps if configured.
 
@@ -298,8 +313,7 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
     if not folders and bump_cfg.get("folder"):
         folders = [bump_cfg["folder"]]
     if not bump_cfg.get("enabled") or not folders:
-        return [{"type": item.get("type", "content"), "path": item["path"],
-                 "title": item.get("title", "")} for item in items]
+        return [_schedule_entry(item) for item in items]
 
     count = bump_cfg.get("count", 1)
     freq = bump_cfg.get("frequency", "between")
@@ -356,11 +370,7 @@ def generate_schedule(channel: dict, bump_manager, media_library=None) -> list:
                     bump_idx += 1
                     schedule.append({"type": "bump", "path": b, "title": os.path.basename(b)})
 
-        schedule.append({
-            "type": item.get("type", "content"),
-            "path": item["path"],
-            "title": item.get("title", ""),
-        })
+        schedule.append(_schedule_entry(item))
 
     logging.info("[SCHEDULE] Built schedule: %d content + %d bumps", len(items), bump_idx)
     return schedule
@@ -390,23 +400,34 @@ def materialize_schedule(channel: dict, bump_manager, media_library=None) -> dic
     materialized = []
 
     for entry in ordered:
-        filepath = entry["path"]
-        duration = ffprobe_duration(filepath)
-        if duration <= 0:
-            logging.warning("[MATERIALIZE] Skipping %s — could not determine duration", filepath)
-            continue
+        if entry.get("type") == "youtube":
+            from core.youtube import yt_cache_path, yt_get_duration
+            yt_id = entry.get("yt_id", "")
+            filepath = yt_cache_path(yt_id)
+            duration = entry.get("duration", 0)
+            if duration <= 0:
+                duration = yt_get_duration(entry.get("url", ""))
+            if duration <= 0:
+                logging.warning("[MATERIALIZE] Skipping YouTube item %s — no duration", yt_id)
+                continue
+            title = entry.get("title", "") or yt_id
+            desc = ""
+        else:
+            filepath = entry["path"]
+            duration = ffprobe_duration(filepath)
+            if duration <= 0:
+                logging.warning("[MATERIALIZE] Skipping %s — could not determine duration", filepath)
+                continue
+            title = entry.get("title", "") or os.path.basename(filepath)
+            desc = ""
+            if entry["type"] != "bump":
+                title = read_nfo_title(filepath)
+                desc = read_nfo_plot(filepath)
 
         start_time = epoch + timedelta(seconds=elapsed)
         stop_time = start_time + timedelta(seconds=duration)
 
-        # Build title and description from NFO
-        title = entry.get("title", "") or os.path.basename(filepath)
-        desc = ""
-        if entry["type"] != "bump":
-            title = read_nfo_title(filepath)
-            desc = read_nfo_plot(filepath)
-
-        materialized.append({
+        mat_entry = {
             "type": entry["type"],
             "path": filepath,
             "title": title,
@@ -414,7 +435,12 @@ def materialize_schedule(channel: dict, bump_manager, media_library=None) -> dic
             "duration": duration,
             "start": start_time.isoformat(),
             "stop": stop_time.isoformat(),
-        })
+        }
+        if entry.get("type") == "youtube":
+            mat_entry["url"] = entry.get("url", "")
+            mat_entry["yt_id"] = entry.get("yt_id", "")
+            mat_entry["thumbnail"] = entry.get("thumbnail", "")
+        materialized.append(mat_entry)
         elapsed += duration
 
     channel["materialized_schedule"] = materialized

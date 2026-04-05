@@ -69,7 +69,7 @@ def api_epg_guide(hours: int = Query(default=6)):
                                           ch.get("loop", True), window_start, horizon)
             )
             for entry in merged:
-                entries.append({
+                ep = {
                     "title": entry.get("title", ""),
                     "desc": entry.get("desc", ""),
                     "type": entry.get("type", ""),
@@ -77,7 +77,10 @@ def api_epg_guide(hours: int = Query(default=6)):
                     "start": entry["start"].isoformat() if hasattr(entry["start"], "isoformat") else entry["start"],
                     "stop": entry["stop"].isoformat() if hasattr(entry["stop"], "isoformat") else entry["stop"],
                     "duration": entry.get("duration", 0),
-                })
+                }
+                if entry.get("thumbnail"):
+                    ep["thumbnail"] = entry["thumbnail"]
+                entries.append(ep)
 
         guide.append({
             "id": ch["id"],

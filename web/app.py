@@ -18,7 +18,7 @@ from core.channels import ChannelManager, materialize_schedule
 from core.streamer import StreamerManager
 
 from web import shared_state
-from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr
+from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube
 
 
 def _clean_stale_hls():
@@ -75,6 +75,8 @@ async def lifespan(app: FastAPI):
     shared_state.streamer_mgr = streamer_mgr
     shared_state.log_path = log_file
 
+    from core.youtube import yt_cleanup_all
+    yt_cleanup_all()
     _clean_stale_hls()
     _materialize_missing(channel_mgr, bump_mgr, media_lib)
     shared_state.regenerate_m3u()
@@ -104,6 +106,7 @@ app.include_router(settings.router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.include_router(hls.router)
 app.include_router(hdhr.router)
+app.include_router(youtube.router, prefix="/api")
 
 
 @app.get("/health")

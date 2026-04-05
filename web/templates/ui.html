@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=18" />
+  <link rel="stylesheet" href="/static/style.css?v=19" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -218,57 +218,57 @@
         <button id="modal-close" class="btn-close">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="setting-field">
-          <label>Channel Name</label>
-          <input type="text" id="ch-name" placeholder="Movie Night" />
-        </div>
-
-        <div class="setting-field ch-logo-field">
-          <label>Channel Logo</label>
-          <div class="ch-logo-row">
-            <img id="ch-logo-preview" class="ch-logo-thumb" style="display:none" alt="Logo" />
-            <input type="file" id="ch-logo-input" accept="image/png,image/jpeg" />
-            <button type="button" class="btn btn-sm btn-danger" id="ch-logo-delete" style="display:none" onclick="channelarr.deleteLogo()">Remove</button>
+        <div class="modal-top-row">
+          <div class="setting-field" style="flex:1">
+            <label>Channel Name</label>
+            <input type="text" id="ch-name" placeholder="Movie Night" />
+          </div>
+          <div class="setting-field ch-logo-field">
+            <label>Logo</label>
+            <div class="ch-logo-row">
+              <img id="ch-logo-preview" class="ch-logo-thumb" style="display:none" alt="Logo" />
+              <input type="file" id="ch-logo-input" accept="image/png,image/jpeg" />
+              <button type="button" class="btn btn-sm btn-danger" id="ch-logo-delete" style="display:none" onclick="channelarr.deleteLogo()">Remove</button>
+            </div>
           </div>
         </div>
 
-        <div class="modal-two-col">
+        <div class="modal-three-col">
           <!-- Left: current items -->
           <div class="modal-col">
             <h4>Content <span id="ch-item-count" class="muted">(0)</span></h4>
             <div id="ch-items" class="ch-items-list"></div>
           </div>
-          <!-- Right: media picker -->
+          <!-- Center: media picker -->
           <div class="modal-col">
             <h4>Add Content</h4>
             <div class="picker-tabs">
               <button class="btn btn-ghost picker-tab active" data-ptab="movies">Movies</button>
               <button class="btn btn-ghost picker-tab" data-ptab="tv">TV</button>
+              <button class="btn btn-ghost picker-tab" data-ptab="youtube">YouTube</button>
             </div>
             <input type="text" id="picker-search" class="media-search" placeholder="Search..." />
             <div id="picker-list" class="picker-list"></div>
           </div>
-        </div>
-
-        <div class="modal-section">
-          <h4>Bumps</h4>
-          <div class="bump-cfg">
-            <div class="bump-cfg-toggles">
-              <label class="toggle-label">
-                <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
-              </label>
-              <label class="toggle-label">
-                <input type="checkbox" id="ch-bump-start" /> Play bumps at start
-              </label>
-              <label class="toggle-label">
-                <input type="checkbox" id="ch-bump-next" /> Show "Up Next" overlay
-              </label>
-            </div>
-            <div class="setting-field">
-              <label>Folders</label>
-              <div id="ch-bump-folders" class="bump-folders-checklist"></div>
-            </div>
-            <div class="bump-cfg-row">
+          <!-- Right: bumps + playback -->
+          <div class="modal-col modal-col-config">
+            <h4>Bumps</h4>
+            <div class="bump-cfg">
+              <div class="bump-cfg-toggles-col">
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
+                </label>
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-start" /> Start bumps
+                </label>
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-next" /> "Up Next" overlay
+                </label>
+              </div>
+              <div class="setting-field">
+                <label>Folders</label>
+                <div id="ch-bump-folders" class="bump-folders-checklist"></div>
+              </div>
               <div class="setting-field">
                 <label>Frequency</label>
                 <select id="ch-bump-freq">
@@ -282,12 +282,7 @@
                 <input type="number" id="ch-bump-count" value="1" min="1" max="5" />
               </div>
             </div>
-          </div>
-        </div>
-
-        <div class="modal-section">
-          <h4>Playback</h4>
-          <div class="ch-playback-options">
+            <h4 style="margin-top:12px">Playback</h4>
             <div class="setting-field">
               <label>Shuffle Mode</label>
               <select id="ch-shuffle-mode">
@@ -302,7 +297,7 @@
               <div id="ch-weights-list" class="ch-weights-list"></div>
               <div id="ch-weights-total" class="ch-weights-total"></div>
             </div>
-            <label class="toggle-label"><input type="checkbox" id="ch-loop" checked /> Loop</label>
+            <label class="toggle-label" style="margin-top:8px"><input type="checkbox" id="ch-loop" checked /> Loop</label>
           </div>
         </div>
 
@@ -335,6 +330,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=20"></script>
+  <script src="/static/ui.js?v=21"></script>
 </body>
 </html>

@@ -72,13 +72,18 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
                 desc_el.text = desc
 
             cat_el = SubElement(prog, "category", lang="en")
-            if entry["type"] == "episode":
+            if entry["type"] == "youtube":
+                cat_el.text = "YouTube"
+            elif entry["type"] == "episode":
                 cat_el.text = "Series"
             else:
                 cat_el.text = "Movie"
 
-            logo_url = f"{base_url}/api/logo/{cid}"
-            SubElement(prog, "icon", src=logo_url)
+            if entry.get("thumbnail"):
+                SubElement(prog, "icon", src=entry["thumbnail"])
+            else:
+                logo_url = f"{base_url}/api/logo/{cid}"
+                SubElement(prog, "icon", src=logo_url)
 
             count += 1
 

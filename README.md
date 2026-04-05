@@ -1,12 +1,14 @@
 # Channelarr
 
-A self-hosted custom TV channel builder. Create your own 24/7 live TV channels from your media library — movies, TV shows, and bump clips — served as HLS streams compatible with Jellyfin, Threadfin, Manifold, or any IPTV client.
+A self-hosted custom TV channel builder. Create your own 24/7 live TV channels from your media library and YouTube — movies, TV shows, YouTube channels/playlists, and bump clips — served as HLS streams compatible with Jellyfin, Threadfin, Manifold, or any IPTV client.
+
+YouTube videos are streamed ephemerally — downloaded just before playback, encoded through the same pipeline as local files, and deleted immediately after. Zero permanent storage.
 
 ## What It Does
 
-Channelarr lets you build TV channels that feel like real broadcast television. Add movies and shows to a channel, configure bumps (short interstitial clips like station idents or "up next" segments), and the app generates a persistent EPG schedule with real timestamps. When a client requests a stream, encoding starts from wherever the schedule says it should be — even mid-episode — just like tuning into a real TV channel.
+Channelarr lets you build TV channels that feel like real broadcast television. Add movies, shows, and YouTube content to a channel, configure bumps (short interstitial clips like station idents or "up next" segments), and the app generates a persistent EPG schedule with real timestamps. When a client requests a stream, encoding starts from wherever the schedule says it should be — even mid-episode — just like tuning into a real TV channel.
 
-Channels are always on standby. No manual start/stop — streams spin up on demand and auto-stop when viewers disconnect.
+Channels are always on standby. No background processes, no always-on streams — everything is client-driven. Streams spin up on demand when a viewer tunes in and auto-stop after 5 minutes with no viewers. YouTube videos are downloaded just-in-time (2 videos ahead of the current position), streamed through the same FFmpeg pipeline as local files, and deleted immediately after playback. At any moment, only 2-3 YouTube videos exist on disk.
 
 ## Screenshots
 
@@ -27,10 +29,12 @@ Channels are always on standby. No manual start/stop — streams spin up on dema
 
 ## Features
 
-- **Persistent EPG Schedule** — Each channel gets a materialized schedule with real start/stop timestamps for every programme. The schedule loops continuously and drives the TV guide, XMLTV export, and stream positioning.
+- **Ephemeral YouTube Streaming** — Add YouTube channels and playlists as content sources. Videos are downloaded just before playback and deleted immediately after — zero permanent storage. Browse and add entire playlists from the channel editor. Thumbnails appear in the EPG guide and XMLTV export.
+- **Persistent EPG Schedule** — Each channel gets a materialized schedule with real start/stop timestamps for every programme. The schedule loops continuously and drives the TV guide, XMLTV export, and stream positioning. YouTube and local content are interleaved seamlessly.
+- **Fully On-Demand** — No background processes, no always-on daemons. Streams start when a client tunes in and stop when viewers leave. YouTube downloads happen just-in-time during active streams only.
 - **Schedule-Aware Streaming** — When a client tunes in, FFmpeg seeks to the correct position in the schedule. If the guide says a movie is 45 minutes in, that's where playback begins.
-- **TV Guide** — Manifold-style EPG grid with channel logos, color-coded programme blocks (blue for movies, purple for episodes), click-to-view detail popovers with poster art and plot descriptions, and a red "now" line.
-- **Channel Builder** — Create channels from your movie and TV library. Add whole shows or individual episodes. Configure shuffle mode, loop, and bumps per-channel.
+- **TV Guide** — EPG grid with channel logos, color-coded programme blocks, click-to-view detail popovers with poster art (or YouTube thumbnails) and plot descriptions, and a red "now" line.
+- **Channel Builder** — Create channels from your movie/TV library and YouTube. Add whole shows, individual episodes, or entire YouTube playlists. Configure shuffle mode, loop, and bumps per-channel.
 - **Advanced Shuffle Modes** — Four shuffle strategies: **None** (play in order), **Random** (full shuffle), **Round Robin** (alternate episodes across shows: A1, B1, A2, B2...), and **Weighted Random** (percentage-based split, e.g. 75% Show A / 25% Show B). Configurable from the UI or API.
 - **Bump System** — Insert short clips between content (station idents, transitions, promos). Organize bumps into folders, download from YouTube via yt-dlp, and configure frequency, count, and placement per channel.
 - **"Up Next" Overlays** — During bumps, display the next content's title and poster image with a countdown timer, just like real TV.
@@ -81,7 +85,7 @@ Open `http://your-server-ip:5045` in your browser.
 
 ### 1. Create a Channel
 
-Click **New Channel**, give it a name, and add content from your media library. Optionally upload a logo and configure bumps. The schedule is automatically generated when you save.
+Click **New Channel**, give it a name, and add content from your media library or YouTube. Optionally upload a logo and configure bumps. The schedule is automatically generated when you save.
 
 ### 2. Configure Bumps (Optional)
 
@@ -98,15 +102,30 @@ In the channel editor under **Playback**, choose a shuffle mode:
 
 For AI agent integration, `GET /api/channels/shuffle-modes` returns the full schema and example payloads for creating channels with any shuffle mode via the API.
 
-### 4. Watch
+### 4. Add YouTube Content (Optional)
 
-Click **Watch** on any channel card. The stream auto-starts from the current schedule position. The stream URL for external clients is:
+In the channel editor, click the **YouTube** tab in the content picker. Paste a YouTube channel or playlist URL and click **Browse**. Videos appear with thumbnails and durations. Click **Add** on individual videos or **Add All** to add the entire playlist.
+
+YouTube videos are not downloaded when you save the channel — only their metadata (title, duration, thumbnail) is stored. Downloads happen automatically when the stream reaches each video:
+
+1. The next 2 YouTube videos are pre-fetched in the background
+2. When the schedule reaches a YouTube entry, the file is already waiting
+3. FFmpeg encodes it through the same pipeline as local files
+4. After playback, the file is deleted immediately
+
+If a download fails (network issue, removed video), the entry is skipped and the stream continues with the next item.
+
+### 5. Watch
+
+Click **Watch** on any channel card. For channels with YouTube content, the first playback may take 30-60 seconds while the initial video downloads.
+
+For channels with YouTube content, the first playback may take 30-60 seconds while the initial video downloads. The stream URL for external clients is:
 
 ```
 http://your-server-ip:5045/live/<channel-id>/stream.m3u8
 ```
 
-### 5. Add to IPTV Clients
+### 6. Add to IPTV Clients
 
 Copy the M3U and EPG URLs from the header bar (click the clipboard icon). Add them to Jellyfin, Threadfin, Manifold, or any IPTV client that supports M3U + XMLTV.
 
@@ -124,7 +143,7 @@ HDHomeRun endpoints:
 - `/lineup_status.json` — Scan status
 - `/device.xml` — UPnP device descriptor
 
-### 6. Guide & Schedule Management
+### 7. Guide & Schedule Management
 
 - **Guide** sidebar view shows the full TV guide grid across all channels
 - **Refresh** (header) regenerates M3U + XMLTV from existing schedules
@@ -185,6 +204,7 @@ All endpoints are under `/api`:
 | POST | `/api/settings` | Save settings |
 | GET | `/api/system/stats` | CPU, RAM, disk stats + 24h history |
 | GET | `/api/logs/tail?pos=0` | Tail application log file |
+| POST | `/api/youtube/browse` | Browse a YouTube channel or playlist |
 | GET | `/discover.json` | HDHomeRun device discovery |
 | GET | `/lineup.json` | HDHomeRun channel lineup |
 | GET | `/lineup_status.json` | HDHomeRun scan status |
@@ -197,6 +217,7 @@ channelarr/
   core/
     channels.py    — Channel CRUD, schedule materialization, position calculation
     streamer.py    — FFmpeg HLS streaming engine (pipe-based, schedule-aware)
+    youtube.py     — YouTube metadata, ephemeral download, cache management
     bumps.py       — Bump clip scanning, cycling, YouTube downloads
     media.py       — Media library filesystem scanner
     config.py      — JSON-backed settings with env fallback
@@ -210,6 +231,7 @@ channelarr/
       epg.py       — EPG, schedule, and M3U/XMLTV export
       media.py     — Media library endpoints
       bumps.py     — Bump clip management
+      youtube.py   — YouTube browse endpoint
       settings.py  — Settings endpoints
       system.py    — System stats + log tail
       hls.py       — HLS playlist/segment serving + schedule-aware auto-start
@@ -232,17 +254,22 @@ Bump clips are included in the schedule for timing accuracy but excluded from EP
 
 Content files are encoded by FFmpeg to MPEG-TS and piped into an HLS segmenter. The pipe never breaks between files, so playback is seamless. The first file in a session may be seeked into (via `-ss`) to match the schedule position. Streams auto-stop after 5 minutes of inactivity.
 
+### YouTube Integration
+
+YouTube videos are treated as ephemeral content — no permanent storage. When the stream reaches a YouTube entry, the pre-fetch worker has already downloaded it to a temporary cache (`/app/data/yt_cache/`). After FFmpeg finishes encoding the file, it is deleted immediately. The pre-fetch worker stays 2 entries ahead of the current position, so downloads happen in the background while the current item plays. If a download fails, the entry is skipped and the stream continues. The cache is wiped on every startup.
+
 ## Stack
 
 - **FastAPI** + **Uvicorn** (ASGI)
 - **Jinja2** templates + vanilla CSS + vanilla JS
 - **FFmpeg** for encoding (included in Docker image)
+- **yt-dlp** for YouTube metadata and downloads (included in Docker image)
 - JSON file storage (no database)
 
 ## Requirements
 
 - Docker
-- A media library (movies/TV shows as video files)
+- A media library (movies/TV shows as video files) and/or YouTube URLs
 
 ## License
 

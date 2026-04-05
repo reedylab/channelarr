@@ -435,11 +435,12 @@ function renderEditorItems() {
     return;
   }
   list.innerHTML = editorItems.map((item, i) => {
-    const badge = item.type === "show" ? "show" : (item.type || "?");
+    const badge = item.type === "show" ? "show" : item.type === "youtube" ? "yt" : (item.type || "?");
+    const titleAttr = item.type === "youtube" ? item.url : item.path;
     return `
     <div class="ch-item">
-      <span class="ch-item-type ${item.type === "show" ? "ch-item-show" : ""}">${esc(badge)}</span>
-      <span class="ch-item-title" title="${esc(item.path)}">${esc(item.title || item.path)}</span>
+      <span class="ch-item-type ${item.type === "show" ? "ch-item-show" : item.type === "youtube" ? "ch-item-yt" : ""}">${esc(badge)}</span>
+      <span class="ch-item-title" title="${esc(titleAttr || "")}">${esc(item.title || item.path || item.url)}</span>
       <button class="btn-remove" onclick="channelarr.removeItem(${i})">&times;</button>
     </div>`;
   }).join("");
@@ -506,6 +507,17 @@ async function renderPicker() {
         <button class="btn-add" onclick='channelarr.addToChannel(${JSON.stringify({type:"movie",path:m.path,title:m.title,runtime:m.runtime||0}).replace(/'/g,"\\'")})'">Add</button>
       </div>
     `).join("") || '<div class="empty-state">No movies found</div>';
+  } else if (pickerTab === "youtube") {
+    list.innerHTML = `
+      <div class="yt-browse-form">
+        <input type="text" id="yt-browse-url" class="media-search" placeholder="Paste YouTube channel or playlist URL..." />
+        <button class="btn btn-primary" id="yt-browse-btn">Browse</button>
+      </div>
+      <div id="yt-results">${ytResults.length ? "" : '<div class="empty-state">Paste a URL and click Browse</div>'}</div>
+    `;
+    $("#yt-browse-btn").addEventListener("click", browseYouTube);
+    $("#yt-browse-url").addEventListener("keydown", e => { if (e.key === "Enter") browseYouTube(); });
+    if (ytResults.length) renderYTResults();
   } else {
     if (!tvShows.length) await loadTVShows();
     let filtered = tvShows;
@@ -552,6 +564,81 @@ channelarr.drillShow = async function(showPath, title) {
     renderPicker();
   } catch(e) { toast("error", "Failed to load episodes"); }
 };
+
+// ─── YouTube picker ───
+let ytResults = [];
+
+async function browseYouTube() {
+  const url = ($("#yt-browse-url") || {}).value;
+  if (!url || !url.trim()) return;
+  const resultsDiv = $("#yt-results");
+  if (resultsDiv) resultsDiv.innerHTML = '<div class="empty-state">Loading...</div>';
+  try {
+    const r = await fetch(`${API}/youtube/browse`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url: url.trim()}),
+    });
+    const d = await r.json();
+    if (!r.ok) { toast("error", d.error || "Browse failed"); return; }
+    ytResults = d.videos || [];
+    renderYTResults();
+    toast("info", `Found ${ytResults.length} videos`);
+  } catch(e) { toast("error", "Failed to browse YouTube"); }
+}
+
+function renderYTResults() {
+  const resultsDiv = $("#yt-results");
+  if (!resultsDiv) return;
+  const q = ($("#picker-search").value || "").toLowerCase();
+  let filtered = ytResults;
+  if (q) filtered = ytResults.filter(v => (v.title || "").toLowerCase().includes(q));
+
+  let html = "";
+  if (filtered.length > 1) {
+    html += `<div class="yt-add-all"><button class="btn btn-primary" id="yt-add-all-btn">Add All (${filtered.length})</button></div>`;
+  }
+  html += filtered.slice(0, 50).map((v, i) => `
+    <div class="picker-item">
+      <img class="picker-poster" src="${esc(v.thumbnail || "")}" alt="" onerror="this.classList.add('no-poster')" />
+      <div class="picker-item-info">
+        <div class="picker-item-title">${esc(v.title)}</div>
+        <div class="picker-item-sub">${v.duration ? formatDuration(v.duration) : "?"}</div>
+      </div>
+      <button class="btn-add yt-add-one" data-idx="${i}">Add</button>
+    </div>
+  `).join("") || '<div class="empty-state">No videos found</div>';
+
+  resultsDiv.innerHTML = html;
+
+  // Bind individual add buttons
+  resultsDiv.querySelectorAll(".yt-add-one").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const v = filtered[parseInt(btn.dataset.idx)];
+      channelarr.addToChannel({
+        type: "youtube", url: v.url, yt_id: v.yt_id,
+        title: v.title, duration: v.duration || 0, thumbnail: v.thumbnail || "",
+      });
+    });
+  });
+
+  // Bind add-all button
+  const addAllBtn = document.getElementById("yt-add-all-btn");
+  if (addAllBtn) {
+    addAllBtn.addEventListener("click", () => {
+      filtered.forEach(v => {
+        editorItems.push({
+          type: "youtube", url: v.url, yt_id: v.yt_id,
+          title: v.title, duration: v.duration || 0, thumbnail: v.thumbnail || "",
+        });
+      });
+      renderEditorItems();
+      if ($("#ch-shuffle-mode").value === "weighted") renderWeightRows();
+      updateSchedulePreview();
+      toast("info", `Added ${filtered.length} YouTube videos`);
+    });
+  }
+}
 
 function updateSchedulePreview() {
   const container = $("#ch-schedule");
@@ -608,6 +695,8 @@ function updateSchedulePreview() {
     }
     if (item.type === "show") {
       sched.push({ type: "show", title: (item.title || item.path) + " (all episodes)" });
+    } else if (item.type === "youtube") {
+      sched.push({ type: "youtube", title: item.title || item.url });
     } else {
       sched.push({ type: item.type, title: item.title || item.path });
     }
@@ -617,7 +706,7 @@ function updateSchedulePreview() {
     if (s.type === "info") {
       return `<div class="sched-item" style="background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);color:var(--accent);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;justify-content:center">${esc(s.title)}</div>`;
     }
-    const cls = s.type === "bump" ? "sched-bump" : s.type === "show" ? "sched-show" : "sched-content";
+    const cls = s.type === "bump" ? "sched-bump" : s.type === "show" ? "sched-show" : s.type === "youtube" ? "sched-yt" : "sched-content";
     return `
     <div class="sched-item ${cls}">
       <span class="sched-num">${i}</span>
@@ -747,7 +836,7 @@ function renderGuide(data) {
 
       const startT = new Date(entry.start).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
       const stopT = new Date(entry.stop).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
-      const posterUrl = entry.path ? `${API}/media/poster?path=${encodeURIComponent(entry.path)}` : "";
+      const posterUrl = entry.thumbnail ? entry.thumbnail : entry.path ? `${API}/media/poster?path=${encodeURIComponent(entry.path)}` : "";
       const imgTag = posterUrl && width > 44 ? `<img class="gp-icon" src="${posterUrl}" onerror="this.remove()">` : "";
       const titleSpan = width > (posterUrl && width > 44 ? 80 : 60) ? `<span class="gp-title">${esc(entry.title)}</span>` : "";
 
