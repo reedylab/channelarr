@@ -6,6 +6,7 @@
   --text:#e6edf3;
   --text-muted:#7d8590;
   --accent:#58a6ff;
+  --accent-2:#8b5cf6;
   --danger:#f85149;
   --ok:#3fb950;
   --warn:#d29922;
@@ -66,18 +67,18 @@ button,input,select,textarea{font-family:inherit}
 
 /* Buttons & Badges */
 .btn{
-  background:var(--bg-card);border:1px solid var(--border);color:var(--text-muted);
+  background:#2a3143;border:1px solid var(--border);color:var(--text);
   padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;transition:all 0.15s;
 }
-.btn:hover,.btn.active{color:var(--text);border-color:var(--accent)}
-.btn-primary{background:var(--accent);border-color:transparent;color:var(--bg);font-weight:600}
+.btn:hover{filter:brightness(1.15)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));border-color:transparent;color:#fff}
 .btn-primary:hover{filter:brightness(1.1)}
 .btn-ghost{background:transparent;border-color:var(--border);color:var(--text-muted)}
 .btn-danger{background:var(--danger);border-color:var(--danger);color:white}
 .btn-danger:hover{filter:brightness(1.1)}
 .btn-sm-header{padding:5px 12px;font-size:12px;border-radius:6px}
-.btn-sm{padding:2px 8px;font-size:11px;border-radius:4px;background:var(--bg-hover);border:1px solid var(--border);color:var(--text-muted);cursor:pointer;transition:all 0.15s}
-.btn-sm:hover{color:var(--text);border-color:var(--accent)}
+.btn-sm{padding:2px 8px;font-size:11px;border-radius:4px;background:var(--bg-hover);border:1px solid var(--border);color:var(--text);cursor:pointer;transition:all 0.15s}
+.btn-sm:hover{background:var(--accent);border-color:var(--accent);color:white}
 .btn-close{background:none;border:none;color:var(--text-muted);font-size:22px;cursor:pointer;padding:0 4px}
 .btn-close:hover{color:var(--text)}
 
@@ -487,14 +488,14 @@ button,input,select,textarea{font-family:inherit}
 .ch-now-playing{
   padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:4px;
 }
-.ch-now-label{font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--accent);margin-bottom:2px}
+.ch-now-label{font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--text-muted);margin-bottom:2px}
 .ch-now-title{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ch-now-remaining{font-size:11px;color:var(--text-muted);margin-top:2px}
 .ch-progress-bar{
   height:3px;background:var(--bg);border-radius:2px;margin-top:6px;overflow:hidden;
 }
-.ch-progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width 1s linear}
-.badge-schedule{background:var(--bg-hover);border:1px solid var(--accent);color:var(--accent);font-size:11px;padding:1px 7px;border-radius:10px}
+.ch-progress-fill{height:100%;background:var(--ok);border-radius:2px;transition:width 1s linear}
+.badge-schedule{background:var(--bg-hover);border:1px solid var(--border);color:var(--text-muted);font-size:11px;padding:1px 7px;border-radius:10px}
 
 /* Guide view — manifold-style grid */
 .guide-controls{display:flex;align-items:center;gap:10px}

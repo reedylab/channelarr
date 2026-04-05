@@ -929,7 +929,7 @@ function renderBumps() {
     <div class="bump-folder" onclick="channelarr.toggleBumpFolder(this)">
       <h4>${esc(name)}</h4>
       <div class="bump-count">${items.length} clip${items.length !== 1 ? "s" : ""}</div>
-      <div class="bump-clips hidden">
+      <div class="bump-clips">
         ${items.map(clip => `
           <div class="bump-clip">
             <img class="bump-thumb" src="${API}/bumps/thumbnail?path=${encodeURIComponent(clip.path)}" alt="" onerror="this.classList.add('no-thumb')" />
