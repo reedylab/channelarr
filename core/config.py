@@ -19,6 +19,7 @@ DEFAULTS = {
     "FFMPEG_THREADS": "1",
     "X264_THREADS": "4",
     "AUDIO_BITRATE": "192k",
+    "YT_CACHE_PATH": "/yt_cache",
     "BASE_URL": "http://localhost:5045",
     "LOG_FILE": "/app/logs/channelarr.log",
 }

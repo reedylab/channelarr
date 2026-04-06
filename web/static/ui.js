@@ -1273,6 +1273,7 @@ async function updateSystemStats() {
     renderLineChart("cpu-chart", statsData.history.timestamps, statsData.history.cpu, {color:"var(--accent)", label:"CPU"});
     renderLineChart("ram-chart", statsData.history.timestamps, statsData.history.ram, {color:"var(--accent)", label:"RAM"});
     renderDiskGauge();
+    renderYTCacheChart();
   } catch(e) {}
 }
 
@@ -1288,6 +1289,7 @@ function renderStatGauges() {
   } else {
     $("#disk-live").textContent = "--";
   }
+  $("#yt-cache-live").textContent = c.yt_cache_bytes != null ? fmtBytes(c.yt_cache_bytes) : "--";
 }
 
 function renderDiskGauge() {
@@ -1310,6 +1312,27 @@ function renderDiskGauge() {
         <span>Total: ${fmtBytes(d.total)}</span>
       </div>
     </div>`;
+}
+
+function renderYTCacheChart() {
+  const container = $("#yt-cache-chart");
+  if (!statsData || !statsData.history.yt_cache) {
+    container.innerHTML = '<div class="empty-state">Collecting data...</div>';
+    return;
+  }
+  const timestamps = statsData.history.timestamps;
+  const values = statsData.history.yt_cache;
+  if (!values.length) {
+    container.innerHTML = '<div class="empty-state">Collecting data...</div>';
+    return;
+  }
+  const maxBytes = Math.max(...values, 1);
+  const pctValues = values.map(v => (v / maxBytes) * 100);
+  const maxLabel = fmtBytes(maxBytes);
+  renderLineChart(container.id, timestamps, pctValues, {
+    color: "var(--danger)", label: "YT Cache", maxLabel,
+    formatTip: (val, idx) => `${fmtBytes(values[idx])}`
+  });
 }
 
 function renderLineChart(containerId, timestamps, values, opts) {
@@ -1369,7 +1392,7 @@ function renderLineChart(containerId, timestamps, values, opts) {
     const val = values[idx];
     const d = new Date(timestamps[idx] * 1000);
     const time = `${d.getHours().toString().padStart(2,"0")}:${d.getMinutes().toString().padStart(2,"0")}`;
-    tip.textContent = `${opts.label}: ${val.toFixed(1)}% at ${time}`;
+    tip.textContent = opts.formatTip ? `${opts.formatTip(val, idx)} at ${time}` : `${opts.label}: ${val.toFixed(1)}% at ${time}`;
     tip.style.display = "block";
     tip.style.left = `${e.clientX - rect.left + 12}px`;
     tip.style.top = `${e.clientY - rect.top - 30}px`;

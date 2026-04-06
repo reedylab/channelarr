@@ -11,6 +11,7 @@ services:
       - /path/to/m3u:/m3u
       - channelarr-data:/app/data
       - channelarr-logs:/app/logs
+      - /path/to/youtube-cache:/yt_cache
     environment:
       - PYTHONUNBUFFERED=1
       - BASE_URL=http://your-server-ip:5045

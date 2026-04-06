@@ -105,7 +105,8 @@ class ChannelStream:
     def _build_encoder_cmd(self, filepath: str, ts_offset: float = 0.0,
                            seek_seconds: float = 0.0,
                            is_bump: bool = False, bump_duration: float = 0.0,
-                           next_title: str = "", next_poster: str = "") -> list:
+                           next_title: str = "", next_poster: str = "",
+                           is_youtube: bool = False) -> list:
         """Build FFmpeg command to encode a single file to MPEG-TS on stdout.
 
         seek_seconds: if > 0, seek into the file before encoding (for schedule catch-up).
@@ -118,6 +119,8 @@ class ChannelStream:
             "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
             "format=yuv420p"
         )
+        # YouTube content uses a faster preset to reduce CPU load
+        preset = "veryfast" if is_youtube else self.video_preset
 
         use_poster = bool(is_bump and next_title and next_poster and os.path.isfile(next_poster))
 
@@ -207,7 +210,7 @@ class ChannelStream:
                 "-r", "30",
                 "-c:v", "libx264",
                 "-x264-params", f"threads={self.x264_threads}",
-                "-preset", self.video_preset,
+                "-preset", preset,
                 "-profile:v", "high",
                 "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
                 "-c:a", "aac",
@@ -234,7 +237,7 @@ class ChannelStream:
                 "-r", "30",
                 "-c:v", "libx264",
                 "-x264-params", f"threads={self.x264_threads}",
-                "-preset", self.video_preset,
+                "-preset", preset,
                 "-profile:v", "high",
                 "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
                 "-c:a", "aac",
@@ -397,6 +400,7 @@ class ChannelStream:
                     bump_duration=bump_duration,
                     next_title=next_title,
                     next_poster=next_poster,
+                    is_youtube=is_youtube,
                 )
                 file_start = time.time()
                 is_first_file = False
@@ -438,7 +442,8 @@ class ChannelStream:
                             except OSError as e:
                                 logging.warning("[YT] Cleanup failed for %s: %s", yt_id, e)
                             self._yt_downloads.pop(yt_id, None)
-                    self._enc_proc.stderr.close()
+                    if self._enc_proc and self._enc_proc.stderr:
+                        self._enc_proc.stderr.close()
                 except Exception as e:
                     logging.error("[STREAM] Encoder failed for %s: %s", self._current_title, e)
                 finally:

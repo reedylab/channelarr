@@ -33,6 +33,7 @@ SETTINGS_SCHEMA = {
             "BUMPS_PATH": {"label": "Bumps Path", "type": "text", "placeholder": "/bumps"},
             "HLS_OUTPUT_PATH": {"label": "HLS Output Path", "type": "text", "placeholder": "/app/data/hls"},
             "M3U_OUTPUT_PATH": {"label": "M3U Output Path", "type": "text", "placeholder": "/m3u"},
+            "YT_CACHE_PATH": {"label": "YouTube Cache Path", "type": "text", "placeholder": "/yt_cache"},
         },
     },
     "streaming": {
@@ -116,16 +117,19 @@ SETTINGS_SCHEMA = {
 # ── Stats collector ──
 _cpu_history = collections.deque(maxlen=2880)
 _ram_history = collections.deque(maxlen=2880)
+_yt_cache_history = collections.deque(maxlen=2880)
 _stats_timestamps = collections.deque(maxlen=2880)
 _stats_started = False
 
 
 def _stats_collector():
+    from core.youtube import yt_cache_size
     while True:
         cpu = psutil.cpu_percent(interval=1)
         mem = psutil.virtual_memory()
         _cpu_history.append(cpu)
         _ram_history.append(mem.percent)
+        _yt_cache_history.append(yt_cache_size())
         _stats_timestamps.append(time.time())
         time.sleep(29)
 
@@ -159,12 +163,16 @@ def get_stats_snapshot():
         }
     except Exception:
         pass
+    from core.youtube import yt_cache_size
+    current["yt_cache_bytes"] = yt_cache_size()
+
     return {
         "current": current,
         "history": {
             "timestamps": list(_stats_timestamps),
             "cpu": list(_cpu_history),
             "ram": list(_ram_history),
+            "yt_cache": list(_yt_cache_history),
         },
     }
 

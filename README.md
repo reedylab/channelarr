@@ -2,13 +2,13 @@
 
 A self-hosted custom TV channel builder. Create your own 24/7 live TV channels from your media library and YouTube — movies, TV shows, YouTube channels/playlists, and bump clips — served as HLS streams compatible with Jellyfin, Threadfin, Manifold, or any IPTV client.
 
-YouTube videos are streamed ephemerally — downloaded just before playback, encoded through the same pipeline as local files, and deleted immediately after. Zero permanent storage.
+YouTube videos are cached intelligently — a background worker keeps the current and upcoming videos pre-downloaded so channels start instantly. Old videos are cleaned up automatically. Storage stays bounded to a small rolling cache.
 
 ## What It Does
 
 Channelarr lets you build TV channels that feel like real broadcast television. Add movies, shows, and YouTube content to a channel, configure bumps (short interstitial clips like station idents or "up next" segments), and the app generates a persistent EPG schedule with real timestamps. When a client requests a stream, encoding starts from wherever the schedule says it should be — even mid-episode — just like tuning into a real TV channel.
 
-Channels are always on standby. No background processes, no always-on streams — everything is client-driven. Streams spin up on demand when a viewer tunes in and auto-stop after 5 minutes with no viewers. YouTube videos are downloaded just-in-time (2 videos ahead of the current position), streamed through the same FFmpeg pipeline as local files, and deleted immediately after playback. At any moment, only 2-3 YouTube videos exist on disk.
+Channels are always on standby. Streams spin up on demand when a viewer tunes in and auto-stop after 5 minutes with no viewers. A background cache worker keeps YouTube videos pre-downloaded — the current and next 2 videos per channel are always ready, so playback starts instantly. Videos that have already played are cleaned up automatically. YouTube content uses a faster encoding preset for smoother real-time playback.
 
 ## Screenshots
 
@@ -29,9 +29,9 @@ Channels are always on standby. No background processes, no always-on streams �
 
 ## Features
 
-- **Ephemeral YouTube Streaming** — Add YouTube channels and playlists as content sources. Videos are downloaded just before playback and deleted immediately after — zero permanent storage. Browse and add entire playlists from the channel editor. Thumbnails appear in the EPG guide and XMLTV export.
+- **YouTube Streaming** — Add YouTube channels and playlists as content sources. A background cache worker keeps upcoming videos pre-downloaded so channels start instantly. Old videos are cleaned up automatically — storage stays bounded to a small rolling cache. Browse and add entire playlists from the channel editor. Thumbnails appear in the EPG guide and XMLTV export.
 - **Persistent EPG Schedule** — Each channel gets a materialized schedule with real start/stop timestamps for every programme. The schedule loops continuously and drives the TV guide, XMLTV export, and stream positioning. YouTube and local content are interleaved seamlessly.
-- **Fully On-Demand** — No background processes, no always-on daemons. Streams start when a client tunes in and stop when viewers leave. YouTube downloads happen just-in-time during active streams only.
+- **On-Demand Streams** — Streams start when a client tunes in and stop when viewers leave. No always-on encoding processes.
 - **Schedule-Aware Streaming** — When a client tunes in, FFmpeg seeks to the correct position in the schedule. If the guide says a movie is 45 minutes in, that's where playback begins.
 - **TV Guide** — EPG grid with channel logos, color-coded programme blocks, click-to-view detail popovers with poster art (or YouTube thumbnails) and plot descriptions, and a red "now" line.
 - **Channel Builder** — Create channels from your movie/TV library and YouTube. Add whole shows, individual episodes, or entire YouTube playlists. Configure shuffle mode, loop, and bumps per-channel.
@@ -65,6 +65,7 @@ services:
       - /path/to/media:/media:ro
       - /path/to/bumps:/bumps
       - /path/to/m3u:/m3u
+      - /path/to/youtube-cache:/yt_cache
       - channelarr-data:/app/data
       - channelarr-logs:/app/logs
     environment:
@@ -106,20 +107,13 @@ For AI agent integration, `GET /api/channels/shuffle-modes` returns the full sch
 
 In the channel editor, click the **YouTube** tab in the content picker. Paste a YouTube channel or playlist URL and click **Browse**. Videos appear with thumbnails and durations. Click **Add** on individual videos or **Add All** to add the entire playlist.
 
-YouTube videos are not downloaded when you save the channel — only their metadata (title, duration, thumbnail) is stored. Downloads happen automatically when the stream reaches each video:
-
-1. The next 2 YouTube videos are pre-fetched in the background
-2. When the schedule reaches a YouTube entry, the file is already waiting
-3. FFmpeg encodes it through the same pipeline as local files
-4. After playback, the file is deleted immediately
+Only metadata (title, duration, thumbnail) is stored when you save. A background cache worker automatically keeps the current and next 2 YouTube videos per channel pre-downloaded so playback starts instantly. Videos that have already played are cleaned up automatically.
 
 If a download fails (network issue, removed video), the entry is skipped and the stream continues with the next item.
 
 ### 5. Watch
 
-Click **Watch** on any channel card. For channels with YouTube content, the first playback may take 30-60 seconds while the initial video downloads.
-
-For channels with YouTube content, the first playback may take 30-60 seconds while the initial video downloads. The stream URL for external clients is:
+Click **Watch** on any channel card. The stream URL for external clients is:
 
 ```
 http://your-server-ip:5045/live/<channel-id>/stream.m3u8
@@ -166,6 +160,7 @@ All settings are configurable from the web UI under **Settings**:
 | FFMPEG_THREADS | `1` | FFmpeg threads |
 | X264_THREADS | `4` | x264 encoder threads |
 | AUDIO_BITRATE | `192k` | AAC audio bitrate |
+| YT_CACHE_PATH | `/yt_cache` | YouTube video cache directory |
 | BASE_URL | `http://localhost:5045` | Public base URL for M3U/EPG links |
 
 ## API
@@ -256,7 +251,7 @@ Content files are encoded by FFmpeg to MPEG-TS and piped into an HLS segmenter. 
 
 ### YouTube Integration
 
-YouTube videos are treated as ephemeral content — no permanent storage. When the stream reaches a YouTube entry, the pre-fetch worker has already downloaded it to a temporary cache (`/app/data/yt_cache/`). After FFmpeg finishes encoding the file, it is deleted immediately. The pre-fetch worker stays 2 entries ahead of the current position, so downloads happen in the background while the current item plays. If a download fails, the entry is skipped and the stream continues. The cache is wiped on every startup.
+A background cache worker monitors all channels with YouTube content and keeps the current + next 2 videos per channel pre-downloaded to a configurable cache directory (`/yt_cache`). Videos are downloaded as H.264 MP4 and encoded with a `veryfast` x264 preset for smoother real-time playback. After a video has played and is no longer in the upcoming window, the cache worker deletes it automatically. Storage stays bounded to a small rolling cache (typically 1-3 GB depending on channel count). YouTube thumbnails are included in the EPG guide and XMLTV export as programme icons.
 
 ## Stack
 

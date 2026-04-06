@@ -1,17 +1,34 @@
-"""YouTube metadata, download, and cache management for ephemeral streaming."""
+"""YouTube metadata, download, cache management, and background pre-cache worker."""
 
-import json
 import logging
 import os
-import shutil
 import subprocess
+import threading
+import time
 
-YT_CACHE_DIR = "/app/data/yt_cache"
+from core.config import get_setting
+
+
+def _cache_dir() -> str:
+    return get_setting("YT_CACHE_PATH", "/yt_cache")
 
 
 def yt_cache_path(yt_id: str) -> str:
     """Deterministic path for a cached YouTube video."""
-    return os.path.join(YT_CACHE_DIR, f"{yt_id}.mp4")
+    return os.path.join(_cache_dir(), f"{yt_id}.mp4")
+
+
+def yt_cache_size() -> int:
+    """Return total size of all files in the cache directory in bytes."""
+    cache = _cache_dir()
+    if not os.path.isdir(cache):
+        return 0
+    total = 0
+    for f in os.listdir(cache):
+        fp = os.path.join(cache, f)
+        if os.path.isfile(fp):
+            total += os.path.getsize(fp)
+    return total
 
 
 def yt_cleanup(yt_id: str):
@@ -24,9 +41,15 @@ def yt_cleanup(yt_id: str):
 
 def yt_cleanup_all():
     """Wipe the entire YouTube cache directory."""
-    if os.path.isdir(YT_CACHE_DIR):
-        shutil.rmtree(YT_CACHE_DIR, ignore_errors=True)
-    os.makedirs(YT_CACHE_DIR, exist_ok=True)
+    cache = _cache_dir()
+    os.makedirs(cache, exist_ok=True)
+    for f in os.listdir(cache):
+        fp = os.path.join(cache, f)
+        if os.path.isfile(fp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
     logging.info("[YT] Cache cleared")
 
 
@@ -81,7 +104,6 @@ def yt_browse(url: str) -> list[dict]:
             except (ValueError, TypeError):
                 pass
 
-            # Use standard thumbnail URL if yt-dlp didn't provide one
             if not thumb or thumb == "NA":
                 thumb = f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
 
@@ -139,3 +161,97 @@ def yt_download(url: str, dest_path: str, resolution: str = "1080") -> bool:
     except Exception as e:
         logging.error("[YT] Download error: %s", e)
         return False
+
+
+# ── Background pre-cache worker ──
+
+_worker_started = False
+_channel_mgr = None
+
+
+def start_yt_cache_worker(channel_mgr, interval: int = 60):
+    """Start a background thread that keeps YouTube videos pre-cached.
+
+    For each channel with YouTube content, ensures the current + next 2
+    YouTube entries are downloaded. Cleans up entries that have already played.
+    """
+    global _worker_started, _channel_mgr
+    if _worker_started:
+        return
+    _worker_started = True
+    _channel_mgr = channel_mgr
+    t = threading.Thread(target=_cache_worker_loop, args=(interval,), daemon=True)
+    t.start()
+    logging.info("[YT] Cache worker started (interval=%ds)", interval)
+
+
+def _cache_worker_loop(interval: int):
+    # Wait a bit for app to finish starting
+    time.sleep(10)
+    while True:
+        try:
+            _cache_worker_tick()
+        except Exception as e:
+            logging.error("[YT] Cache worker error: %s", e)
+        time.sleep(interval)
+
+
+def _cache_worker_tick():
+    from core.channels import find_schedule_position
+
+    if not _channel_mgr:
+        return
+
+    channels = _channel_mgr.list_channels()
+    needed_ids = set()
+
+    for ch in channels:
+        schedule = ch.get("materialized_schedule", [])
+        if not schedule:
+            continue
+
+        # Check if this channel has any YouTube entries
+        has_yt = any(e.get("type") == "youtube" for e in schedule)
+        if not has_yt:
+            continue
+
+        # Find current position
+        idx, _ = find_schedule_position(ch)
+        if idx is None:
+            idx = 0
+
+        # Collect current + next 2 YouTube entries
+        count = 0
+        i = idx
+        checked = 0
+        while count < 3 and checked < len(schedule):
+            entry = schedule[i % len(schedule)]
+            if entry.get("type") == "youtube" and entry.get("yt_id"):
+                yt_id = entry["yt_id"]
+                needed_ids.add(yt_id)
+                path = entry["path"]
+                # Skip if file exists or a .part file indicates download in progress
+                if not os.path.isfile(path) and not any(
+                    f.startswith(yt_id) and f.endswith(".part")
+                    for f in os.listdir(_cache_dir())
+                ):
+                    logging.info("[YT] Cache worker: downloading %s", yt_id)
+                    yt_download(entry.get("url", ""), path)
+                count += 1
+            i += 1
+            checked += 1
+
+    # Clean up cached files that are no longer needed
+    cache = _cache_dir()
+    if os.path.isdir(cache):
+        for f in os.listdir(cache):
+            if not f.endswith(".mp4"):
+                continue
+            yt_id = f.replace(".mp4", "")
+            if yt_id not in needed_ids:
+                fp = os.path.join(cache, f)
+                try:
+                    os.remove(fp)
+                    logging.info("[YT] Cache worker: cleaned up %s (no longer needed)", yt_id)
+                except OSError:
+                    pass

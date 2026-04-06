@@ -83,6 +83,9 @@ async def lifespan(app: FastAPI):
     shared_state.start_stats_collector()
     streamer_mgr.start_idle_cleanup(interval=60, timeout=300)
 
+    from core.youtube import start_yt_cache_worker
+    start_yt_cache_worker(channel_mgr)
+
     logging.info("[APP] Channelarr ready")
 
     yield
