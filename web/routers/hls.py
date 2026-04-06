@@ -64,7 +64,7 @@ def hls_playlist(channel_id: str):
 
     if need_start:
         lock = _get_boot_lock(channel_id)
-        if not lock.acquire(timeout=35):
+        if not lock.acquire(timeout=95):
             raise HTTPException(status_code=503)
         try:
             stream_status = shared_state.streamer_mgr.get_status(channel_id)
@@ -74,7 +74,7 @@ def hls_playlist(channel_id: str):
                 if not ok:
                     logging.warning("[HLS] Auto-start failed for %s: %s", channel_id, msg)
                     raise HTTPException(status_code=404)
-            deadline = time.time() + 30
+            deadline = time.time() + 90
             while time.time() < deadline:
                 if os.path.isfile(playlist):
                     break
@@ -85,8 +85,11 @@ def hls_playlist(channel_id: str):
         finally:
             lock.release()
 
+    if not os.path.isfile(playlist):
+        raise HTTPException(status_code=503, detail="Stream not ready")
+
     return FileResponse(
-        os.path.join(hls_dir, "stream.m3u8"),
+        playlist,
         media_type="application/vnd.apple.mpegurl",
     )
 

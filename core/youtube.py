@@ -108,8 +108,10 @@ def yt_download(url: str, dest_path: str, resolution: str = "1080") -> bool:
     """Download a YouTube video to a specific path. Returns True on success."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     fmt = (
-        f"bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]"
-        f"/best[height<={resolution}][ext=mp4]"
+        f"bestvideo[height<={resolution}][vcodec^=avc1]+bestaudio[ext=m4a]"
+        f"/bestvideo[height<={resolution}][ext=mp4][vcodec^=avc1]+bestaudio"
+        f"/best[height<={resolution}][vcodec^=avc1]"
+        f"/bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]"
         f"/best[height<={resolution}]/best"
     )
     try:
