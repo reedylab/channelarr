@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from web import shared_state
 from core.config import get_setting
-from core.channels import materialize_all_channels, get_now_playing
+from core.channels import materialize_all_channels, get_now_playing, placeholder_entries_in_window
 from core.xmltv import _iterate_schedule_window, _merge_bump_gaps
 
 router = APIRouter()
@@ -58,12 +58,13 @@ def api_epg_guide(hours: int = Query(default=6)):
     channels = shared_state.channel_mgr.list_channels()
     guide = []
     for ch in channels:
+        is_resolved = ch.get("type") == "resolved"
         schedule = ch.get("materialized_schedule", [])
         epoch_str = ch.get("schedule_epoch")
         cycle_dur = ch.get("schedule_cycle_duration", 0)
 
         entries = []
-        if schedule and epoch_str and cycle_dur > 0:
+        if not is_resolved and schedule and epoch_str and cycle_dur > 0:
             merged = _merge_bump_gaps(
                 _iterate_schedule_window(schedule, epoch_str, cycle_dur,
                                           ch.get("loop", True), window_start, horizon)
@@ -81,6 +82,13 @@ def api_epg_guide(hours: int = Query(default=6)):
                 if entry.get("thumbnail"):
                     ep["thumbnail"] = entry["thumbnail"]
                 entries.append(ep)
+        else:
+            # Resolved channels (always live) and empty scheduled channels
+            # both fall back to placeholder blocks. Block boundaries align
+            # to :00/:30 so they match the channel-tile and EPG export.
+            entries = placeholder_entries_in_window(
+                ch["name"], window_start, horizon, is_live=is_resolved
+            )
 
         guide.append({
             "id": ch["id"],

@@ -833,6 +833,36 @@ def get_now_playing(channel: dict) -> dict | None:
 PLACEHOLDER_BLOCK_MINUTES = 30
 
 
+def placeholder_entries_in_window(channel_name: str, window_start: datetime,
+                                   window_end: datetime, *, is_live: bool = False) -> list:
+    """Generate 30-minute placeholder programme blocks within a time window.
+
+    Block boundaries align to :00 and :30 of every hour so this function
+    agrees with current_placeholder_block() and the XMLTV exporter on which
+    block contains any given moment. Used by the in-app guide endpoint for
+    channels with no materialized schedule (resolved channels and empty
+    scheduled channels alike).
+    """
+    block_minutes = PLACEHOLDER_BLOCK_MINUTES
+    block = timedelta(minutes=block_minutes)
+    block_start_minute = (window_start.minute // block_minutes) * block_minutes
+    current = window_start.replace(minute=block_start_minute, second=0, microsecond=0)
+    entries = []
+    while current < window_end:
+        stop = current + block
+        entries.append({
+            "title": channel_name,
+            "desc": f"{channel_name} — Live Stream" if is_live else f"{channel_name} — Scheduled Programming",
+            "type": "live" if is_live else "placeholder",
+            "path": "",
+            "start": current.isoformat(),
+            "stop": stop.isoformat(),
+            "duration": block_minutes * 60,
+        })
+        current = stop
+    return entries
+
+
 def current_placeholder_block(channel_name: str) -> dict:
     """Compute the current 30-minute placeholder block for a channel.
 
