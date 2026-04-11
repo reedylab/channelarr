@@ -82,6 +82,15 @@ async def lifespan(app: FastAPI):
         # Start demand-driven refresh worker (only if DB is reachable)
         from core.resolver.manifest_resolver import start_refresh_worker
         start_refresh_worker()
+        # B1: mirror existing JSON channels and active resolved manifests into
+        # the new channels table. JSON is still the source of truth at this
+        # stage; this is a parallel write that the next phase will read from.
+        from core.channels import (
+            backfill_scheduled_channels_to_db,
+            backfill_resolved_manifests_to_channels,
+        )
+        backfill_scheduled_channels_to_db()
+        backfill_resolved_manifests_to_channels()
     except Exception as e:
         logging.error("[DB] Failed to initialize Postgres: %s", e)
         logging.error("[DB] Resolver features will be unavailable. Set PG_PASS in env or settings.")

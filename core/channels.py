@@ -17,6 +17,153 @@ CHANNELS_FILE = os.getenv("CHANNELS_FILE", "/app/data/channels.json")
 
 _file_lock = threading.Lock()
 
+
+# ── DB mirror (Phase B1 dual-write) ──────────────────────────────────────────
+# JSON is still the source of truth in B1. Every write to JSON also mirrors
+# to the Postgres `channels` table. Mirror failures log a warning but never
+# break the JSON path — the next startup backfill catches up missed records.
+
+def _mirror_upsert(channel: dict):
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+        from sqlalchemy.exc import SQLAlchemyError
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel["id"]).first()
+            if row is None:
+                row = ChannelRow(id=channel["id"], type="scheduled")
+                session.add(row)
+            _apply_dict_to_row(row, channel)
+    except SQLAlchemyError as e:
+        logging.warning("[CHANNELS] DB mirror upsert failed for %s: %s", channel.get("id"), e)
+    except Exception as e:
+        logging.warning("[CHANNELS] DB mirror upsert error for %s: %s", channel.get("id"), e)
+
+
+def _mirror_delete(channel_id: str):
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+        from sqlalchemy.exc import SQLAlchemyError
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel_id).first()
+            if row is not None:
+                session.delete(row)
+    except SQLAlchemyError as e:
+        logging.warning("[CHANNELS] DB mirror delete failed for %s: %s", channel_id, e)
+    except Exception as e:
+        logging.warning("[CHANNELS] DB mirror delete error for %s: %s", channel_id, e)
+
+
+def _apply_dict_to_row(row, channel: dict):
+    """Copy fields from a JSON channel dict onto a Channel SQLAlchemy row."""
+    row.name = channel.get("name", "Unnamed")
+    row.items = channel.get("items", []) or []
+    row.bump_config = channel.get("bump_config", {}) or {}
+    sc = channel.get("shuffle_config")
+    if sc is None and channel.get("shuffle"):
+        sc = {"mode": "random"}
+    row.shuffle_config = sc or {"mode": "none"}
+    row.loop = bool(channel.get("loop", True))
+    row.materialized_schedule = channel.get("materialized_schedule", []) or []
+    row.schedule_cycle_duration = float(channel.get("schedule_cycle_duration", 0) or 0)
+    epoch_str = channel.get("schedule_epoch")
+    if epoch_str:
+        try:
+            row.schedule_epoch = datetime.fromisoformat(epoch_str)
+        except (TypeError, ValueError):
+            row.schedule_epoch = None
+    else:
+        row.schedule_epoch = None
+
+
+def backfill_scheduled_channels_to_db():
+    """Mirror every JSON channel into the Postgres channels table.
+
+    Idempotent: existing rows are updated, new rows are inserted. Does NOT
+    delete Postgres rows that are missing from JSON — resolved-channel rows
+    must survive this pass.
+    """
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+    except Exception as e:
+        logging.warning("[CHANNELS] DB modules unavailable, skipping backfill: %s", e)
+        return
+
+    json_channels = _load()
+    count = 0
+    try:
+        with get_session() as session:
+            for ch in json_channels:
+                row = session.query(ChannelRow).filter_by(id=ch["id"]).first()
+                if row is None:
+                    row = ChannelRow(id=ch["id"], type="scheduled")
+                    session.add(row)
+                _apply_dict_to_row(row, ch)
+                count += 1
+        logging.info("[CHANNELS] Backfilled %d scheduled channels to DB", count)
+    except Exception as e:
+        logging.warning("[CHANNELS] Scheduled-channel backfill failed: %s", e)
+
+
+def backfill_resolved_manifests_to_channels():
+    """Create Channel rows for active resolved manifests that don't yet have one.
+
+    Preserves the current "every resolved manifest is also a channel" behavior
+    during the cutover. Decoupling happens in B3.
+    """
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow, Manifest
+    except Exception as e:
+        logging.warning("[CHANNELS] DB modules unavailable, skipping resolved backfill: %s", e)
+        return
+
+    count = 0
+    try:
+        with get_session() as session:
+            manifests = (
+                session.query(Manifest)
+                .filter(Manifest.active == True)  # noqa: E712
+                .filter(Manifest.tags.contains(["resolved"]))
+                .all()
+            )
+            for m in manifests:
+                channel_id = m.channelarr_channel_id or f"ch-res-{uuid.uuid4().hex[:8]}"
+                existing = session.query(ChannelRow).filter_by(id=channel_id).first()
+                if existing is not None:
+                    continue
+                # Also catch the case where a different ID already maps to this manifest
+                bymanifest = (
+                    session.query(ChannelRow)
+                    .filter_by(manifest_id=m.id, type="resolved")
+                    .first()
+                )
+                if bymanifest is not None:
+                    continue
+                row = ChannelRow(
+                    id=channel_id,
+                    name=m.title or "Unnamed Resolved",
+                    type="resolved",
+                    manifest_id=m.id,
+                    items=[],
+                    bump_config={},
+                    shuffle_config={"mode": "none"},
+                    loop=False,
+                    schedule_cycle_duration=0,
+                    materialized_schedule=[],
+                )
+                session.add(row)
+                count += 1
+        if count:
+            logging.info("[CHANNELS] Backfilled %d resolved manifests as channels", count)
+    except Exception as e:
+        logging.warning("[CHANNELS] Resolved-manifest backfill failed: %s", e)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Duration cache: {filepath: seconds} — avoids re-probing unchanged files
 _duration_cache = {}
 
@@ -77,6 +224,7 @@ class ChannelManager:
         }
         channels.append(channel)
         _save(channels)
+        _mirror_upsert(channel)
         logging.info("[CHANNELS] Created channel %s: %s", channel["id"], channel["name"])
         return channel
 
@@ -89,6 +237,7 @@ class ChannelManager:
                         ch[key] = data[key]
                 channels[i] = ch
                 _save(channels)
+                _mirror_upsert(ch)
                 logging.info("[CHANNELS] Updated channel %s", channel_id)
                 return ch
         return None
@@ -99,6 +248,7 @@ class ChannelManager:
         if len(new) == len(channels):
             return False
         _save(new)
+        _mirror_delete(channel_id)
         logging.info("[CHANNELS] Deleted channel %s", channel_id)
         return True
 
@@ -109,10 +259,12 @@ class ChannelManager:
             if ch["id"] == channel["id"]:
                 channels[i] = channel
                 _save(channels)
+                _mirror_upsert(channel)
                 return
         # Channel not found — append it
         channels.append(channel)
         _save(channels)
+        _mirror_upsert(channel)
 
 
 # ---------------------------------------------------------------------------
