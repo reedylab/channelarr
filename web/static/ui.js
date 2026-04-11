@@ -1620,7 +1620,14 @@ function renderResolverQueue(batch) {
       expiryHint = `<span class="res-expiry res-expiry-unknown" title="Unknown expiry — will auto-refresh on failure">token unknown</span>`;
     }
 
-    let actions = `<button class="btn btn-sm-danger" data-res-remove="${i}" title="Remove">&times;</button>`;
+    // Persisted (done) rows get a DB delete; failed/pending rows just get a DOM remove
+    let removeBtn;
+    if (r.status === "done" && r.manifest_id) {
+      removeBtn = `<button class="btn btn-sm-danger" data-res-delete="${r.manifest_id}" data-res-delete-title="${title}" title="Delete permanently">&times;</button>`;
+    } else {
+      removeBtn = `<button class="btn btn-sm-danger" data-res-remove="${i}" title="Remove from queue">&times;</button>`;
+    }
+    let actions = removeBtn;
     if (r.status === "done" && r.manifest_id) {
       actions = `<button class="btn btn-sm-watch" data-res-play="${r.manifest_id}" data-res-play-title="${title}" data-res-play-url="${url}" title="Test Stream">&#9654;</button> <button class="btn btn-sm" data-res-refresh="${r.manifest_id}" title="Refresh token now">&#8635;</button> ` + actions;
     }
@@ -1660,6 +1667,30 @@ function renderResolverQueue(batch) {
   });
   body.querySelectorAll("[data-res-remove]").forEach(btn => {
     btn.addEventListener("click", () => { btn.closest("tr").remove(); });
+  });
+  body.querySelectorAll("[data-res-delete]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const mid = btn.dataset.resDelete;
+      const title = btn.dataset.resDeleteTitle || "channel";
+      if (!confirm(`Delete "${title}" permanently?`)) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch(`${API}/resolve/channels/${mid}`, { method: "DELETE" });
+        const j = await r.json();
+        if (r.ok && j.ok) {
+          toast("success", `Deleted "${title}"`);
+          btn.closest("tr").remove();
+          // Reload to reflect any downstream M3U regeneration
+          setTimeout(() => loadResolver(), 500);
+        } else {
+          toast("error", j.error || "Delete failed");
+          btn.disabled = false;
+        }
+      } catch (e) {
+        toast("error", "Delete failed");
+        btn.disabled = false;
+      }
+    });
   });
 }
 

@@ -117,6 +117,36 @@ def list_resolved_channels():
     }
 
 
+@router.delete("/resolve/channels/{manifest_id}")
+def delete_resolved_channel(manifest_id: str):
+    """Permanently delete a resolved channel (manifest + variants).
+
+    Captures are kept (capture_id set to NULL) so the historical record of
+    'we once resolved this page' survives. Variants cascade-delete with the
+    manifest. After delete, regenerate the M3U so the channel disappears
+    from the export right away.
+    """
+    from core.database import get_session
+    from core.models.manifest import Manifest
+
+    with get_session() as session:
+        row = session.query(Manifest).filter_by(id=manifest_id).first()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        title = row.title
+        session.delete(row)
+
+    # Refresh M3U so downstream consumers (e.g. manifold) drop it on next ingest
+    try:
+        from web import shared_state
+        shared_state.regenerate_m3u()
+    except Exception as e:
+        import logging
+        logging.warning("[RESOLVER] regenerate_m3u after delete failed: %s", e)
+
+    return {"ok": True, "deleted": manifest_id, "title": title}
+
+
 @router.post("/resolve/retry/{index}")
 def retry_item(index: int):
     from core.resolver.manifest_resolver import ManifestResolverService
