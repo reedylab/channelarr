@@ -8,7 +8,6 @@ in channelarr's resolver Postgres tables (parallel to existing JSON storage).
 import hashlib
 import logging
 import re
-import uuid
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urljoin
 
@@ -492,7 +491,6 @@ def _store_manifest(
             manifest = Manifest(
                 capture_id=cap.id,
                 header_profile_id=header_profile_id,
-                channelarr_channel_id=f"ch-res-{uuid.uuid4().hex[:8]}",
                 url=manifest_url,
                 url_hash=url_hash,
                 source_domain=source_domain,

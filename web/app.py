@@ -36,8 +36,9 @@ def _clean_stale_hls():
 
 
 def _materialize_missing(channel_mgr, bump_mgr, media_lib):
-    """Auto-materialize channels that don't have a schedule yet."""
-    channel_list = channel_mgr.list_channels()
+    """Auto-materialize scheduled channels that don't have a schedule yet.
+    Resolved channels are skipped — they're pure live streams with no schedule."""
+    channel_list = [ch for ch in channel_mgr.list_channels() if ch.get("type") != "resolved"]
     needs = any(not ch.get("materialized_schedule") for ch in channel_list)
     if not needs:
         return
@@ -64,33 +65,39 @@ async def lifespan(app: FastAPI):
         engine = get_engine()
         insp = inspect(engine)
         tables = insp.get_table_names()
-        # Schema migrations for known column additions (idempotent)
+        # Schema migrations (idempotent). B5 also drops legacy columns.
         if "manifests" in tables:
             manifest_cols = [c["name"] for c in insp.get_columns("manifests")]
             with engine.connect() as conn:
+                # Add columns introduced before B5 (still needed in case
+                # someone is upgrading from an older version)
                 for col, coltype in [
                     ("expires_at", "TIMESTAMPTZ"),
                     ("last_refreshed_at", "TIMESTAMPTZ"),
                     ("last_accessed_at", "TIMESTAMPTZ"),
-                    ("channelarr_channel_id", "VARCHAR"),
                 ]:
                     if col not in manifest_cols:
                         conn.execute(text(f"ALTER TABLE manifests ADD COLUMN {col} {coltype}"))
+                # B5: drop the legacy channelarr_channel_id linker column
+                if "channelarr_channel_id" in manifest_cols:
+                    conn.execute(text("ALTER TABLE manifests DROP COLUMN channelarr_channel_id"))
+                    logging.info("[DB] Dropped legacy column manifests.channelarr_channel_id (B5)")
                 conn.commit()
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # Start demand-driven refresh worker (only if DB is reachable)
         from core.resolver.manifest_resolver import start_refresh_worker
         start_refresh_worker()
-        # B1: mirror existing JSON channels and active resolved manifests into
-        # the new channels table. JSON is still the source of truth at this
-        # stage; this is a parallel write that the next phase will read from.
+        # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the
+        # JSON safety net, clean orphaned resolved channels.
         from core.channels import (
-            backfill_scheduled_channels_to_db,
+            migrate_channel_ids_to_uuids,
+            backup_channels_json,
             backfill_resolved_manifests_to_channels,
         )
-        backfill_scheduled_channels_to_db()
+        migrate_channel_ids_to_uuids()
         backfill_resolved_manifests_to_channels()
+        backup_channels_json()
     except Exception as e:
         logging.error("[DB] Failed to initialize Postgres: %s", e)
         logging.error("[DB] Resolver features will be unavailable. Set PG_PASS in env or settings.")

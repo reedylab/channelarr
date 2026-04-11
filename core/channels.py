@@ -5,17 +5,16 @@ import os
 import random
 import logging
 import subprocess
-import tempfile
-import threading
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from core.nfo import read_nfo_title, read_nfo_plot
 
+# Path of the legacy JSON store. Post-B5 the app no longer reads or writes
+# this file — backup_channels_json() moves it aside on first startup. The
+# constant is kept so the backup helper can find the original location.
 CHANNELS_FILE = os.getenv("CHANNELS_FILE", "/app/data/channels.json")
-
-_file_lock = threading.Lock()
 
 
 # ── Postgres-backed channel store (Phase B2) ────────────────────────────────
@@ -125,10 +124,81 @@ def _db_delete(channel_id: str):
             session.delete(row)
 
 
-# In B2, JSON is no longer the source of truth — DB writes come first, then
-# JSON is mirrored as a safety net for one phase (retired in B5). If a DB
-# write fails, we still write JSON and warn loudly; the next startup backfill
-# will reconcile the DB from JSON.
+# B5: JSON safety net is retired. Postgres is the only source of truth.
+# channels.json is moved aside on first startup after the migration runs.
+
+
+# ── B5 finalization migrations ──────────────────────────────────────────────
+
+def migrate_channel_ids_to_uuids():
+    """Replace legacy ch-{8} and ch-res-{8} channel IDs with plain UUIDs.
+
+    Idempotent: channels already on UUID format are skipped. For each
+    migrated channel, the logo file (if any) is renamed to match the new ID.
+    Old HLS dirs are not touched here — _clean_stale_hls() handles them on
+    every startup anyway.
+
+    Channel.id has no foreign-key dependents, so the UPDATE is safe.
+    """
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+    except Exception as e:
+        logging.warning("[CHANNELS] DB unavailable, skipping ID migration: %s", e)
+        return
+
+    logo_dir = os.getenv("LOGO_DIR", "/app/data/logos")
+    migrated = 0
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(ChannelRow)
+                .filter(ChannelRow.id.like("ch-%"))
+                .all()
+            )
+            renames: list[tuple[str, str]] = []
+            for r in rows:
+                old_id = r.id
+                new_id = str(uuid.uuid4())
+                r.id = new_id
+                renames.append((old_id, new_id))
+                migrated += 1
+
+        # Rename logo files outside the DB session — best-effort, failures
+        # are logged but don't roll back the DB change.
+        for old_id, new_id in renames:
+            old_logo = os.path.join(logo_dir, f"{old_id}.png")
+            new_logo = os.path.join(logo_dir, f"{new_id}.png")
+            if os.path.isfile(old_logo):
+                try:
+                    os.rename(old_logo, new_logo)
+                    logging.info("[CHANNELS] Renamed logo %s -> %s", old_id, new_id)
+                except OSError as e:
+                    logging.warning("[CHANNELS] Logo rename failed for %s: %s", old_id, e)
+
+        if migrated:
+            logging.info("[CHANNELS] Migrated %d channel IDs to UUIDs", migrated)
+    except Exception as e:
+        logging.warning("[CHANNELS] ID migration failed: %s", e)
+
+
+def backup_channels_json():
+    """Move channels.json out of the way after the DB has become source of truth.
+
+    Renames it to channels.json.b5-backup-{timestamp}. Keeps the file on disk
+    for emergency recovery but stops the app from touching it. Idempotent:
+    if the file is already backed up or doesn't exist, this is a no-op.
+    """
+    if not os.path.isfile(CHANNELS_FILE):
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = f"{CHANNELS_FILE}.b5-backup-{ts}"
+    try:
+        os.rename(CHANNELS_FILE, backup_path)
+        logging.info("[CHANNELS] channels.json moved to %s (B5 safety net retirement)", backup_path)
+    except OSError as e:
+        logging.warning("[CHANNELS] channels.json backup failed: %s", e)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _apply_dict_to_row(row, channel: dict):
@@ -153,91 +223,24 @@ def _apply_dict_to_row(row, channel: dict):
         row.schedule_epoch = None
 
 
-def backfill_scheduled_channels_to_db():
-    """Mirror every JSON channel into the Postgres channels table.
+def backfill_resolved_manifests_to_channels():
+    """Clean up orphaned resolved channels.
 
-    Idempotent: existing rows are updated, new rows are inserted. Does NOT
-    delete Postgres rows that are missing from JSON — resolved-channel rows
-    must survive this pass.
+    Post-B5 this function is purely a cleanup pass — it deletes resolved
+    Channel rows whose manifest_id is NULL (manifest was hard-deleted but
+    the row leaked). New resolved manifests no longer auto-create channels
+    (B3 decoupling), so the create branch from earlier phases is gone.
     """
     try:
         from core.database import get_session
         from core.models import Channel as ChannelRow
     except Exception as e:
-        logging.warning("[CHANNELS] DB modules unavailable, skipping backfill: %s", e)
+        logging.warning("[CHANNELS] DB modules unavailable, skipping orphan cleanup: %s", e)
         return
 
-    json_channels = _load()
-    count = 0
-    try:
-        with get_session() as session:
-            for ch in json_channels:
-                row = session.query(ChannelRow).filter_by(id=ch["id"]).first()
-                if row is None:
-                    row = ChannelRow(id=ch["id"], type="scheduled")
-                    session.add(row)
-                _apply_dict_to_row(row, ch)
-                count += 1
-        logging.info("[CHANNELS] Backfilled %d scheduled channels to DB", count)
-    except Exception as e:
-        logging.warning("[CHANNELS] Scheduled-channel backfill failed: %s", e)
-
-
-def backfill_resolved_manifests_to_channels():
-    """Create Channel rows for active resolved manifests that don't yet have
-    one, and clean up orphaned resolved channels (manifest_id=NULL or pointing
-    at a deleted/inactive manifest).
-
-    Originally introduced in B1 to preserve the "every resolved manifest is
-    also a channel" behavior during cutover. In B3 this still runs to mop up
-    orphans, but resolved channels are no longer auto-created at resolve time.
-    """
-    try:
-        from core.database import get_session
-        from core.models import Channel as ChannelRow, Manifest
-    except Exception as e:
-        logging.warning("[CHANNELS] DB modules unavailable, skipping resolved backfill: %s", e)
-        return
-
-    created = 0
     cleaned = 0
     try:
         with get_session() as session:
-            manifests = (
-                session.query(Manifest)
-                .filter(Manifest.active == True)  # noqa: E712
-                .filter(Manifest.tags.contains(["resolved"]))
-                .all()
-            )
-            for m in manifests:
-                channel_id = m.channelarr_channel_id or f"ch-res-{uuid.uuid4().hex[:8]}"
-                existing = session.query(ChannelRow).filter_by(id=channel_id).first()
-                if existing is not None:
-                    continue
-                bymanifest = (
-                    session.query(ChannelRow)
-                    .filter_by(manifest_id=m.id, type="resolved")
-                    .first()
-                )
-                if bymanifest is not None:
-                    continue
-                row = ChannelRow(
-                    id=channel_id,
-                    name=m.title or "Unnamed Resolved",
-                    type="resolved",
-                    manifest_id=m.id,
-                    items=[],
-                    bump_config={},
-                    shuffle_config={"mode": "none"},
-                    loop=False,
-                    schedule_cycle_duration=0,
-                    materialized_schedule=[],
-                )
-                session.add(row)
-                created += 1
-
-            # Cleanup pass: orphans (resolved channels with no manifest_id, or
-            # pointing at a manifest that no longer exists / is inactive).
             orphans = (
                 session.query(ChannelRow)
                 .filter(ChannelRow.type == "resolved")
@@ -248,71 +251,23 @@ def backfill_resolved_manifests_to_channels():
                 logging.info("[CHANNELS] Removing orphaned resolved channel: %s (%s)", o.id, o.name)
                 session.delete(o)
                 cleaned += 1
-        if created:
-            logging.info("[CHANNELS] Backfilled %d resolved manifests as channels", created)
         if cleaned:
             logging.info("[CHANNELS] Cleaned %d orphaned resolved channels", cleaned)
     except Exception as e:
-        logging.warning("[CHANNELS] Resolved-manifest backfill failed: %s", e)
+        logging.warning("[CHANNELS] Orphan cleanup failed: %s", e)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Duration cache: {filepath: seconds} — avoids re-probing unchanged files
 _duration_cache = {}
 
 
-def _load() -> list:
-    with _file_lock:
-        try:
-            with open(CHANNELS_FILE, "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return []
-
-
-def _save(channels: list):
-    with _file_lock:
-        dir_name = os.path.dirname(CHANNELS_FILE)
-        os.makedirs(dir_name, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(channels, f, indent=2, default=str)
-            os.replace(tmp_path, CHANNELS_FILE)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
-
 class ChannelManager:
     def list_channels(self) -> list:
-        """Return all channels (scheduled + resolved) from the DB.
-
-        Falls back to JSON (scheduled only — resolver features go offline)
-        if the DB is unreachable.
-        """
-        try:
-            return _db_list_all()
-        except Exception as e:
-            logging.warning("[CHANNELS] DB list failed, using JSON fallback: %s", e)
-            return _load()
+        """Return all channels (scheduled + resolved) from the DB."""
+        return _db_list_all()
 
     def get_channel(self, channel_id: str) -> dict | None:
-        try:
-            ch = _db_get_one(channel_id)
-            if ch is not None:
-                return ch
-        except Exception as e:
-            logging.warning("[CHANNELS] DB get failed for %s, using JSON fallback: %s", channel_id, e)
-        # Fall back to JSON (scheduled channels only)
-        for ch in _load():
-            if ch["id"] == channel_id:
-                # Stamp type so callers can branch consistently
-                ch.setdefault("type", "scheduled")
-                return ch
-        return None
+        return _db_get_one(channel_id)
 
     def create_resolved_channel(self, manifest_id: str, name: str | None = None) -> dict | None:
         """Create a new resolved-type Channel referencing an existing manifest.
@@ -353,7 +308,7 @@ class ChannelManager:
             if not display_name:
                 display_name = m.source_domain or "Unnamed Resolved"
 
-            new_id = f"ch-res-{uuid.uuid4().hex[:8]}"
+            new_id = str(uuid.uuid4())
             row = ChannelRow(
                 id=new_id,
                 name=display_name,
@@ -374,7 +329,7 @@ class ChannelManager:
 
     def create_channel(self, data: dict) -> dict:
         channel = {
-            "id": f"ch-{uuid.uuid4().hex[:8]}",
+            "id": str(uuid.uuid4()),
             "type": "scheduled",
             "name": data.get("name", "New Channel"),
             "items": data.get("items", []),
@@ -390,51 +345,30 @@ class ChannelManager:
             "shuffle_config": data.get("shuffle_config", None),
             "loop": data.get("loop", True),
         }
-        # DB first (source of truth in B2), then JSON safety net
-        try:
-            _db_upsert(channel)
-        except Exception as e:
-            logging.error("[CHANNELS] DB create failed for %s, JSON only: %s", channel["id"], e)
-        channels = _load()
-        channels.append(channel)
-        _save(channels)
+        _db_upsert(channel)
         logging.info("[CHANNELS] Created channel %s: %s", channel["id"], channel["name"])
         return channel
 
     def update_channel(self, channel_id: str, data: dict) -> dict | None:
-        # Resolved channels: only `name` is editable (no items/schedule).
-        # Look up the channel via the unified path so we know its type.
         existing = self.get_channel(channel_id)
         if existing is None:
             return None
         if existing.get("type") == "resolved":
             return self._update_resolved(channel_id, data, existing)
-        return self._update_scheduled(channel_id, data)
+        return self._update_scheduled(channel_id, existing, data)
 
-    def _update_scheduled(self, channel_id: str, data: dict) -> dict | None:
-        # Update the JSON record (still safety-net) and DB row in lockstep.
-        channels = _load()
-        target = None
-        for i, ch in enumerate(channels):
-            if ch["id"] == channel_id:
-                for key in ("name", "items", "bump_config", "shuffle", "shuffle_config", "loop"):
-                    if key in data:
-                        ch[key] = data[key]
-                channels[i] = ch
-                target = ch
-                break
-        if target is None:
-            # Channel exists in DB but not in JSON (e.g., a resolved channel
-            # with type=scheduled — shouldn't happen, but be defensive).
-            return None
+    def _update_scheduled(self, channel_id: str, existing: dict, data: dict) -> dict | None:
+        for key in ("name", "items", "bump_config", "shuffle", "shuffle_config", "loop"):
+            if key in data:
+                existing[key] = data[key]
         try:
-            _db_upsert(target)
+            _db_upsert(existing)
         except Exception as e:
-            logging.error("[CHANNELS] DB update failed for %s, JSON only: %s", channel_id, e)
-        _save(channels)
+            logging.error("[CHANNELS] DB update failed for %s: %s", channel_id, e)
+            return None
         logging.info("[CHANNELS] Updated channel %s", channel_id)
-        target["type"] = "scheduled"
-        return target
+        existing["type"] = "scheduled"
+        return existing
 
     def _update_resolved(self, channel_id: str, data: dict, existing: dict) -> dict | None:
         try:
@@ -446,51 +380,34 @@ class ChannelManager:
                     return None
                 if "name" in data:
                     row.name = data["name"]
-                # logo_filename, items/bumps are intentionally not updatable
-                # for resolved channels in B2.
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None
         return self.get_channel(channel_id)
 
     def delete_channel(self, channel_id: str) -> bool:
-        existing = self.get_channel(channel_id)
-        if existing is None:
+        if self.get_channel(channel_id) is None:
             return False
-        # Delete from DB first
         try:
             _db_delete(channel_id)
         except Exception as e:
             logging.error("[CHANNELS] DB delete failed for %s: %s", channel_id, e)
-        # JSON safety net only contains scheduled channels
-        if existing.get("type") != "resolved":
-            channels = _load()
-            new = [ch for ch in channels if ch["id"] != channel_id]
-            _save(new)
+            return False
         logging.info("[CHANNELS] Deleted channel %s", channel_id)
         return True
 
     def save_channel(self, channel: dict):
         """Persist an updated channel dict back to the store.
 
-        Used by the streamer/materialize loop to write back computed schedule
-        data. For scheduled channels, dual-writes DB + JSON. For resolved
-        channels, this is a no-op (they have no schedule to materialize).
+        Used by the streamer/materialize loop to write computed schedule
+        data back. No-op for resolved channels (they have no schedule).
         """
         if channel.get("type") == "resolved":
             return
         try:
             _db_upsert(channel)
         except Exception as e:
-            logging.error("[CHANNELS] DB save failed for %s, JSON only: %s", channel.get("id"), e)
-        channels = _load()
-        for i, ch in enumerate(channels):
-            if ch["id"] == channel["id"]:
-                channels[i] = channel
-                _save(channels)
-                return
-        channels.append(channel)
-        _save(channels)
+            logging.error("[CHANNELS] DB save failed for %s: %s", channel.get("id"), e)
 
 
 # ---------------------------------------------------------------------------

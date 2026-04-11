@@ -48,8 +48,6 @@ class Manifest(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     capture_id = Column(String, ForeignKey("captures.id", ondelete="SET NULL"))
     header_profile_id = Column(String, ForeignKey("header_profiles.id", ondelete="SET NULL"))
-    # channelarr-style identifier (ch-res-xxxxxxxx) for unified handling with JSON channels
-    channelarr_channel_id = Column(String, unique=True, index=True, nullable=True)
     url = Column(Text, nullable=False)
     url_hash = Column(String(32), nullable=False)
     source_domain = Column(String, index=True)
