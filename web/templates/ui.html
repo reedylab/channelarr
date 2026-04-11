@@ -381,7 +381,19 @@
               <label>Source URL</label>
               <input type="text" id="ch-resolved-url" readonly />
             </div>
-            <div class="muted" style="margin-top:8px">Resolved channels are pure live streams. Items, bumps, and schedules don't apply — they proxy the upstream HLS directly. The library will be reshaped in the next phase so you'll be able to pick a captured manifest as the source for any channel you create.</div>
+            <label class="toggle-label" style="margin-top:12px">
+              <input type="checkbox" id="ch-resolved-transcode" />
+              Transcode-mediated streaming (insert bumps during ad breaks)
+            </label>
+            <div class="muted" style="margin-top:4px;font-size:11px">When enabled, channelarr re-encodes the upstream HLS through FFmpeg and replaces SCTE-35 ad breaks with bumps from the folders below. This produces a single coherent HLS stream that even strict players (Jellyfin/ExoPlayer) handle smoothly. Costs one continuous FFmpeg encoder while clients are watching.</div>
+
+            <div id="ch-resolved-bump-section" style="display:none;margin-top:12px">
+              <h4 style="margin-bottom:6px">Bump Folders</h4>
+              <div class="setting-field">
+                <div id="ch-resolved-bump-folders" class="bump-folders-checklist"></div>
+              </div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Bumps are picked at random from the selected folders and packed to fit each ad break exactly. The last bump is truncated as needed.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -468,6 +480,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=28"></script>
+  <script src="/static/ui.js?v=29"></script>
 </body>
 </html>

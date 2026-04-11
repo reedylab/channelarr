@@ -83,6 +83,14 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE manifests DROP COLUMN channelarr_channel_id"))
                     logging.info("[DB] Dropped legacy column manifests.channelarr_channel_id (B5)")
                 conn.commit()
+        # B6: add the transcode_mediated column to channels (idempotent)
+        if "channels" in tables:
+            channel_cols = [c["name"] for c in insp.get_columns("channels")]
+            if "transcode_mediated" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN transcode_mediated BOOLEAN NOT NULL DEFAULT FALSE"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.transcode_mediated (B6)")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # Start demand-driven refresh worker (only if DB is reachable)

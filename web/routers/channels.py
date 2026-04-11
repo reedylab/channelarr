@@ -23,8 +23,15 @@ def _enrich(ch: dict) -> dict:
 
     if ch.get("type") == "resolved":
         mid = ch.get("manifest_id")
-        ch["stream_url"] = f"/live-resolved/{mid}.m3u8" if mid else None
-        ch["stream_status"] = {"running": False, "uptime": 0}
+        if ch.get("transcode_mediated"):
+            # Transcode-mediated resolved channels use the same /live/{id}
+            # endpoint as scheduled channels — output goes through the
+            # unified HLS pipeline so the URL pattern is identical.
+            ch["stream_url"] = f"/live/{cid}/stream.m3u8"
+            ch["stream_status"] = shared_state.streamer_mgr.get_status(cid)
+        else:
+            ch["stream_url"] = f"/live-resolved/{mid}.m3u8" if mid else None
+            ch["stream_status"] = {"running": False, "uptime": 0}
         ch["now_playing"] = current_placeholder_block(ch.get("name", "Live"))
     else:
         ch["stream_url"] = f"/live/{cid}/stream.m3u8"

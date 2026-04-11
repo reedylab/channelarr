@@ -30,6 +30,22 @@ def _start_from_schedule(channel_id):
     if not ch:
         return False, "Channel not found"
 
+    # Resolved channels with transcode_mediated=True go through the resolver
+    # transcoder pipeline (B6) instead of the scheduled-channel streamer.
+    if ch.get("type") == "resolved" and ch.get("transcode_mediated"):
+        manifest_id = ch.get("manifest_id")
+        manifest_url = ch.get("manifest_url")
+        if not manifest_id or not manifest_url:
+            return False, "Resolved channel missing manifest"
+        ok = shared_state.streamer_mgr.start_resolved_channel(
+            channel_id,
+            manifest_id=manifest_id,
+            manifest_url=manifest_url,
+            bump_config=ch.get("bump_config", {}),
+            bump_manager=shared_state.bump_mgr,
+        )
+        return ok, "Started" if ok else "Already running"
+
     schedule = ch.get("materialized_schedule", [])
     if not schedule:
         return False, "No materialized schedule — run Regenerate first"

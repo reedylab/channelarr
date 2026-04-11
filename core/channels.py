@@ -45,6 +45,7 @@ def _row_to_dict(row, manifest=None) -> dict:
         "schedule_epoch": row.schedule_epoch.isoformat() if row.schedule_epoch else None,
         "schedule_cycle_duration": row.schedule_cycle_duration or 0,
         "manifest_id": row.manifest_id,
+        "transcode_mediated": bool(getattr(row, "transcode_mediated", False)),
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
@@ -202,7 +203,7 @@ def backup_channels_json():
 
 
 def _apply_dict_to_row(row, channel: dict):
-    """Copy fields from a JSON channel dict onto a Channel SQLAlchemy row."""
+    """Copy fields from a channel dict onto a Channel SQLAlchemy row."""
     row.name = channel.get("name", "Unnamed")
     row.items = channel.get("items", []) or []
     row.bump_config = channel.get("bump_config", {}) or {}
@@ -221,6 +222,8 @@ def _apply_dict_to_row(row, channel: dict):
             row.schedule_epoch = None
     else:
         row.schedule_epoch = None
+    if "transcode_mediated" in channel:
+        row.transcode_mediated = bool(channel["transcode_mediated"])
 
 
 def backfill_resolved_manifests_to_channels():
@@ -380,6 +383,10 @@ class ChannelManager:
                     return None
                 if "name" in data:
                     row.name = data["name"]
+                if "transcode_mediated" in data:
+                    row.transcode_mediated = bool(data["transcode_mediated"])
+                if "bump_config" in data:
+                    row.bump_config = data["bump_config"] or {}
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None

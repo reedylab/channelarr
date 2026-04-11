@@ -533,7 +533,10 @@ class ChannelStream:
 class StreamerManager:
     def __init__(self, get_setting_fn):
         self._get = get_setting_fn
-        self._streams: dict[str, ChannelStream] = {}
+        # Holds either ChannelStream (scheduled) or ResolvedChannelStream
+        # (resolved+transcode_mediated). Both expose the same lifecycle:
+        # start(), stop(), touch(), last_access, status().
+        self._streams: dict = {}
         self._cleanup_thread = None
         self._cleanup_stop = threading.Event()
 
@@ -565,6 +568,72 @@ class StreamerManager:
             x264_threads=self._get("X264_THREADS", "4"),
             audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
             show_next=show_next,
+        )
+        stream.start()
+        self._streams[channel_id] = stream
+        return True
+
+    def start_resolved_channel(self, channel_id: str, manifest_id: str,
+                                manifest_url: str, bump_config: dict,
+                                bump_manager) -> bool:
+        """Start a transcode-mediated resolved channel.
+
+        Builds a ResolvedChannelStream that polls the upstream playlist,
+        downloads/decrypts segments, and inserts bumps at SCTE-35 cue
+        boundaries. Output goes to the same /app/data/hls/{channel_id}/
+        directory as scheduled channels — the existing HLS endpoints serve
+        it without any changes.
+        """
+        from core.resolver.transcoder import ResolvedChannelStream
+        from core.channels import ffprobe_duration
+
+        if channel_id in self._streams:
+            existing = self._streams[channel_id]
+            try:
+                if existing.status()["running"]:
+                    return False
+            except Exception:
+                pass
+            try:
+                existing.stop()
+            except Exception:
+                pass
+            del self._streams[channel_id]
+
+        # Resolve bump folders into a flat list of files with durations
+        folders = (bump_config or {}).get("folders") or []
+        if not folders and (bump_config or {}).get("folder"):
+            folders = [bump_config["folder"]]
+        bump_paths: list = []
+        bump_durations: dict = {}
+        for folder in folders:
+            try:
+                clips = bump_manager.get_clips(folder)
+            except Exception as e:
+                logging.warning("[STREAM] couldn't get bumps for %s: %s", folder, e)
+                continue
+            for clip_path in clips:
+                bump_paths.append(clip_path)
+                bump_durations[clip_path] = ffprobe_duration(clip_path)
+
+        hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
+        hls_dir = os.path.join(hls_base, channel_id)
+
+        stream = ResolvedChannelStream(
+            channel_id=channel_id,
+            manifest_id=manifest_id,
+            manifest_url=manifest_url,
+            bump_paths=bump_paths,
+            bump_durations=bump_durations,
+            hls_dir=hls_dir,
+            hls_time=int(self._get("HLS_TIME", "6")),
+            hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+            loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
+            video_preset=self._get("VIDEO_PRESET", "fast"),
+            crf=self._get("VIDEO_CRF", ""),
+            ffmpeg_threads=self._get("FFMPEG_THREADS", "1"),
+            x264_threads=self._get("X264_THREADS", "4"),
+            audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
         )
         stream.start()
         self._streams[channel_id] = stream

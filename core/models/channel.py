@@ -53,6 +53,13 @@ class Channel(Base):
         nullable=True,
     )
 
+    # B6: when true on a resolved channel, the upstream HLS goes through a
+    # full transcode pipeline (same as scheduled channels). Bumps from the
+    # channel's bump_config get spliced into ad-break gaps detected via
+    # SCTE-35 markers in the upstream playlist. Defaults to False — pure
+    # passthrough proxy is the safe baseline for resolved channels.
+    transcode_mediated = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

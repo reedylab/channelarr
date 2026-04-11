@@ -472,6 +472,12 @@ function openEditor(ch) {
   $("#ch-resolved-only").style.display = isResolved ? "" : "none";
   if (isResolved) {
     $("#ch-resolved-url").value = ch.manifest_url || "";
+    const transcodeOn = !!ch.transcode_mediated;
+    $("#ch-resolved-transcode").checked = transcodeOn;
+    $("#ch-resolved-bump-section").style.display = transcodeOn ? "" : "none";
+    const bc = ch.bump_config || {};
+    const selected = bc.folders || (bc.folder ? [bc.folder] : []);
+    loadResolvedBumpFolders(selected);
   }
 
   const bc = ch ? (ch.bump_config || {}) : {};
@@ -557,6 +563,38 @@ channelarr.deleteLogo = async function() {
     toast("success", "Logo removed");
   } catch(ex) { toast("error", "Failed to remove logo"); }
 };
+
+async function loadResolvedBumpFolders(selectedFolders) {
+  try {
+    const r = await fetch(`${API}/bumps`);
+    const d = await r.json();
+    const container = $("#ch-resolved-bump-folders");
+    if (!container) return;
+    const folders = Object.keys(d.folders || {});
+    if (!folders.length) {
+      container.innerHTML = '<span class="muted">No bump folders found</span>';
+      return;
+    }
+    container.innerHTML = folders.map(f => {
+      const checked = (selectedFolders || []).includes(f) ? " checked" : "";
+      return `<label class="bump-folder-check"><input type="checkbox" value="${esc(f)}" class="ch-res-bump-folder-cb"${checked}/> ${esc(f)} <span class="muted">(${d.folders[f]})</span></label>`;
+    }).join("");
+  } catch (e) {}
+}
+
+function getSelectedResolvedBumpFolders() {
+  return Array.from($$(".ch-res-bump-folder-cb:checked")).map(cb => cb.value);
+}
+
+// Toggle the bump section when transcode-mediated is checked
+document.addEventListener("DOMContentLoaded", () => {
+  const cb = document.getElementById("ch-resolved-transcode");
+  if (cb) {
+    cb.addEventListener("change", () => {
+      $("#ch-resolved-bump-section").style.display = cb.checked ? "" : "none";
+    });
+  }
+});
 
 async function loadBumpFolders(selectedFolders) {
   try {
@@ -944,8 +982,18 @@ async function saveChannel() {
 
   let data;
   if (isResolved) {
-    // Resolved channels: only name is editable in B2.
-    data = { name };
+    // Resolved channels: name + transcode_mediated toggle + bump folders.
+    const transcodeOn = $("#ch-resolved-transcode").checked;
+    data = {
+      name,
+      transcode_mediated: transcodeOn,
+    };
+    if (transcodeOn) {
+      data.bump_config = {
+        enabled: true,
+        folders: getSelectedResolvedBumpFolders(),
+      };
+    }
   } else {
     const shuffleMode = $("#ch-shuffle-mode").value;
     const shuffleConfig = { mode: shuffleMode };
@@ -1425,15 +1473,19 @@ playerOverlay.addEventListener("click", (e) => {
 });
 
 channelarr.watchChannel = function(id, name) {
-  // Type-aware URL: resolved channels use the proxy endpoint, scheduled
-  // channels use the FFmpeg-fed HLS endpoint.
+  // Use the API-provided stream_url so the frontend doesn't have to know
+  // which endpoint each channel type maps to. The backend stamps:
+  //   - scheduled: /live/{id}/stream.m3u8
+  //   - resolved (passthrough): /live-resolved/{manifest_id}.m3u8
+  //   - resolved (transcode-mediated): /live/{id}/stream.m3u8 (same as scheduled)
   const ch = (channels || []).find(c => c.id === id);
-  let url;
-  if (ch && ch.type === "resolved") {
-    if (!ch.manifest_id) { toast("error", "Resolved channel missing manifest"); return; }
-    url = `/live-resolved/${ch.manifest_id}.m3u8`;
-  } else {
-    url = `/live/${id}/stream.m3u8`;
+  let url = ch && ch.stream_url;
+  if (!url) {
+    if (ch && ch.type === "resolved" && ch.manifest_id) {
+      url = `/live-resolved/${ch.manifest_id}.m3u8`;
+    } else {
+      url = `/live/${id}/stream.m3u8`;
+    }
   }
   $("#player-title").textContent = name || "Watch";
   playerOverlay.classList.remove("hidden");
