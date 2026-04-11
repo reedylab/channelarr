@@ -1,0 +1,5 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+undetected-chromedriver==3.5.5
+selenium==4.11.2
+requests>=2.31

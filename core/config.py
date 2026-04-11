@@ -22,6 +22,14 @@ DEFAULTS = {
     "YT_CACHE_PATH": "/yt_cache",
     "BASE_URL": "http://localhost:5045",
     "LOG_FILE": "/app/logs/channelarr.log",
+    # Postgres for resolver storage (not existing channels — those stay JSON)
+    "PG_HOST": "192.168.20.15",
+    "PG_PORT": "5432",
+    "PG_USER": "channelarr",
+    "PG_PASS": "",
+    "PG_DB": "channelarr",
+    # Selenium-uc sidecar URL
+    "SELENIUM_URL": "http://localhost:4445",
 }
 
 

@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=19" />
+  <link rel="stylesheet" href="/static/style.css?v=20" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -50,6 +50,9 @@
         </button>
         <button class="nav-item" data-view="bumps" title="Bumps">
           <span class="nav-ic">&#9670;</span> <span>Bumps</span>
+        </button>
+        <button class="nav-item" data-view="resolver" title="Resolver">
+          <span class="nav-ic">&#9906;</span> <span>Resolver</span>
         </button>
         <button class="nav-item" data-view="logs" title="Logs">
           <span class="nav-ic">&#9776;</span> <span>Logs</span>
@@ -143,6 +146,66 @@
               </div>
             </div>
             <div id="bumps-grid" class="bump-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RESOLVER -->
+      <section id="view-resolver" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Manifest Resolver</h3>
+            <div class="panel-actions">
+              <span id="selenium-badge" class="badge" title="Selenium sidecar status">Selenium: --</span>
+              <button id="resolver-clear" class="btn btn-ghost">Clear</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div class="resolver-input">
+              <textarea id="resolver-urls" class="resolver-textarea" rows="3" placeholder="Paste URLs to resolve (one per line)&#10;&#10;Or JSON: [{&quot;url&quot;: &quot;...&quot;, &quot;title&quot;: &quot;...&quot;}, ...]"></textarea>
+              <div class="resolver-controls">
+                <input type="text" id="resolver-title" class="filter-search" placeholder="Title (optional, single URL)" style="width:200px">
+                <select id="resolver-timeout" class="filter-status">
+                  <option value="30">30s timeout</option>
+                  <option value="60">60s timeout</option>
+                  <option value="90" selected>90s timeout</option>
+                  <option value="120">120s timeout</option>
+                </select>
+                <button id="resolver-go" class="btn btn-primary">Resolve All</button>
+              </div>
+            </div>
+
+            <div id="resolver-progress" class="resolver-progress hidden">
+              <div class="resolver-progress-text"><span id="resolver-progress-label">Resolving...</span></div>
+              <div class="resolver-progress-bar"><div id="resolver-progress-fill" class="resolver-progress-fill"></div></div>
+            </div>
+
+            <table class="tbl resolver-tbl" id="resolver-queue-table">
+              <thead>
+                <tr>
+                  <th style="width:60px">Status</th>
+                  <th style="width:220px">Title</th>
+                  <th>URL</th>
+                  <th style="width:110px">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="resolver-queue-body"></tbody>
+            </table>
+
+            <div id="resolver-player" class="resolver-player hidden">
+              <div class="resolver-player-header">
+                <div>
+                  <strong id="resolver-player-title">--</strong>
+                  <span id="resolver-player-url" class="text-muted" style="font-family:var(--mono);font-size:12px;display:block;margin-top:4px;word-break:break-all"></span>
+                </div>
+                <div class="resolver-player-actions">
+                  <button id="resolver-player-close" class="btn-close">&times;</button>
+                </div>
+              </div>
+              <div class="resolver-player-wrap">
+                <video id="resolver-video" controls autoplay></video>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -334,6 +397,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=21"></script>
+  <script src="/static/ui.js?v=22"></script>
 </body>
 </html>

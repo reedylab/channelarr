@@ -48,6 +48,11 @@ function switchView(view) {
   if (view === "media") loadMediaView();
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
+  if (view === "resolver") loadResolver();
+  if (view !== "resolver") {
+    clearInterval(resolverTimer);
+    resolverTimer = null;
+  }
 }
 
 // ─── Toast ───
@@ -1518,6 +1523,245 @@ async function tick() {
     await updateSystemStats();
   }
 }
+
+// ─── Resolver ─────────────────────────────────────────────────────────────
+let resolverTimer = null;
+let resolverHls = null;
+
+async function loadResolver() {
+  // Selenium sidecar status
+  try {
+    const r = await fetch(`${API}/resolve/selenium-status`);
+    const s = await r.json();
+    const badge = $("#selenium-badge");
+    if (s.ready) {
+      badge.textContent = "Selenium: Ready";
+      badge.className = "badge selenium-ready";
+    } else {
+      badge.textContent = "Selenium: Offline";
+      badge.className = "badge selenium-offline";
+    }
+  } catch (e) {
+    const badge = $("#selenium-badge");
+    badge.textContent = "Selenium: Offline";
+    badge.className = "badge selenium-offline";
+  }
+  // Load existing batch state
+  try {
+    const r = await fetch(`${API}/resolve/batch/status`);
+    const b = await r.json();
+    if (b.results && b.results.length > 0) {
+      renderResolverQueue(b);
+      if (b.running) startResolverPolling();
+    }
+  } catch (e) {}
+}
+
+function renderResolverQueue(batch) {
+  const body = $("#resolver-queue-body");
+  const prog = $("#resolver-progress");
+  const goBtn = $("#resolver-go");
+
+  if (!batch.results || batch.results.length === 0) {
+    body.innerHTML = "";
+    prog.classList.add("hidden");
+    goBtn.disabled = false;
+    return;
+  }
+
+  if (batch.running) {
+    prog.classList.remove("hidden");
+    const pct = batch.total > 0 ? Math.round((batch.completed / batch.total) * 100) : 0;
+    $("#resolver-progress-fill").style.width = pct + "%";
+    $("#resolver-progress-label").textContent = `Resolving ${batch.completed + 1} of ${batch.total}...`;
+    goBtn.disabled = true;
+  } else {
+    const done = batch.results.filter(r => r.status === "done").length;
+    const failed = batch.results.filter(r => r.status === "failed").length;
+    if (done > 0 || failed > 0) {
+      prog.classList.remove("hidden");
+      $("#resolver-progress-fill").style.width = "100%";
+      $("#resolver-progress-label").textContent = `Complete: ${done} resolved, ${failed} failed`;
+    } else {
+      prog.classList.add("hidden");
+    }
+    goBtn.disabled = false;
+  }
+
+  body.innerHTML = batch.results.map((r, i) => {
+    const statusClass = `res-status-${r.status}`;
+    const statusTitle = r.status === "failed" ? (r.error || "Failed") : r.status;
+    const title = r.title || "(untitled)";
+    const url = r.url || "";
+    const truncUrl = url.length > 80 ? url.substring(0, 80) + "..." : url;
+
+    let expiryHint = "";
+    if (r.status === "done" && r.expires_at) {
+      const exp = new Date(r.expires_at).getTime();
+      const mins = Math.round((exp - Date.now()) / 60000);
+      if (mins > 5) expiryHint = `<span class="res-expiry" title="Auto-refresh scheduled">refreshes in ${mins - 5}m</span>`;
+      else if (mins > 0) expiryHint = `<span class="res-expiry res-expiry-soon" title="Refresh due">refreshing soon</span>`;
+      else expiryHint = `<span class="res-expiry res-expiry-stale" title="Token expired">refresh overdue</span>`;
+    } else if (r.status === "done") {
+      expiryHint = `<span class="res-expiry res-expiry-unknown" title="Unknown expiry — will auto-refresh on failure">token unknown</span>`;
+    }
+
+    let actions = `<button class="btn btn-sm-danger" data-res-remove="${i}" title="Remove">&times;</button>`;
+    if (r.status === "done" && r.manifest_id) {
+      actions = `<button class="btn btn-sm-watch" data-res-play="${r.manifest_id}" data-res-play-title="${title}" data-res-play-url="${url}" title="Test Stream">&#9654;</button> <button class="btn btn-sm" data-res-refresh="${r.manifest_id}" title="Refresh token now">&#8635;</button> ` + actions;
+    }
+    if (r.status === "failed") {
+      actions = `<button class="btn btn-sm" data-res-retry="${i}" title="Retry">&#8635;</button> ` + actions;
+    }
+
+    return `<tr>
+      <td><span class="res-status ${statusClass}" title="${statusTitle}"></span></td>
+      <td>${title}${expiryHint ? "<br>" + expiryHint : ""}</td>
+      <td class="res-url" title="${url}">${truncUrl}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
+
+  body.querySelectorAll("[data-res-play]").forEach(btn => {
+    btn.addEventListener("click", () => resolverPlay(btn.dataset.resPlay, btn.dataset.resPlayTitle, btn.dataset.resPlayUrl));
+  });
+  body.querySelectorAll("[data-res-retry]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      await fetch(`${API}/resolve/retry/${btn.dataset.resRetry}`, { method: "POST" });
+      startResolverPolling();
+    });
+  });
+  body.querySelectorAll("[data-res-refresh]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const mid = btn.dataset.resRefresh;
+      btn.disabled = true;
+      try {
+        const r = await fetch(`${API}/resolve/refresh/${mid}`, { method: "POST" });
+        const j = await r.json();
+        if (j.ok) toast("info", "Refresh queued");
+        else toast("error", j.error || "Refresh failed");
+      } catch (e) { toast("error", "Refresh failed"); }
+      setTimeout(() => { btn.disabled = false; loadResolver(); }, 3000);
+    });
+  });
+  body.querySelectorAll("[data-res-remove]").forEach(btn => {
+    btn.addEventListener("click", () => { btn.closest("tr").remove(); });
+  });
+}
+
+function startResolverPolling() {
+  clearInterval(resolverTimer);
+  resolverTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${API}/resolve/batch/status`);
+      const b = await r.json();
+      renderResolverQueue(b);
+      if (!b.running) {
+        clearInterval(resolverTimer);
+        resolverTimer = null;
+        toast("success", `Batch complete: ${b.results.filter(x => x.status === "done").length} resolved`);
+      }
+    } catch (e) {
+      clearInterval(resolverTimer);
+      resolverTimer = null;
+    }
+  }, 2000);
+}
+
+function resolverPlay(manifestId, title, pageUrl) {
+  const player = $("#resolver-player");
+  const video = $("#resolver-video");
+  player.classList.remove("hidden");
+  $("#resolver-player-title").textContent = title || "Test Stream";
+  $("#resolver-player-url").textContent = pageUrl || "";
+
+  const url = `/live-resolved/${manifestId}.m3u8`;
+  if (resolverHls) { resolverHls.destroy(); resolverHls = null; }
+
+  if (typeof Hls !== "undefined" && Hls.isSupported()) {
+    const hls = new Hls({
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 10,
+      liveDurationInfinity: true,
+      enableWorker: true,
+      maxBufferLength: 30,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (ev, data) => {
+      if (data.fatal) toast("error", "Stream playback error");
+    });
+    resolverHls = hls;
+  } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = url;
+    video.play().catch(() => {});
+  } else {
+    toast("error", "HLS not supported in this browser");
+  }
+}
+
+function closeResolverPlayer() {
+  $("#resolver-player").classList.add("hidden");
+  if (resolverHls) { resolverHls.destroy(); resolverHls = null; }
+  const video = $("#resolver-video");
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
+// Wire resolver buttons (outside SPA switching loop so bound once)
+document.addEventListener("DOMContentLoaded", () => {
+  const goBtn = $("#resolver-go");
+  if (goBtn) {
+    goBtn.addEventListener("click", async () => {
+      const raw = $("#resolver-urls").value.trim();
+      if (!raw) { toast("error", "Enter at least one URL"); return; }
+      let urls = [];
+      const title = $("#resolver-title").value.trim();
+      const timeout = parseInt($("#resolver-timeout").value);
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) urls = parsed.map(e => typeof e === "string" ? {url: e} : e);
+      } catch (e) {
+        urls = raw.split("\n").map(l => l.trim()).filter(l => l && l.startsWith("http")).map(u => ({url: u, title: title || null}));
+      }
+      if (urls.length === 0) { toast("error", "No valid URLs found"); return; }
+      try {
+        const r = await fetch(`${API}/resolve/batch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls, timeout }),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          toast("info", `Resolving ${urls.length} URL${urls.length > 1 ? "s" : ""}...`);
+          $("#resolver-urls").value = "";
+          $("#resolver-title").value = "";
+          startResolverPolling();
+          setTimeout(async () => {
+            const res = await fetch(`${API}/resolve/batch/status`);
+            renderResolverQueue(await res.json());
+          }, 500);
+        } else {
+          toast("error", j.error || "Failed to start batch");
+        }
+      } catch (e) { toast("error", "Failed to start resolve"); }
+    });
+  }
+  const clearBtn = $("#resolver-clear");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      $("#resolver-queue-body").innerHTML = "";
+      $("#resolver-progress").classList.add("hidden");
+      $("#resolver-urls").value = "";
+      $("#resolver-title").value = "";
+      closeResolverPlayer();
+    });
+  }
+  const closeBtn = $("#resolver-player-close");
+  if (closeBtn) closeBtn.addEventListener("click", closeResolverPlayer);
+});
 
 // Initial
 updateStatus();

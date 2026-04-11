@@ -1,5 +1,6 @@
 /.idea/
 /docker-compose.yml
+/docker-compose.postgres.yml
 __pycache__/
 *.pyc
 *.log

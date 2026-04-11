@@ -1,4 +1,17 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: channelarr-db
+    environment:
+      POSTGRES_DB: ${PG_DB:-channelarr}
+      POSTGRES_USER: ${PG_USER:-channelarr}
+      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+
   gluetun:
     image: qmcgaw/gluetun:v3.36.0
     container_name: channelarr-vpn
@@ -17,6 +30,8 @@ services:
       - CONTROL_SERVER_PASSWORD=${VPN_CONTROL_PASS:?Set VPN_CONTROL_PASS in .env}
     ports:
       - "5045:5045"
+    networks:
+      - internal
     volumes:
       - ./gluetun:/gluetun
     restart: unless-stopped
@@ -29,11 +44,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - BASE_URL=${BASE_URL:-http://your-server-ip:5045}
-      # Shared Postgres (point at your existing DB — or use docker-compose.postgres.yml for a bundled sidecar)
-      - PG_HOST=${PG_HOST:-your.postgres.host}
-      - PG_PORT=${PG_PORT:-5432}
+      - PG_HOST=channelarr-db
+      - PG_PORT=5432
       - PG_USER=${PG_USER:-channelarr}
-      - PG_PASS=${PG_PASS:?Set PG_PASS in .env}
+      - PG_PASS=${PG_PASS}
       - PG_DB=${PG_DB:-channelarr}
       - SELENIUM_URL=http://localhost:4445
     volumes:
@@ -44,6 +58,7 @@ services:
       - channelarr-logs:/app/logs
       - /path/to/youtube-cache:/yt_cache
     depends_on:
+      - postgres
       - gluetun
     restart: unless-stopped
     logging:
@@ -68,9 +83,13 @@ services:
         syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
         tag: "channelarr-selenium-uc"
 
+networks:
+  internal:
+
 volumes:
   channelarr-data:
   channelarr-logs:
+  pgdata:
   selenium_profile:
     external: true
     name: channelarr_selenium_profile

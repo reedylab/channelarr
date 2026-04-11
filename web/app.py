@@ -18,7 +18,7 @@ from core.channels import ChannelManager, materialize_schedule
 from core.streamer import StreamerManager
 
 from web import shared_state
-from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube
+from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube, resolve, resolved_stream
 
 
 def _clean_stale_hls():
@@ -54,6 +54,37 @@ async def lifespan(app: FastAPI):
     # ── STARTUP ──
     log_file = get_setting("LOG_FILE", "/app/logs/channelarr.log")
     setup_logging(log_file)
+
+    # Initialize Postgres for resolver storage (existing channels stay in JSON)
+    from core.database import init_engine, get_engine
+    from core.models import Base
+    from sqlalchemy import text, inspect
+    try:
+        init_engine()
+        engine = get_engine()
+        insp = inspect(engine)
+        tables = insp.get_table_names()
+        # Schema migrations for known column additions (idempotent)
+        if "manifests" in tables:
+            manifest_cols = [c["name"] for c in insp.get_columns("manifests")]
+            with engine.connect() as conn:
+                for col, coltype in [
+                    ("expires_at", "TIMESTAMPTZ"),
+                    ("last_refreshed_at", "TIMESTAMPTZ"),
+                    ("last_accessed_at", "TIMESTAMPTZ"),
+                    ("channelarr_channel_id", "VARCHAR"),
+                ]:
+                    if col not in manifest_cols:
+                        conn.execute(text(f"ALTER TABLE manifests ADD COLUMN {col} {coltype}"))
+                conn.commit()
+        Base.metadata.create_all(engine)
+        logging.info("[DB] Resolver tables ready")
+        # Start demand-driven refresh worker (only if DB is reachable)
+        from core.resolver.manifest_resolver import start_refresh_worker
+        start_refresh_worker()
+    except Exception as e:
+        logging.error("[DB] Failed to initialize Postgres: %s", e)
+        logging.error("[DB] Resolver features will be unavailable. Set PG_PASS in env or settings.")
 
     bump_mgr = BumpManager(get_setting_fn=get_setting)
     bump_mgr.scan()
@@ -110,6 +141,8 @@ app.include_router(system.router, prefix="/api")
 app.include_router(hls.router)
 app.include_router(hdhr.router)
 app.include_router(youtube.router, prefix="/api")
+app.include_router(resolve.router, prefix="/api")
+app.include_router(resolved_stream.router)
 
 
 @app.get("/health")

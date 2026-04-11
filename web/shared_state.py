@@ -186,6 +186,23 @@ def regenerate_m3u():
     os.makedirs(m3u_path, exist_ok=True)
     out = os.path.join(m3u_path, "channelarr.m3u")
 
+    # Also collect resolved channels from Postgres (parallel to JSON-stored channels)
+    resolved_rows = []
+    try:
+        from core.database import get_session
+        from core.models.manifest import Manifest
+        with get_session() as session:
+            rows = (
+                session.query(Manifest.id, Manifest.title)
+                .filter(Manifest.active == True)
+                .filter(Manifest.tags.contains(["resolved"]))
+                .order_by(Manifest.title)
+                .all()
+            )
+            resolved_rows = [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        logging.debug("[M3U] could not query resolved manifests: %s", e)
+
     with open(out, "w") as f:
         f.write("#EXTM3U\n")
         for i, ch in enumerate(channels):
@@ -199,7 +216,19 @@ def regenerate_m3u():
             f.write(f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} group-title="Channelarr",{name}\n')
             f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
 
-    logging.info("[M3U] Regenerated %s with %d channels", out, len(channels))
+        # Append resolved channels (group-title differentiates them for users)
+        next_chno = len(channels) + 1
+        for mid, title in resolved_rows:
+            display_name = title or f"Resolved {mid[:8]}"
+            f.write(
+                f'#EXTINF:-1 tvg-id="{mid}" tvg-chno="{next_chno}" tvg-name="{display_name}" '
+                f'group-title="Channelarr Resolved",{display_name}\n'
+            )
+            f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")
+            next_chno += 1
+
+    logging.info("[M3U] Regenerated %s with %d channels (%d resolved)",
+                 out, len(channels) + len(resolved_rows), len(resolved_rows))
 
     xmltv_out = os.path.join(m3u_path, "channelarr.xml")
     generate_channelarr_xmltv(channels, xmltv_out, base_url)
