@@ -74,6 +74,49 @@ def batch_status():
     return ManifestResolverService.get_batch_status()
 
 
+@router.get("/resolve/channels")
+def list_resolved_channels():
+    """List all persisted resolved channels from Postgres.
+
+    Unlike /resolve/batch/status (which reflects ephemeral in-memory batch work),
+    this survives container restarts by reading directly from the manifests
+    table. Shape matches batch result entries so the UI can render them the
+    same way.
+    """
+    from core.database import get_session
+    from core.models.manifest import Manifest, Capture
+
+    with get_session() as session:
+        rows = (
+            session.query(
+                Manifest.id,
+                Manifest.title,
+                Manifest.url,
+                Manifest.expires_at,
+                Capture.page_url,
+            )
+            .outerjoin(Capture, Manifest.capture_id == Capture.id)
+            .filter(Manifest.active == True)
+            .filter(Manifest.tags.contains(["resolved"]))
+            .order_by(Manifest.created_at.desc())
+            .all()
+        )
+    return {
+        "results": [
+            {
+                "url": r.page_url or r.url,
+                "title": r.title,
+                "status": "done",
+                "manifest_id": r.id,
+                "manifest_url": r.url,
+                "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+                "error": None,
+            }
+            for r in rows
+        ]
+    }
+
+
 @router.post("/resolve/retry/{index}")
 def retry_item(index: int):
     from core.resolver.manifest_resolver import ManifestResolverService

@@ -1546,15 +1546,29 @@ async function loadResolver() {
     badge.textContent = "Selenium: Offline";
     badge.className = "badge selenium-offline";
   }
-  // Load existing batch state
+  // Always load persisted channels from DB first (survives restarts)
+  let persisted = [];
+  try {
+    const r = await fetch(`${API}/resolve/channels`);
+    const j = await r.json();
+    persisted = j.results || [];
+  } catch (e) {}
+
+  // Layer any in-flight batch state on top
   try {
     const r = await fetch(`${API}/resolve/batch/status`);
     const b = await r.json();
-    if (b.results && b.results.length > 0) {
+    if (b.running || (b.results && b.results.some(x => x.status === "resolving" || x.status === "pending"))) {
+      // A batch is active — show batch state (it includes in-progress + recently done)
       renderResolverQueue(b);
       if (b.running) startResolverPolling();
+    } else {
+      // No active batch — show persisted channels
+      renderResolverQueue({ running: false, results: persisted });
     }
-  } catch (e) {}
+  } catch (e) {
+    renderResolverQueue({ running: false, results: persisted });
+  }
 }
 
 function renderResolverQueue(batch) {
@@ -1659,7 +1673,10 @@ function startResolverPolling() {
       if (!b.running) {
         clearInterval(resolverTimer);
         resolverTimer = null;
-        toast("success", `Batch complete: ${b.results.filter(x => x.status === "done").length} resolved`);
+        const doneCount = b.results.filter(x => x.status === "done").length;
+        toast("success", `Batch complete: ${doneCount} resolved`);
+        // Reload full persisted list so previously-resolved channels reappear
+        setTimeout(() => loadResolver(), 500);
       }
     } catch (e) {
       clearInterval(resolverTimer);
