@@ -115,13 +115,27 @@ def api_list_channels():
 
 @router.post("/channels")
 async def api_create_channel(request: Request):
-    """Create a scheduled (local/YouTube) channel.
+    """Create a channel.
 
-    Resolved channels are not created via this endpoint in B2 — they're still
-    created by the resolver flow. The "create channel from resolver library"
-    flow lands in B4.
+    Two channel types are supported:
+      - "scheduled" (default): local + YouTube items, with bumps/shuffle/loop
+      - "resolved": references a captured manifest from the library. Body must
+        include `manifest_id`. Items/bumps/shuffle are ignored.
     """
     data = await request.json()
+    ctype = data.get("type", "scheduled")
+
+    if ctype == "resolved":
+        manifest_id = data.get("manifest_id")
+        if not manifest_id:
+            return JSONResponse({"error": "manifest_id required for resolved channel"}, status_code=400)
+        ch = shared_state.channel_mgr.create_resolved_channel(manifest_id, data.get("name"))
+        if not ch:
+            return JSONResponse({"error": "manifest not found"}, status_code=404)
+        shared_state.regenerate_m3u()
+        return JSONResponse(_enrich(ch), status_code=201)
+
+    # Default: scheduled channel
     ch = shared_state.channel_mgr.create_channel(data)
     materialize_schedule(ch, shared_state.bump_mgr, media_library=shared_state.media_lib)
     shared_state.channel_mgr.save_channel(ch)

@@ -1682,16 +1682,31 @@ function renderResolverQueue(batch) {
       expiryHint = `<span class="res-expiry res-expiry-unknown" title="Unknown expiry — will auto-refresh on failure">token unknown</span>`;
     }
 
+    // Channel reference badge: how many Channel rows point at this manifest
+    let channelBadge = "";
+    if (r.status === "done" && typeof r.channel_count === "number") {
+      if (r.channel_count > 0) {
+        const names = (r.channels || []).map(c => c.name).join(", ");
+        channelBadge = `<span class="res-channel-count" title="${esc(names)}">in ${r.channel_count} channel${r.channel_count !== 1 ? "s" : ""}</span>`;
+      } else {
+        channelBadge = `<span class="res-channel-count res-channel-count-zero" title="Not yet used as a channel">unused</span>`;
+      }
+    }
+
     // Persisted (done) rows get a DB delete; failed/pending rows just get a DOM remove
     let removeBtn;
     if (r.status === "done" && r.manifest_id) {
-      removeBtn = `<button class="btn btn-sm-danger" data-res-delete="${r.manifest_id}" data-res-delete-title="${title}" title="Delete permanently">&times;</button>`;
+      const delTitle = r.channel_count > 0
+        ? `Delete library entry — also removes ${r.channel_count} channel${r.channel_count !== 1 ? "s" : ""}`
+        : "Delete library entry";
+      removeBtn = `<button class="btn btn-sm-danger" data-res-delete="${r.manifest_id}" data-res-delete-title="${title}" data-res-delete-count="${r.channel_count || 0}" title="${delTitle}">&times;</button>`;
     } else {
       removeBtn = `<button class="btn btn-sm-danger" data-res-remove="${i}" title="Remove from queue">&times;</button>`;
     }
     let actions = removeBtn;
     if (r.status === "done" && r.manifest_id) {
-      actions = `<button class="btn btn-sm-watch" data-res-play="${r.manifest_id}" data-res-play-title="${title}" data-res-play-url="${url}" title="Test Stream">&#9654;</button> <button class="btn btn-sm" data-res-refresh="${r.manifest_id}" title="Refresh token now">&#8635;</button> ` + actions;
+      const createBtn = `<button class="btn btn-sm" data-res-create="${r.manifest_id}" data-res-create-title="${title}" title="Create a channel from this manifest">+ Channel</button>`;
+      actions = `<button class="btn btn-sm-watch" data-res-play="${r.manifest_id}" data-res-play-title="${title}" data-res-play-url="${url}" title="Test Stream">&#9654;</button> <button class="btn btn-sm" data-res-refresh="${r.manifest_id}" title="Refresh token now">&#8635;</button> ${createBtn} ` + actions;
     }
     if (r.status === "failed") {
       actions = `<button class="btn btn-sm" data-res-retry="${i}" title="Retry">&#8635;</button> ` + actions;
@@ -1699,7 +1714,7 @@ function renderResolverQueue(batch) {
 
     return `<tr>
       <td><span class="res-status ${statusClass}" title="${statusTitle}"></span></td>
-      <td>${title}${expiryHint ? "<br>" + expiryHint : ""}</td>
+      <td>${title}${expiryHint ? "<br>" + expiryHint : ""}${channelBadge ? "<br>" + channelBadge : ""}</td>
       <td class="res-url" title="${url}">${truncUrl}</td>
       <td>${actions}</td>
     </tr>`;
@@ -1733,8 +1748,13 @@ function renderResolverQueue(batch) {
   body.querySelectorAll("[data-res-delete]").forEach(btn => {
     btn.addEventListener("click", async () => {
       const mid = btn.dataset.resDelete;
-      const title = btn.dataset.resDeleteTitle || "channel";
-      if (!confirm(`Delete "${title}" permanently?`)) return;
+      const title = btn.dataset.resDeleteTitle || "library entry";
+      const count = parseInt(btn.dataset.resDeleteCount || "0");
+      let prompt = `Delete "${title}" from the library?`;
+      if (count > 0) {
+        prompt += `\n\nThis will also remove ${count} channel${count !== 1 ? "s" : ""} that reference this manifest.`;
+      }
+      if (!confirm(prompt)) return;
       btn.disabled = true;
       try {
         const r = await fetch(`${API}/resolve/channels/${mid}`, { method: "DELETE" });
@@ -1742,14 +1762,41 @@ function renderResolverQueue(batch) {
         if (r.ok && j.ok) {
           toast("success", `Deleted "${title}"`);
           btn.closest("tr").remove();
-          // Reload to reflect any downstream M3U regeneration
-          setTimeout(() => loadResolver(), 500);
+          setTimeout(() => { loadResolver(); loadChannels(); }, 500);
         } else {
           toast("error", j.error || "Delete failed");
           btn.disabled = false;
         }
       } catch (e) {
         toast("error", "Delete failed");
+        btn.disabled = false;
+      }
+    });
+  });
+  body.querySelectorAll("[data-res-create]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const mid = btn.dataset.resCreate;
+      const defaultTitle = btn.dataset.resCreateTitle || "";
+      const name = prompt("Channel name:", defaultTitle && defaultTitle !== "(untitled)" ? defaultTitle : "");
+      if (name === null) return;  // user cancelled
+      btn.disabled = true;
+      try {
+        const r = await fetch(`${API}/channels`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ type: "resolved", manifest_id: mid, name: (name || "").trim() }),
+        });
+        const j = await r.json();
+        if (r.ok) {
+          toast("success", `Created channel "${j.name}"`);
+          loadResolver();
+          loadChannels();
+        } else {
+          toast("error", j.error || "Create failed");
+        }
+      } catch (e) {
+        toast("error", "Create failed");
+      } finally {
         btn.disabled = false;
       }
     });

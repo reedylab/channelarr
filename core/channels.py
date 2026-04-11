@@ -184,10 +184,13 @@ def backfill_scheduled_channels_to_db():
 
 
 def backfill_resolved_manifests_to_channels():
-    """Create Channel rows for active resolved manifests that don't yet have one.
+    """Create Channel rows for active resolved manifests that don't yet have
+    one, and clean up orphaned resolved channels (manifest_id=NULL or pointing
+    at a deleted/inactive manifest).
 
-    Preserves the current "every resolved manifest is also a channel" behavior
-    during the cutover. Decoupling happens in B3.
+    Originally introduced in B1 to preserve the "every resolved manifest is
+    also a channel" behavior during cutover. In B3 this still runs to mop up
+    orphans, but resolved channels are no longer auto-created at resolve time.
     """
     try:
         from core.database import get_session
@@ -196,7 +199,8 @@ def backfill_resolved_manifests_to_channels():
         logging.warning("[CHANNELS] DB modules unavailable, skipping resolved backfill: %s", e)
         return
 
-    count = 0
+    created = 0
+    cleaned = 0
     try:
         with get_session() as session:
             manifests = (
@@ -210,7 +214,6 @@ def backfill_resolved_manifests_to_channels():
                 existing = session.query(ChannelRow).filter_by(id=channel_id).first()
                 if existing is not None:
                     continue
-                # Also catch the case where a different ID already maps to this manifest
                 bymanifest = (
                     session.query(ChannelRow)
                     .filter_by(manifest_id=m.id, type="resolved")
@@ -231,9 +234,24 @@ def backfill_resolved_manifests_to_channels():
                     materialized_schedule=[],
                 )
                 session.add(row)
-                count += 1
-        if count:
-            logging.info("[CHANNELS] Backfilled %d resolved manifests as channels", count)
+                created += 1
+
+            # Cleanup pass: orphans (resolved channels with no manifest_id, or
+            # pointing at a manifest that no longer exists / is inactive).
+            orphans = (
+                session.query(ChannelRow)
+                .filter(ChannelRow.type == "resolved")
+                .filter(ChannelRow.manifest_id.is_(None))
+                .all()
+            )
+            for o in orphans:
+                logging.info("[CHANNELS] Removing orphaned resolved channel: %s (%s)", o.id, o.name)
+                session.delete(o)
+                cleaned += 1
+        if created:
+            logging.info("[CHANNELS] Backfilled %d resolved manifests as channels", created)
+        if cleaned:
+            logging.info("[CHANNELS] Cleaned %d orphaned resolved channels", cleaned)
     except Exception as e:
         logging.warning("[CHANNELS] Resolved-manifest backfill failed: %s", e)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +313,64 @@ class ChannelManager:
                 ch.setdefault("type", "scheduled")
                 return ch
         return None
+
+    def create_resolved_channel(self, manifest_id: str, name: str | None = None) -> dict | None:
+        """Create a new resolved-type Channel referencing an existing manifest.
+
+        Used by the library "Create Channel" flow. The manifest must exist
+        and be active. Returns the new channel dict (enrichable shape) or
+        None if the manifest doesn't exist.
+        """
+        from urllib.parse import urlparse
+        try:
+            from core.database import get_session
+            from core.models import Channel as ChannelRow, Manifest
+        except Exception as e:
+            logging.error("[CHANNELS] DB unavailable, cannot create resolved channel: %s", e)
+            return None
+
+        with get_session() as session:
+            m = (
+                session.query(Manifest)
+                .filter(Manifest.id == manifest_id)
+                .filter(Manifest.active == True)  # noqa: E712
+                .first()
+            )
+            if m is None:
+                return None
+
+            # Default name: provided → manifest title → m3u8 hostname → fallback
+            display_name = (name or "").strip()
+            if not display_name and m.title:
+                display_name = m.title.strip()
+            if not display_name:
+                try:
+                    host = urlparse(m.url).hostname or ""
+                    if host:
+                        display_name = host
+                except Exception:
+                    pass
+            if not display_name:
+                display_name = m.source_domain or "Unnamed Resolved"
+
+            new_id = f"ch-res-{uuid.uuid4().hex[:8]}"
+            row = ChannelRow(
+                id=new_id,
+                name=display_name,
+                type="resolved",
+                manifest_id=m.id,
+                items=[],
+                bump_config={},
+                shuffle_config={"mode": "none"},
+                loop=False,
+                schedule_cycle_duration=0,
+                materialized_schedule=[],
+            )
+            session.add(row)
+            session.flush()
+
+        logging.info("[CHANNELS] Created resolved channel %s -> manifest %s", new_id, manifest_id)
+        return self.get_channel(new_id)
 
     def create_channel(self, data: dict) -> dict:
         channel = {

@@ -76,18 +76,19 @@ def batch_status():
 
 @router.get("/resolve/channels")
 def list_resolved_channels():
-    """List all persisted resolved channels from Postgres.
+    """List all manifests in the library (B3: this is now a manifest library,
+    not an auto-channel list).
 
-    Unlike /resolve/batch/status (which reflects ephemeral in-memory batch work),
-    this survives container restarts by reading directly from the manifests
-    table. Shape matches batch result entries so the UI can render them the
-    same way.
+    Each row includes a `channels` list with the names + ids of any Channel
+    rows referencing this manifest, plus a `channel_count`. The UI uses these
+    to show 'Used in N channels' and to gate the 'Create Channel' action.
     """
     from core.database import get_session
     from core.models.manifest import Manifest, Capture
+    from core.models.channel import Channel
 
     with get_session() as session:
-        rows = (
+        manifests = (
             session.query(
                 Manifest.id,
                 Manifest.title,
@@ -101,18 +102,33 @@ def list_resolved_channels():
             .order_by(Manifest.created_at.desc())
             .all()
         )
+
+        # Bulk-load channel references in one query, then group by manifest_id
+        manifest_ids = [m.id for m in manifests]
+        channels_by_manifest: dict[str, list] = {}
+        if manifest_ids:
+            ch_rows = (
+                session.query(Channel.id, Channel.name, Channel.manifest_id)
+                .filter(Channel.manifest_id.in_(manifest_ids))
+                .all()
+            )
+            for cid, cname, mid in ch_rows:
+                channels_by_manifest.setdefault(mid, []).append({"id": cid, "name": cname})
+
     return {
         "results": [
             {
-                "url": r.page_url or r.url,
-                "title": r.title,
+                "url": m.page_url or m.url,
+                "title": m.title,
                 "status": "done",
-                "manifest_id": r.id,
-                "manifest_url": r.url,
-                "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+                "manifest_id": m.id,
+                "manifest_url": m.url,
+                "expires_at": m.expires_at.isoformat() if m.expires_at else None,
+                "channels": channels_by_manifest.get(m.id, []),
+                "channel_count": len(channels_by_manifest.get(m.id, [])),
                 "error": None,
             }
-            for r in rows
+            for m in manifests
         ]
     }
 

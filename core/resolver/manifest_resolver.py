@@ -517,22 +517,9 @@ def _store_manifest(
                 for v in _parse_master_variants(body_text, manifest_url):
                     session.add(Variant(manifest_id=manifest.id, **v))
 
-            # B1 dual-write: every new resolved manifest also gets a Channel
-            # row so the unified `channels` table stays in parity. Decoupling
-            # (resolver no longer auto-creates channels) lands in B3.
-            from core.models.channel import Channel
-            ch_row = Channel(
-                id=manifest.channelarr_channel_id,
-                name=_default_resolved_name(manifest.title, manifest_url, source_domain),
-                type="resolved",
-                manifest_id=manifest.id,
-                items=[],
-                bump_config={},
-                shuffle_config={"mode": "none"},
-                loop=False,
-                schedule_cycle_duration=0,
-                materialized_schedule=[],
-            )
-            session.add(ch_row)
+            # B3: Resolves create manifests only — they no longer auto-create
+            # a Channel row. The library is the manifest collection; channels
+            # are created explicitly from a library entry via /api/channels
+            # with type=resolved + manifest_id.
 
         return manifest.id
