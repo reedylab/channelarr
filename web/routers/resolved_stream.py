@@ -17,13 +17,34 @@ from urllib.parse import urljoin, quote
 
 import requests as http_requests
 from fastapi import APIRouter, Query, HTTPException
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import Response, StreamingResponse, RedirectResponse
 
 from core.database import get_session
 from core.models.manifest import Manifest
+from core.models.channel import Channel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _find_transcode_channel_for_manifest(manifest_id: str) -> str | None:
+    """Return the channel_id of any active transcode-mediated channel that
+    references this manifest, or None if no such channel exists. Used by the
+    legacy /live-resolved/{mid}.m3u8 endpoint to transparently route stale
+    clients to the new transcoded HLS pipeline."""
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Channel.id)
+                .filter(Channel.manifest_id == manifest_id)
+                .filter(Channel.type == "resolved")
+                .filter(Channel.transcode_mediated == True)  # noqa: E712
+                .first()
+            )
+        return row[0] if row else None
+    except Exception as e:
+        logger.debug("[RESOLVED-STREAM] transcode lookup failed: %s", e)
+        return None
 
 MANIFEST_ID_RE = re.compile(r"^[a-f0-9-]+$")
 CHUNK = 16384
@@ -112,6 +133,18 @@ def resolved_playlist(manifest_id: str, src: str = Query(default=None)):
     # Nested playlist fetch (when HLS.js follows a variant) keeps the same mid
     if src:
         return _proxy_m3u8(manifest_id, src)
+
+    # Safety net for stale clients: if any active channel using this manifest
+    # has transcode_mediated enabled, redirect to the unified /live/ endpoint
+    # instead of serving the raw passthrough proxy. Means an IPTV client
+    # (Jellyfin/Plex/etc) holding a cached /live-resolved/ URL will pick up
+    # the transcoded stream automatically without re-importing the M3U.
+    transcode_channel_id = _find_transcode_channel_for_manifest(manifest_id)
+    if transcode_channel_id:
+        return RedirectResponse(
+            url=f"/live/{transcode_channel_id}/stream.m3u8",
+            status_code=302,
+        )
 
     with get_session() as session:
         row = session.query(Manifest.url).filter(Manifest.id == manifest_id, Manifest.active == True).first()

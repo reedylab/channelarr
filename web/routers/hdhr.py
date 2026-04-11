@@ -64,7 +64,13 @@ def lineup(request: Request):
             mid = ch.get("manifest_id")
             if not mid:
                 continue
-            url = f"{base}/live-resolved/{mid}.m3u8"
+            # Transcode-mediated resolved channels use the unified /live/
+            # endpoint just like scheduled channels. Pure-proxy resolved
+            # channels use /live-resolved/.
+            if ch.get("transcode_mediated"):
+                url = f"{base}/live/{cid}/stream.m3u8"
+            else:
+                url = f"{base}/live-resolved/{mid}.m3u8"
         else:
             url = f"{base}/live/{cid}/stream.m3u8"
 
