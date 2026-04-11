@@ -3,9 +3,10 @@
 When a resolved channel has `transcode_mediated=True`, instead of proxying the
 upstream HLS bytes through unchanged, we run a full transcode pipeline like
 scheduled channels do. The orchestrator polls the upstream variant playlist,
-classifies each segment as show / ad / bumper using the SCTE-35 cue markers,
-and feeds them through a long-running FFmpeg encoder. Ad segments get
-replaced with bump files (configurable per channel).
+classifies each segment as show or break using a per-channel profile (Adult
+Swim's SCTE-35 dialect, Anvato/Lura's type-tagged segments, etc.), and feeds
+them through a long-running FFmpeg encoder. Break segments get replaced with
+bump files (configurable per channel).
 
 The output is a single coherent HLS stream with one consistent codec profile,
 no encryption-method changes, no discontinuities, and no CDN-path mismatches —
@@ -38,6 +39,15 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests as http_requests
+
+from core.resolver.profiles import (
+    UpstreamSegment,
+    StreamProfile,
+    get_profile,
+    detect_profile,
+    CLASS_SHOW,
+    CLASS_REPLACE,
+)
 
 
 # ── Encoder target params ───────────────────────────────────────────────────
@@ -118,112 +128,6 @@ def build_bump_sequence(bump_paths: list, bump_durations: dict, target_seconds: 
     return sequence
 
 
-# ── Upstream playlist parsing ───────────────────────────────────────────────
-
-@dataclass
-class UpstreamSegment:
-    seq: int
-    uri: str               # absolute URL (resolved against playlist base)
-    duration: float
-    program_date_time: Optional[str]
-    discontinuity: bool    # this segment starts after a discontinuity
-    cue_out_duration: Optional[float]  # if this segment starts a cue, total cue duration
-    cue_out_cont_remaining: Optional[float]  # if mid-cue, seconds remaining (Duration - ElapsedTime)
-    cue_in: bool           # this segment is the cue-in marker
-    key_method: Optional[str]
-    key_uri: Optional[str]
-    key_iv: Optional[str]
-
-
-def parse_variant_playlist(text: str, base_url: str) -> tuple[int, list[UpstreamSegment]]:
-    """Parse a variant playlist into structured segments.
-
-    Returns (media_sequence_start, segments). Each segment carries enough
-    state to classify it as show/ad/bumper later.
-    """
-    lines = text.splitlines()
-    media_seq = 0
-    segments: list[UpstreamSegment] = []
-
-    current_duration = 0.0
-    current_pdt = None
-    pending_disc = False
-    pending_cue_out_dur = None
-    pending_cue_out_cont_remaining = None
-    pending_cue_in = False
-    current_key_method = None
-    current_key_uri = None
-    current_key_iv = None
-
-    for line in lines:
-        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            try:
-                media_seq = int(line.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-        elif line.startswith("#EXTINF:"):
-            try:
-                current_duration = float(line.split(":", 1)[1].split(",", 1)[0])
-            except (ValueError, IndexError):
-                current_duration = 0.0
-        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-            current_pdt = line.split(":", 1)[1].strip()
-        elif line.startswith("#EXT-X-DISCONTINUITY"):
-            pending_disc = True
-        elif line.startswith("#EXT-X-CUE-OUT-CONT"):
-            # Continuation marker — extract Duration and ElapsedTime to know
-            # how much cue is left when joining mid-break
-            dur_m = re.search(r'Duration=([\d.]+)', line)
-            elapsed_m = re.search(r'ElapsedTime=([\d.]+)', line)
-            if dur_m and elapsed_m:
-                try:
-                    total = float(dur_m.group(1))
-                    elapsed = float(elapsed_m.group(1))
-                    pending_cue_out_cont_remaining = max(0.0, total - elapsed)
-                except ValueError:
-                    pass
-        elif line.startswith("#EXT-X-CUE-OUT:"):
-            try:
-                pending_cue_out_dur = float(line.split(":", 1)[1].strip())
-            except ValueError:
-                pending_cue_out_dur = None
-        elif line.startswith("#EXT-X-CUE-IN"):
-            pending_cue_in = True
-        elif line.startswith("#EXT-X-KEY:"):
-            attrs = line.split(":", 1)[1]
-            method_match = re.search(r'METHOD=([^,]+)', attrs)
-            uri_match = re.search(r'URI="([^"]+)"', attrs)
-            iv_match = re.search(r'IV=(0x[0-9a-fA-F]+)', attrs)
-            current_key_method = method_match.group(1) if method_match else None
-            current_key_uri = uri_match.group(1) if uri_match else None
-            current_key_iv = iv_match.group(1) if iv_match else None
-        elif line and not line.startswith("#"):
-            # Segment URI line
-            seq_num = media_seq + len(segments)
-            abs_uri = urljoin(base_url, line)
-            segments.append(UpstreamSegment(
-                seq=seq_num,
-                uri=abs_uri,
-                duration=current_duration,
-                program_date_time=current_pdt,
-                discontinuity=pending_disc,
-                cue_out_duration=pending_cue_out_dur,
-                cue_out_cont_remaining=pending_cue_out_cont_remaining,
-                cue_in=pending_cue_in,
-                key_method=current_key_method,
-                key_uri=current_key_uri,
-                key_iv=current_key_iv,
-            ))
-            current_duration = 0.0
-            current_pdt = None
-            pending_disc = False
-            pending_cue_out_dur = None
-            pending_cue_out_cont_remaining = None
-            pending_cue_in = False
-
-    return media_seq, segments
-
-
 # ── Resolved channel stream ─────────────────────────────────────────────────
 
 class ResolvedChannelStream:
@@ -245,6 +149,7 @@ class ResolvedChannelStream:
         channel_name: str = "",
         logo_path: str = "",
         show_next: bool = False,
+        profile_name: str = "auto",
         hls_time: int = 6,
         hls_list_size: int = 10,
         loglevel: str = "warning",
@@ -263,6 +168,8 @@ class ResolvedChannelStream:
         self.channel_name = channel_name or "Live"
         self.logo_path = logo_path
         self.show_next = show_next
+        self.profile_name = profile_name
+        self.profile: Optional[StreamProfile] = None  # resolved on first poll
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
         self.loglevel = loglevel
@@ -360,58 +267,147 @@ class ResolvedChannelStream:
 
     # ── Playlist poller ────────────────────────────────────────────────────
 
-    def _poller_loop(self):
-        """Poll the upstream variant playlist, classify segments, enqueue work.
+    def _refresh_manifest_url(self) -> Optional[str]:
+        """Trigger a synchronous re-resolve of the manifest via selenium.
+        Used when the upstream variant URL 403s and the cached token has
+        expired. Returns the fresh manifest URL or None on failure."""
+        try:
+            from core.resolver.manifest_resolver import ManifestResolverService
+            from core.database import get_session
+            from core.models.manifest import Manifest
 
-        Maintains state about the current cue (if any) so consecutive ad
-        segments get replaced by a single bump sequence rather than one bump
-        per ad segment.
+            result = ManifestResolverService.refresh_manifest(self.manifest_id)
+            if not result.get("ok"):
+                logging.warning(
+                    "[RESOLVED-XCODE] %s manifest refresh failed: %s",
+                    self.channel_id, result.get("error"),
+                )
+                return None
+            with get_session() as session:
+                row = session.query(Manifest.url).filter(Manifest.id == self.manifest_id).first()
+            return row[0] if row else None
+        except Exception as e:
+            logging.warning("[RESOLVED-XCODE] %s manifest refresh error: %s",
+                            self.channel_id, e)
+            return None
+
+    def _poller_loop(self):
+        """Poll the upstream variant playlist, classify segments via the
+        profile, enqueue upstream segments or replacement bumps.
+
+        Profile-agnostic — the SCTE-35 details for Adult Swim and the
+        Anvato/Lura details for WSPA both flow through the same loop, just
+        with different profile.parse() / profile.classify() behavior.
         """
         seen_seqs: set[int] = set()
-        cue_state = "IDLE"            # IDLE | IN_CUE | POST_CUE_BUMPER_WINDOW
-        cue_remaining = 0.0
-        bumper_window_until = 0.0     # epoch when post-cue bumper window expires
+        profile_state: dict = {}      # opaque per-profile classifier state
+        in_break: bool = False        # tracks whether we're currently replacing
         backfilled = False
+        consecutive_403s = 0
 
-        # Need a variant URL — if the manifest_url is a master, pick the first variant
         variant_url = self._resolve_variant_url(self.manifest_url)
-        logging.info("[RESOLVED-XCODE] Polling variant: %s", variant_url[:120])
+        logging.info("[RESOLVED-XCODE] %s polling variant: %s",
+                     self.channel_id, variant_url[:120])
 
         while not self._stop_event.is_set():
             try:
                 resp = http_requests.get(variant_url, timeout=10)
-                if resp.status_code != 200:
-                    logging.warning("[RESOLVED-XCODE] %s playlist HTTP %d", self.channel_id, resp.status_code)
-                    time.sleep(POLL_INTERVAL_SECONDS)
+                if resp.status_code in (401, 403):
+                    consecutive_403s += 1
+                    logging.warning(
+                        "[RESOLVED-XCODE] %s variant HTTP %d (#%d) — refreshing manifest",
+                        self.channel_id, resp.status_code, consecutive_403s,
+                    )
+                    fresh_master = self._refresh_manifest_url()
+                    if fresh_master:
+                        self.manifest_url = fresh_master
+                        variant_url = self._resolve_variant_url(fresh_master)
+                        logging.info("[RESOLVED-XCODE] %s new variant: %s",
+                                     self.channel_id, variant_url[:120])
+                        consecutive_403s = 0
+                    else:
+                        # Backoff to avoid hammering selenium
+                        self._stop_event.wait(min(POLL_INTERVAL_SECONDS * 5, 30))
                     continue
-                _, segments = parse_variant_playlist(resp.text, variant_url)
+                if resp.status_code != 200:
+                    logging.warning("[RESOLVED-XCODE] %s playlist HTTP %d",
+                                    self.channel_id, resp.status_code)
+                    self._stop_event.wait(POLL_INTERVAL_SECONDS)
+                    continue
+                consecutive_403s = 0
+                # Resolve the profile on first poll if set to "auto"
+                if self.profile is None:
+                    if self.profile_name and self.profile_name != "auto":
+                        self.profile = get_profile(self.profile_name)
+                    else:
+                        self.profile = detect_profile(resp.text)
+                    logging.info("[RESOLVED-XCODE] %s using profile: %s",
+                                 self.channel_id, self.profile.name)
+                _, segments = self.profile.parse(resp.text, variant_url)
             except Exception as e:
-                logging.warning("[RESOLVED-XCODE] %s playlist fetch failed: %s", self.channel_id, e)
-                time.sleep(POLL_INTERVAL_SECONDS)
+                logging.warning("[RESOLVED-XCODE] %s playlist fetch failed: %s",
+                                self.channel_id, e)
+                self._stop_event.wait(POLL_INTERVAL_SECONDS)
                 continue
 
             # On first poll, mark every old segment as already-seen so we
-            # only process segments at the live edge. This prevents
-            # replaying the whole rolling window (which would include
-            # historical ad breaks).
+            # only process segments at the live edge. Prevents replaying
+            # the whole rolling window (which often includes historical
+            # ad breaks).
             if not backfilled:
                 for old_seg in segments[:-INITIAL_BACKFILL_SEGMENTS]:
                     seen_seqs.add(old_seg.seq)
-                # Also: if any of the live-edge segments are mid-cue, set
-                # state appropriately so we know we joined inside a break.
-                live_edge = segments[-INITIAL_BACKFILL_SEGMENTS:] if len(segments) > INITIAL_BACKFILL_SEGMENTS else segments
+                # If we joined mid-break, set in_break so the first
+                # live-edge segment of the break gets replaced.
+                live_edge = (
+                    segments[-INITIAL_BACKFILL_SEGMENTS:]
+                    if len(segments) > INITIAL_BACKFILL_SEGMENTS
+                    else segments
+                )
                 for s in live_edge:
-                    if s.cue_out_cont_remaining is not None and not s.cue_in:
-                        cue_state = "IN_CUE"
-                        cue_remaining = s.cue_out_cont_remaining
+                    cls, _ = self.profile.classify(s, profile_state)
+                    if cls == CLASS_REPLACE:
+                        in_break = True
                         logging.info(
-                            "[RESOLVED-XCODE] %s joined mid-cue, %.1fs remaining",
-                            self.channel_id, cue_remaining,
+                            "[RESOLVED-XCODE] %s joined mid-break", self.channel_id,
                         )
-                        bump_seq = build_bump_sequence(
-                            self.bump_paths, self.bump_durations, cue_remaining,
-                        )
-                        cue_left = cue_remaining
+                        break
+                    # Reset profile state to avoid double-counting on the
+                    # real loop below
+                    profile_state = {}
+                backfilled = True
+
+            for seg in segments:
+                if seg.seq in seen_seqs:
+                    continue
+                seen_seqs.add(seg.seq)
+
+                cls, pod_hint = self.profile.classify(seg, profile_state)
+
+                if cls == CLASS_SHOW:
+                    if in_break:
+                        in_break = False
+                        logging.info("[RESOLVED-XCODE] %s break ended, master resumed",
+                                     self.channel_id)
+                    self._enqueue_upstream(seg)
+                    continue
+
+                # CLASS_REPLACE — break content, queue a bump instead
+                if not in_break:
+                    in_break = True
+                    logging.info("[RESOLVED-XCODE] %s break started (type=%s)",
+                                 self.channel_id, seg.anvato_type or "scte35")
+
+                # When the profile reports a pod_hint (e.g. Lura's pod-duration
+                # at ad-index=0, or Adult Swim's CUE-OUT duration), build a
+                # full perfect-fit bump sequence right now. Otherwise enqueue
+                # one bump matching this segment's duration.
+                if pod_hint and pod_hint > 0:
+                    bump_seq = build_bump_sequence(
+                        self.bump_paths, self.bump_durations, pod_hint,
+                    )
+                    if bump_seq:
+                        cue_left = pod_hint
                         for bump_path, bump_dur in bump_seq:
                             self._segment_queue.put(QueueItem(
                                 kind="bump",
@@ -421,65 +417,39 @@ class ResolvedChannelStream:
                                 cue_remaining_at_start=cue_left,
                             ))
                             cue_left -= bump_dur
-                        if not bump_seq:
-                            logging.warning(
-                                "[RESOLVED-XCODE] %s no bumps configured — joining mid-cue with no replacement",
-                                self.channel_id,
-                            )
-                        break
-                backfilled = True
-
-            for seg in segments:
-                if seg.seq in seen_seqs:
-                    continue
-                seen_seqs.add(seg.seq)
-
-                # Cue start: a segment with cue_out_duration starts an ad break
-                if seg.cue_out_duration:
-                    cue_state = "IN_CUE"
-                    cue_remaining = seg.cue_out_duration
-                    logging.info("[RESOLVED-XCODE] %s CUE-OUT detected: %.1fs",
-                                 self.channel_id, cue_remaining)
-                    bump_seq = build_bump_sequence(self.bump_paths, self.bump_durations, cue_remaining)
-                    if not bump_seq:
+                        logging.info(
+                            "[RESOLVED-XCODE] %s queued %d bumps for %.1fs pod",
+                            self.channel_id, len(bump_seq), pod_hint,
+                        )
+                    else:
                         logging.warning(
-                            "[RESOLVED-XCODE] %s no bumps configured — falling back to upstream during cue",
+                            "[RESOLVED-XCODE] %s no bumps configured — break content will pass through",
                             self.channel_id,
                         )
                         self._enqueue_upstream(seg)
-                        continue
-                    # Discard the upstream ad segments and queue bumps instead
-                    cue_left = cue_remaining
-                    for bump_path, bump_dur in bump_seq:
-                        self._segment_queue.put(QueueItem(
-                            kind="bump",
-                            source_path=bump_path,
-                            duration=bump_dur,
-                            label=os.path.basename(bump_path),
-                            cue_remaining_at_start=cue_left,
-                        ))
-                        cue_left -= bump_dur
-                    continue
+                else:
+                    # Continuous mode: queue one bump per replaced segment.
+                    # Used when we don't have an upfront pod duration (e.g.
+                    # Lura SLATE segments before the ad pod starts, or
+                    # joining mid-cue without continuation markers).
+                    bump_seq = build_bump_sequence(
+                        self.bump_paths, self.bump_durations, seg.duration,
+                    )
+                    if bump_seq:
+                        for bump_path, bump_dur in bump_seq:
+                            self._segment_queue.put(QueueItem(
+                                kind="bump",
+                                source_path=bump_path,
+                                duration=bump_dur,
+                                label=os.path.basename(bump_path),
+                            ))
+                    else:
+                        logging.warning(
+                            "[RESOLVED-XCODE] %s no bumps configured — passing through",
+                            self.channel_id,
+                        )
+                        self._enqueue_upstream(seg)
 
-                # Inside an active cue: skip the upstream ad segments
-                if cue_state == "IN_CUE":
-                    cue_remaining -= seg.duration
-                    if seg.cue_in or cue_remaining <= 0:
-                        cue_state = "POST_CUE_BUMPER_WINDOW"
-                        bumper_window_until = time.time() + BUMPER_WINDOW_SECONDS
-                        logging.info("[RESOLVED-XCODE] %s CUE-IN — bumper window opens", self.channel_id)
-                    continue
-
-                # Post-cue: bare discontinuities within the window are bumpers
-                # (Adult Swim convention) — pass through unchanged.
-                if cue_state == "POST_CUE_BUMPER_WINDOW":
-                    if time.time() > bumper_window_until:
-                        cue_state = "IDLE"
-
-                # Normal show or bumper segment — enqueue
-                self._enqueue_upstream(seg)
-
-            # Sleep before next poll
             self._stop_event.wait(POLL_INTERVAL_SECONDS)
 
     def _resolve_variant_url(self, url: str) -> str:

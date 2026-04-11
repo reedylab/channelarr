@@ -60,6 +60,12 @@ class Channel(Base):
     # passthrough proxy is the safe baseline for resolved channels.
     transcode_mediated = Column(Boolean, default=False, nullable=False)
 
+    # B6.2: which stream profile drives ad-break detection. "auto" picks
+    # based on heuristics in the playlist (the default). Named profiles:
+    # "adultswim" (SCTE-35), "anvato_lura" (Anvato/Lura type-tagged
+    # segments — used by WSPA News and other local affiliates).
+    profile_name = Column(String, nullable=False, default="auto")
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -385,7 +385,17 @@
               <input type="checkbox" id="ch-resolved-transcode" />
               Transcode-mediated streaming (insert bumps during ad breaks)
             </label>
-            <div class="muted" style="margin-top:4px;font-size:11px">When enabled, channelarr re-encodes the upstream HLS through FFmpeg and replaces SCTE-35 ad breaks with bumps from the folders below. This produces a single coherent HLS stream that even strict players (Jellyfin/ExoPlayer) handle smoothly. Costs one continuous FFmpeg encoder while clients are watching.</div>
+            <div class="muted" style="margin-top:4px;font-size:11px">When enabled, channelarr re-encodes the upstream HLS through FFmpeg and replaces ad breaks with bumps from the folders below. This produces a single coherent HLS stream that even strict players (Jellyfin/ExoPlayer) handle smoothly. Costs one continuous FFmpeg encoder while clients are watching.</div>
+
+            <div class="setting-field" style="margin-top:10px">
+              <label>Stream Profile</label>
+              <select id="ch-resolved-profile">
+                <option value="auto">Auto-detect</option>
+                <option value="adultswim">Adult Swim / Turner CDN (SCTE-35)</option>
+                <option value="anvato_lura">Anvato / Lura Live (local TV affiliates, e.g. WSPA)</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">How channelarr detects ad breaks in the upstream playlist. Auto picks based on marker fingerprints and is correct for most sources. Pick a named profile if auto-detect chooses wrong.</div>
+            </div>
 
             <div id="ch-resolved-bump-section" style="display:none;margin-top:12px">
               <h4 style="margin-bottom:6px">Bump Folders</h4>
@@ -485,6 +495,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=30"></script>
+  <script src="/static/ui.js?v=31"></script>
 </body>
 </html>

@@ -45,6 +45,7 @@ def _start_from_schedule(channel_id):
             bump_manager=shared_state.bump_mgr,
             channel_name=ch.get("name", ""),
             logo_dir=shared_state.LOGO_DIR,
+            profile_name=ch.get("profile_name", "auto"),
         )
         return ok, "Started" if ok else "Already running"
 

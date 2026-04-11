@@ -479,6 +479,7 @@ function openEditor(ch) {
     const selected = bc.folders || (bc.folder ? [bc.folder] : []);
     loadResolvedBumpFolders(selected);
     $("#ch-resolved-shownext").checked = !!bc.show_next;
+    $("#ch-resolved-profile").value = ch.profile_name || "auto";
   }
 
   const bc = ch ? (ch.bump_config || {}) : {};
@@ -983,11 +984,12 @@ async function saveChannel() {
 
   let data;
   if (isResolved) {
-    // Resolved channels: name + transcode_mediated toggle + bump folders + overlay.
+    // Resolved channels: name + transcode_mediated toggle + bump folders + overlay + profile.
     const transcodeOn = $("#ch-resolved-transcode").checked;
     data = {
       name,
       transcode_mediated: transcodeOn,
+      profile_name: $("#ch-resolved-profile").value || "auto",
     };
     if (transcodeOn) {
       data.bump_config = {

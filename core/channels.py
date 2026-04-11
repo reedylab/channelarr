@@ -46,6 +46,7 @@ def _row_to_dict(row, manifest=None) -> dict:
         "schedule_cycle_duration": row.schedule_cycle_duration or 0,
         "manifest_id": row.manifest_id,
         "transcode_mediated": bool(getattr(row, "transcode_mediated", False)),
+        "profile_name": getattr(row, "profile_name", "auto") or "auto",
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
@@ -387,6 +388,8 @@ class ChannelManager:
                     row.transcode_mediated = bool(data["transcode_mediated"])
                 if "bump_config" in data:
                     row.bump_config = data["bump_config"] or {}
+                if "profile_name" in data:
+                    row.profile_name = data["profile_name"] or "auto"
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None
