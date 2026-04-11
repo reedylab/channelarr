@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=21" />
+  <link rel="stylesheet" href="/static/style.css?v=22" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -405,10 +405,69 @@
     </div>
   </div>
 
+  <!-- Channel Type Picker Modal -->
+  <div id="type-picker-overlay" class="modal-overlay hidden">
+    <div class="modal type-picker-modal">
+      <div class="modal-header">
+        <h3>Create New Channel</h3>
+        <button id="type-picker-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted" style="margin-bottom:16px">Choose what kind of channel to create.</p>
+        <div class="type-picker-options">
+          <button class="type-picker-card" id="type-pick-scheduled">
+            <div class="type-picker-icon">&#128250;</div>
+            <h4>Scheduled</h4>
+            <p>Local media + YouTube items playing on a schedule, with bumps, shuffle, and looping.</p>
+          </button>
+          <button class="type-picker-card" id="type-pick-resolved">
+            <div class="type-picker-icon">&#128225;</div>
+            <h4>Resolved Stream</h4>
+            <p>Live stream sourced from a captured manifest in the library. Pure live, no schedule.</p>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Resolved Channel Modal -->
+  <div id="create-resolved-overlay" class="modal-overlay hidden">
+    <div class="modal create-resolved-modal">
+      <div class="modal-header">
+        <h3>Create Resolved Channel</h3>
+        <button id="create-resolved-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="cr-picker-section">
+          <h4 style="margin-bottom:8px">Pick a Manifest from the Library</h4>
+          <div id="cr-manifest-list" class="cr-manifest-list">
+            <div class="empty-state">Loading library...</div>
+          </div>
+        </div>
+        <div id="cr-form-section" style="display:none">
+          <div class="setting-field">
+            <label>Source Manifest</label>
+            <div id="cr-selected-manifest" class="cr-selected-manifest"></div>
+          </div>
+          <div class="setting-field">
+            <label>Channel Name</label>
+            <input type="text" id="cr-channel-name" placeholder="My Channel" />
+          </div>
+          <div class="muted" style="margin-top:8px">After creating the channel you can upload a logo from the channel editor. Resolved channels have no schedule — they proxy the upstream HLS directly.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="create-resolved-back" class="btn btn-ghost" style="display:none">&larr; Back to picker</button>
+        <button id="create-resolved-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="create-resolved-submit" class="btn btn-primary" disabled>Create Channel</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=26"></script>
+  <script src="/static/ui.js?v=27"></script>
 </body>
 </html>

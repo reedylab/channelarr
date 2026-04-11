@@ -290,10 +290,157 @@ channelarr.editChannel = function(id) {
 // ─── Channel Editor Modal ───
 const overlay = $("#modal-overlay");
 
-$("#new-channel-btn").addEventListener("click", () => openEditor(null));
+$("#new-channel-btn").addEventListener("click", () => openTypePicker());
 $("#modal-close").addEventListener("click", closeEditor);
 $("#modal-cancel").addEventListener("click", closeEditor);
 $("#modal-save").addEventListener("click", saveChannel);
+
+// ─── Channel Type Picker ───
+function openTypePicker() {
+  $("#type-picker-overlay").classList.remove("hidden");
+}
+function closeTypePicker() {
+  $("#type-picker-overlay").classList.add("hidden");
+}
+$("#type-picker-close").addEventListener("click", closeTypePicker);
+$("#type-picker-overlay").addEventListener("click", e => {
+  if (e.target.id === "type-picker-overlay") closeTypePicker();
+});
+$("#type-pick-scheduled").addEventListener("click", () => {
+  closeTypePicker();
+  openEditor(null);
+});
+$("#type-pick-resolved").addEventListener("click", () => {
+  closeTypePicker();
+  openCreateResolved(null);
+});
+
+// ─── Create Resolved Channel Modal ───
+let crSelectedManifest = null;
+
+function openCreateResolved(preselectedManifest) {
+  crSelectedManifest = null;
+  $("#cr-channel-name").value = "";
+  $("#create-resolved-submit").disabled = true;
+  $("#create-resolved-overlay").classList.remove("hidden");
+
+  if (preselectedManifest) {
+    // Skip picker — go straight to form
+    crShowForm(preselectedManifest);
+  } else {
+    crShowPicker();
+  }
+}
+
+function closeCreateResolved() {
+  $("#create-resolved-overlay").classList.add("hidden");
+  crSelectedManifest = null;
+}
+
+function crShowPicker() {
+  $("#cr-picker-section").style.display = "";
+  $("#cr-form-section").style.display = "none";
+  $("#create-resolved-back").style.display = "none";
+  $("#create-resolved-submit").disabled = true;
+  loadCrManifestList();
+}
+
+function crShowForm(manifest) {
+  crSelectedManifest = manifest;
+  $("#cr-picker-section").style.display = "none";
+  $("#cr-form-section").style.display = "";
+  // "Back" only visible when we came from the picker (i.e. no preselect)
+  $("#create-resolved-back").style.display = manifest && manifest._fromPicker ? "" : "none";
+
+  const display = `<div class="cr-selected-name">${esc(manifest.title || "(no title)")}</div>` +
+    `<div class="cr-selected-url">${esc(manifest.manifest_url || manifest.url || "")}</div>`;
+  $("#cr-selected-manifest").innerHTML = display;
+
+  // Default name: title → hostname → domain → fallback
+  let defaultName = manifest.title || "";
+  if (!defaultName && manifest.manifest_url) {
+    try { defaultName = new URL(manifest.manifest_url).hostname; } catch (e) {}
+  }
+  if (!defaultName) defaultName = "Resolved Channel";
+  $("#cr-channel-name").value = defaultName;
+  $("#create-resolved-submit").disabled = false;
+  setTimeout(() => $("#cr-channel-name").focus(), 50);
+}
+
+async function loadCrManifestList() {
+  const list = $("#cr-manifest-list");
+  list.innerHTML = '<div class="empty-state">Loading library...</div>';
+  try {
+    const r = await fetch(`${API}/resolve/channels`);
+    const j = await r.json();
+    const results = j.results || [];
+    if (!results.length) {
+      list.innerHTML = '<div class="empty-state">No manifests in the library yet. Open the Manifest Library tab and resolve a URL first.</div>';
+      return;
+    }
+    list.innerHTML = results.map(m => {
+      const title = m.title || "(no title)";
+      const url = m.manifest_url || m.url || "";
+      const truncUrl = url.length > 70 ? url.substring(0, 70) + "..." : url;
+      const usedBadge = m.channel_count > 0
+        ? `<span class="cr-used-badge">in ${m.channel_count} channel${m.channel_count !== 1 ? "s" : ""}</span>`
+        : `<span class="cr-used-badge cr-used-zero">unused</span>`;
+      return `<div class="cr-manifest-item" data-mid="${esc(m.manifest_id)}">
+        <div class="cr-manifest-title">${esc(title)} ${usedBadge}</div>
+        <div class="cr-manifest-url" title="${esc(url)}">${esc(truncUrl)}</div>
+      </div>`;
+    }).join("");
+    list.querySelectorAll(".cr-manifest-item").forEach(el => {
+      el.addEventListener("click", () => {
+        const mid = el.dataset.mid;
+        const m = results.find(x => x.manifest_id === mid);
+        if (m) crShowForm({ ...m, _fromPicker: true });
+      });
+    });
+  } catch (e) {
+    list.innerHTML = '<div class="empty-state">Failed to load library.</div>';
+  }
+}
+
+$("#create-resolved-close").addEventListener("click", closeCreateResolved);
+$("#create-resolved-cancel").addEventListener("click", closeCreateResolved);
+$("#create-resolved-overlay").addEventListener("click", e => {
+  if (e.target.id === "create-resolved-overlay") closeCreateResolved();
+});
+$("#create-resolved-back").addEventListener("click", () => {
+  crShowPicker();
+});
+$("#create-resolved-submit").addEventListener("click", async () => {
+  if (!crSelectedManifest) return;
+  const name = $("#cr-channel-name").value.trim();
+  if (!name) { toast("error", "Channel name required"); return; }
+  const btn = $("#create-resolved-submit");
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${API}/channels`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        type: "resolved",
+        manifest_id: crSelectedManifest.manifest_id,
+        name,
+      }),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      toast("success", `Created channel "${j.name}"`);
+      closeCreateResolved();
+      loadChannels();
+      loadResolver();
+    } else {
+      toast("error", j.error || "Create failed");
+      btn.disabled = false;
+    }
+  } catch (e) {
+    toast("error", "Create failed");
+    btn.disabled = false;
+  }
+});
 
 function openEditor(ch) {
   editingChannel = ch;
@@ -1639,7 +1786,7 @@ function renderResolverQueue(batch) {
   const goBtn = $("#resolver-go");
 
   if (!batch.results || batch.results.length === 0) {
-    body.innerHTML = "";
+    body.innerHTML = '<tr><td colspan="4" class="empty-state">No manifests captured yet. Paste one or more URLs above and click "Resolve All" to add your first manifest to the library.</td></tr>';
     prog.classList.add("hidden");
     goBtn.disabled = false;
     return;
@@ -1774,31 +1921,16 @@ function renderResolverQueue(batch) {
     });
   });
   body.querySelectorAll("[data-res-create]").forEach(btn => {
-    btn.addEventListener("click", async () => {
+    btn.addEventListener("click", () => {
       const mid = btn.dataset.resCreate;
-      const defaultTitle = btn.dataset.resCreateTitle || "";
-      const name = prompt("Channel name:", defaultTitle && defaultTitle !== "(untitled)" ? defaultTitle : "");
-      if (name === null) return;  // user cancelled
-      btn.disabled = true;
-      try {
-        const r = await fetch(`${API}/channels`, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ type: "resolved", manifest_id: mid, name: (name || "").trim() }),
-        });
-        const j = await r.json();
-        if (r.ok) {
-          toast("success", `Created channel "${j.name}"`);
-          loadResolver();
-          loadChannels();
-        } else {
-          toast("error", j.error || "Create failed");
-        }
-      } catch (e) {
-        toast("error", "Create failed");
-      } finally {
-        btn.disabled = false;
-      }
+      // Look up the full manifest record from the rendered batch results
+      const m = (batch.results || []).find(r => r.manifest_id === mid);
+      if (!m) { toast("error", "Manifest not found"); return; }
+      openCreateResolved({
+        manifest_id: m.manifest_id,
+        title: m.title,
+        manifest_url: m.manifest_url || m.url,
+      });
     });
   });
 }
