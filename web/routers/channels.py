@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from web import shared_state
-from core.channels import materialize_schedule, get_now_playing
+from core.channels import materialize_schedule, get_now_playing, current_placeholder_block
 
 router = APIRouter()
 
@@ -25,7 +25,7 @@ def _enrich(ch: dict) -> dict:
         mid = ch.get("manifest_id")
         ch["stream_url"] = f"/live-resolved/{mid}.m3u8" if mid else None
         ch["stream_status"] = {"running": False, "uptime": 0}
-        ch["now_playing"] = None
+        ch["now_playing"] = current_placeholder_block(ch.get("name", "Live"))
     else:
         ch["stream_url"] = f"/live/{cid}/stream.m3u8"
         ch["stream_status"] = shared_state.streamer_mgr.get_status(cid)

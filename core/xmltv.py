@@ -38,10 +38,15 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
     total_programmes = 0
     for ch in channels:
         cid = ch["id"]
-        # Resolved channels are pure live streams — no programme schedule
-        # exists. Skip programme generation entirely; the <channel> element
-        # written above is enough for guide consumers to recognize them.
+        # Resolved channels are pure live streams — no real schedule. Generate
+        # placeholder blocks so guide consumers see the channel as populated
+        # rather than empty. The block boundaries match the API's
+        # current_placeholder_block() helper so the EPG and the channel tile
+        # always agree on which block is current.
         if ch.get("type") == "resolved":
+            total_programmes += _generate_placeholder_programmes(
+                tv, cid, ch["name"], now, horizon, base_url, is_live=True
+            )
             continue
 
         schedule = ch.get("materialized_schedule", [])
@@ -199,10 +204,19 @@ def _iterate_schedule_window(schedule: list, epoch_str: str, cycle_dur: float,
 
 
 def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: str,
-                                      start: datetime, end: datetime, base_url: str) -> int:
-    """Generate 30-minute placeholder blocks for channels without a schedule."""
+                                      start: datetime, end: datetime, base_url: str,
+                                      *, is_live: bool = False) -> int:
+    """Generate 30-minute placeholder blocks for channels without a schedule.
+
+    Block boundaries align to :00 and :30 of every hour so the EPG matches
+    the API's current_placeholder_block() helper. is_live=True flavors the
+    text and category for resolved channels (live streams) instead of
+    scheduled-but-empty channels.
+    """
     block = timedelta(minutes=30)
-    current = start
+    # Align to the nearest :00 or :30 boundary at or before `start`
+    block_start_minute = (start.minute // 30) * 30
+    current = start.replace(minute=block_start_minute, second=0, microsecond=0)
     count = 0
     while current < end:
         stop = current + block
@@ -214,9 +228,9 @@ def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: 
         title_el = SubElement(prog, "title", lang="en")
         title_el.text = channel_name
         desc_el = SubElement(prog, "desc", lang="en")
-        desc_el.text = f"{channel_name} — Scheduled Programming"
+        desc_el.text = f"{channel_name} — Live Stream" if is_live else f"{channel_name} — Scheduled Programming"
         cat_el = SubElement(prog, "category", lang="en")
-        cat_el.text = "General"
+        cat_el.text = "News" if is_live else "General"
         logo_url = f"{base_url}/api/logo/{channel_id}"
         SubElement(prog, "icon", src=logo_url)
         current = stop

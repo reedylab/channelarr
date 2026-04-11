@@ -826,3 +826,51 @@ def get_now_playing(channel: dict) -> dict | None:
         result["next"] = schedule[next_idx]
 
     return result
+
+
+# ── Placeholder programme blocks for live/empty channels ────────────────────
+
+PLACEHOLDER_BLOCK_MINUTES = 30
+
+
+def current_placeholder_block(channel_name: str) -> dict:
+    """Compute the current 30-minute placeholder block for a channel.
+
+    Returns a dict matching the get_now_playing() shape so the UI can render
+    it with the same progress-bar template. Used for resolved channels (which
+    have no schedule by design) and as a deterministic fallback for any
+    channel without a materialized schedule. Block boundaries align to :00
+    and :30 of every hour, so multiple consumers (API, XMLTV) agree on which
+    block is current at any moment.
+    """
+    block_minutes = PLACEHOLDER_BLOCK_MINUTES
+    now = datetime.now(timezone.utc)
+    block_start_minute = (now.minute // block_minutes) * block_minutes
+    block_start = now.replace(minute=block_start_minute, second=0, microsecond=0)
+    block_end = block_start + timedelta(minutes=block_minutes)
+    duration = block_minutes * 60
+    elapsed = (now - block_start).total_seconds()
+    progress = max(0.0, min(1.0, elapsed / duration))
+    next_start = block_end
+    next_end = next_start + timedelta(minutes=block_minutes)
+    return {
+        "index": 0,
+        "entry": {
+            "type": "live",
+            "title": channel_name,
+            "desc": "Live stream",
+            "start": block_start.isoformat(),
+            "stop": block_end.isoformat(),
+            "duration": duration,
+        },
+        "seek_offset": elapsed,
+        "progress": progress,
+        "next": {
+            "type": "live",
+            "title": channel_name,
+            "desc": "Live stream",
+            "start": next_start.isoformat(),
+            "stop": next_end.isoformat(),
+            "duration": duration,
+        },
+    }

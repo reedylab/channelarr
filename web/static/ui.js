@@ -158,17 +158,35 @@ function renderChannels() {
     const logoUrl = `${API}/logo/${ch.id}`;
 
     if (isResolved) {
-      // Resolved channels are pure live streams — no schedule, no items.
-      // Tile shows source domain + expiry instead of now-playing/meta.
+      // Resolved channels are pure live streams. The API stamps a deterministic
+      // 30-minute placeholder block in now_playing so the tile shows the same
+      // visual treatment as scheduled channels (title + remaining + progress).
       const domain = ch.source_domain || (ch.manifest_url ? new URL(ch.manifest_url).hostname : "");
       const meta = [];
       if (domain) meta.push(domain);
       if (ch.expires_at) {
         const exp = new Date(ch.expires_at);
         const minsLeft = Math.round((exp - Date.now()) / 60000);
-        if (minsLeft > 0) meta.push(`expires in ${minsLeft}m`);
-        else meta.push("expired (auto-refreshes)");
+        if (minsLeft > 0) meta.push(`token: ${minsLeft}m`);
+        else meta.push("token: refreshing");
       }
+
+      const np = ch.now_playing;
+      let nowPlayingHtml;
+      if (np && np.entry) {
+        const pct = Math.round((np.progress || 0) * 100);
+        const remaining = np.entry.duration ? formatDuration(np.entry.duration - np.seek_offset) : "";
+        nowPlayingHtml = `
+          <div class="ch-now-playing">
+            <div class="ch-now-label">LIVE NOW</div>
+            <div class="ch-now-title">${esc(np.entry.title || ch.name)}</div>
+            ${remaining ? `<div class="ch-now-remaining">${remaining} until next block</div>` : ""}
+            <div class="ch-progress-bar"><div class="ch-progress-fill" style="width:${pct}%"></div></div>
+          </div>`;
+      } else {
+        nowPlayingHtml = `<div class="ch-now-playing"><div class="ch-now-label">LIVE</div></div>`;
+      }
+
       return `
         <div class="channel-card" data-id="${ch.id}" data-type="resolved">
           <div class="channel-card-logo-row">
@@ -179,7 +197,7 @@ function renderChannels() {
               <h3>${esc(ch.name)}</h3>
               <span class="badge badge-schedule">LIVE</span>
             </div>
-            <div class="ch-now-playing"><div class="ch-now-label">RESOLVED STREAM</div></div>
+            ${nowPlayingHtml}
             <div class="channel-card-meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>
             <div class="channel-card-actions">
               <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
