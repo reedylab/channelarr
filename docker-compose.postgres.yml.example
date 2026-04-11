@@ -12,34 +12,31 @@ services:
       - internal
     restart: unless-stopped
 
-  gluetun:
-    image: qmcgaw/gluetun:v3.36.0
-    container_name: channelarr-vpn
-    cap_add:
-      - NET_ADMIN
-    environment:
-      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER:-mullvad}
-      - VPN_TYPE=${VPN_TYPE:-wireguard}
-      - WIREGUARD_PRIVATE_KEY=${WG_PRIVATE_KEY:?Set WG_PRIVATE_KEY in .env}
-      - WIREGUARD_ADDRESSES=${WG_ADDRESSES:-10.70.17.30/32}
-      - SERVER_CITIES=${VPN_CITIES:-New York NY,Chicago IL,Atlanta GA,Dallas TX,Miami FL,Ashburn VA,Raleigh NC,Denver CO,Salt Lake City UT,Houston TX,Phoenix AZ,Secaucus NJ}
-      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
-      - DNS_KEEP_NAMESERVER=on
-      - CONTROL_SERVER=true
-      - CONTROL_SERVER_USERNAME=${VPN_CONTROL_USER:-admin}
-      - CONTROL_SERVER_PASSWORD=${VPN_CONTROL_PASS:?Set VPN_CONTROL_PASS in .env}
+  # Selenium undetected-chromedriver sidecar.
+  # Not behind gluetun in this example — if your host already runs another
+  # gluetun (e.g. for manifold) using the same Mullvad key, a second one on
+  # the same host will fail to handshake. Add gluetun back here once you have
+  # a separate Mullvad device/key.
+  selenium-uc:
+    build: ./selenium-uc
+    container_name: channelarr-selenium-uc
+    shm_size: 2g
     ports:
-      - "5045:5045"
+      - "4445:4445"
+    volumes:
+      - selenium_profile:/data
     networks:
       - internal
-    volumes:
-      - ./gluetun:/gluetun
     restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr-selenium-uc"
 
   channelarr:
     build: .
     container_name: channelarr
-    network_mode: service:gluetun
     env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
@@ -49,7 +46,9 @@ services:
       - PG_USER=${PG_USER:-channelarr}
       - PG_PASS=${PG_PASS}
       - PG_DB=${PG_DB:-channelarr}
-      - SELENIUM_URL=http://localhost:4445
+      - SELENIUM_URL=http://channelarr-selenium-uc:4445
+    ports:
+      - "5045:5045"
     volumes:
       - /path/to/media:/media:ro
       - /path/to/bumps:/bumps
@@ -59,29 +58,15 @@ services:
       - /path/to/youtube-cache:/yt_cache
     depends_on:
       - postgres
-      - gluetun
+      - selenium-uc
+    networks:
+      - internal
     restart: unless-stopped
     logging:
       driver: syslog
       options:
         syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
         tag: "channelarr"
-
-  selenium-uc:
-    build: ./selenium-uc
-    container_name: channelarr-selenium-uc
-    network_mode: service:gluetun
-    shm_size: 2g
-    depends_on:
-      - gluetun
-    volumes:
-      - selenium_profile:/data
-    restart: unless-stopped
-    logging:
-      driver: syslog
-      options:
-        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
-        tag: "channelarr-selenium-uc"
 
 networks:
   internal:
