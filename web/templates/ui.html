@@ -300,6 +300,7 @@
           </div>
         </div>
 
+        <div id="ch-scheduled-only">
         <div class="modal-three-col">
           <!-- Left: current items -->
           <div class="modal-col">
@@ -371,6 +372,17 @@
         <div class="modal-section">
           <h4>Schedule Preview</h4>
           <div id="ch-schedule" class="schedule-preview"></div>
+        </div>
+        </div>
+        <div id="ch-resolved-only" style="display:none">
+          <div class="modal-section">
+            <h4>Resolved Stream</h4>
+            <div class="setting-field">
+              <label>Source URL</label>
+              <input type="text" id="ch-resolved-url" readonly />
+            </div>
+            <div class="muted" style="margin-top:8px">Resolved channels are pure live streams. Items, bumps, and schedules don't apply — they proxy the upstream HLS directly. The library will be reshaped in the next phase so you'll be able to pick a captured manifest as the source for any channel you create.</div>
+          </div>
         </div>
       </div>
       <div class="modal-footer">

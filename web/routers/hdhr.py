@@ -57,14 +57,24 @@ def lineup(request: Request):
     channels = shared_state.channel_mgr.list_channels()
     result = []
     for i, ch in enumerate(channels, start=1):
-        logo_path = os.path.join(shared_state.LOGO_DIR, f"{ch['id']}.png")
+        cid = ch["id"]
+        logo_path = os.path.join(shared_state.LOGO_DIR, f"{cid}.png")
+
+        if ch.get("type") == "resolved":
+            mid = ch.get("manifest_id")
+            if not mid:
+                continue
+            url = f"{base}/live-resolved/{mid}.m3u8"
+        else:
+            url = f"{base}/live/{cid}/stream.m3u8"
+
         entry = {
             "GuideNumber": str(i),
             "GuideName": ch.get("name", f"Channel {i}"),
-            "URL": f"{base}/live/{ch['id']}/stream.m3u8",
+            "URL": url,
         }
         if os.path.isfile(logo_path):
-            entry["ImageURL"] = f"{base}/api/logo/{ch['id']}"
+            entry["ImageURL"] = f"{base}/api/logo/{cid}"
         result.append(entry)
     logging.info("[HDHR] Lineup requested — %d channels", len(result))
     return result

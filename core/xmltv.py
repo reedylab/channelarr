@@ -38,6 +38,12 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
     total_programmes = 0
     for ch in channels:
         cid = ch["id"]
+        # Resolved channels are pure live streams — no programme schedule
+        # exists. Skip programme generation entirely; the <channel> element
+        # written above is enough for guide consumers to recognize them.
+        if ch.get("type") == "resolved":
+            continue
+
         schedule = ch.get("materialized_schedule", [])
         epoch_str = ch.get("schedule_epoch")
         cycle_dur = ch.get("schedule_cycle_duration", 0)

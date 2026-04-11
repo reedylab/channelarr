@@ -28,6 +28,23 @@ _status = {"running": False, "last_url": None, "last_error": None, "last_manifes
 _batch = {"running": False, "total": 0, "completed": 0, "current_url": None, "results": []}
 
 
+def _default_resolved_name(title: str | None, manifest_url: str, source_domain: str | None) -> str:
+    """Pick a sensible display name for a resolved channel when the user
+    didn't provide a title. Tries: explicit title → manifest URL hostname
+    → source_domain → constant fallback."""
+    if title and title.strip():
+        return title.strip()
+    try:
+        host = urlparse(manifest_url).hostname or ""
+        if host:
+            return host
+    except Exception:
+        pass
+    if source_domain:
+        return source_domain
+    return "Unnamed Resolved"
+
+
 def _md5(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
@@ -506,7 +523,7 @@ def _store_manifest(
             from core.models.channel import Channel
             ch_row = Channel(
                 id=manifest.channelarr_channel_id,
-                name=manifest.title or "Unnamed Resolved",
+                name=_default_resolved_name(manifest.title, manifest_url, source_domain),
                 type="resolved",
                 manifest_id=manifest.id,
                 items=[],

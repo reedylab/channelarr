@@ -181,54 +181,51 @@ def get_stats_snapshot():
 def regenerate_m3u():
     m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
     base_url = get_setting("BASE_URL", "http://localhost:5045")
-    channels = channel_mgr.list_channels()
+    channels = channel_mgr.list_channels()  # unified list (scheduled + resolved)
 
     os.makedirs(m3u_path, exist_ok=True)
     out = os.path.join(m3u_path, "channelarr.m3u")
 
-    # Also collect resolved channels from Postgres (parallel to JSON-stored channels)
-    resolved_rows = []
-    try:
-        from core.database import get_session
-        from core.models.manifest import Manifest
-        with get_session() as session:
-            rows = (
-                session.query(Manifest.id, Manifest.title)
-                .filter(Manifest.active == True)
-                .filter(Manifest.tags.contains(["resolved"]))
-                .order_by(Manifest.title)
-                .all()
-            )
-            resolved_rows = [(r[0], r[1]) for r in rows]
-    except Exception as e:
-        logging.debug("[M3U] could not query resolved manifests: %s", e)
+    scheduled = [ch for ch in channels if ch.get("type") != "resolved"]
+    resolved = [ch for ch in channels if ch.get("type") == "resolved"]
 
     with open(out, "w") as f:
         f.write("#EXTM3U\n")
-        for i, ch in enumerate(channels):
+        chno = 1
+        for ch in scheduled:
             cid = ch["id"]
             name = ch["name"]
-            chno = i + 1
             logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
             logo_tag = ""
             if os.path.isfile(logo_path):
                 logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
-            f.write(f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} group-title="Channelarr",{name}\n')
-            f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
-
-        # Append resolved channels (group-title differentiates them for users)
-        next_chno = len(channels) + 1
-        for mid, title in resolved_rows:
-            display_name = title or f"Resolved {mid[:8]}"
             f.write(
-                f'#EXTINF:-1 tvg-id="{mid}" tvg-chno="{next_chno}" tvg-name="{display_name}" '
-                f'group-title="Channelarr Resolved",{display_name}\n'
+                f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
+                f'group-title="Channelarr",{name}\n'
+            )
+            f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
+            chno += 1
+
+        # Resolved channels — different group-title and stream URL pattern
+        for ch in resolved:
+            cid = ch["id"]
+            mid = ch.get("manifest_id")
+            if not mid:
+                continue
+            name = ch["name"]
+            logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
+            logo_tag = ""
+            if os.path.isfile(logo_path):
+                logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
+            f.write(
+                f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
+                f'group-title="Channelarr Resolved",{name}\n'
             )
             f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")
-            next_chno += 1
+            chno += 1
 
-    logging.info("[M3U] Regenerated %s with %d channels (%d resolved)",
-                 out, len(channels) + len(resolved_rows), len(resolved_rows))
+    logging.info("[M3U] Regenerated %s with %d channels (%d scheduled, %d resolved)",
+                 out, len(channels), len(scheduled), len(resolved))
 
     xmltv_out = os.path.join(m3u_path, "channelarr.xml")
     generate_channelarr_xmltv(channels, xmltv_out, base_url)

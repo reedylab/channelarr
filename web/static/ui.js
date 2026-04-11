@@ -154,6 +154,43 @@ function renderChannels() {
     return;
   }
   grid.innerHTML = channels.map(ch => {
+    const isResolved = ch.type === "resolved";
+    const logoUrl = `${API}/logo/${ch.id}`;
+
+    if (isResolved) {
+      // Resolved channels are pure live streams — no schedule, no items.
+      // Tile shows source domain + expiry instead of now-playing/meta.
+      const domain = ch.source_domain || (ch.manifest_url ? new URL(ch.manifest_url).hostname : "");
+      const meta = [];
+      if (domain) meta.push(domain);
+      if (ch.expires_at) {
+        const exp = new Date(ch.expires_at);
+        const minsLeft = Math.round((exp - Date.now()) / 60000);
+        if (minsLeft > 0) meta.push(`expires in ${minsLeft}m`);
+        else meta.push("expired (auto-refreshes)");
+      }
+      return `
+        <div class="channel-card" data-id="${ch.id}" data-type="resolved">
+          <div class="channel-card-logo-row">
+            <img class="channel-card-logo" src="${logoUrl}" alt="" onerror="this.classList.add('no-logo')" onload="this.classList.remove('no-logo')" />
+          </div>
+          <div class="channel-card-body">
+            <div class="channel-card-header">
+              <h3>${esc(ch.name)}</h3>
+              <span class="badge badge-schedule">LIVE</span>
+            </div>
+            <div class="ch-now-playing"><div class="ch-now-label">RESOLVED STREAM</div></div>
+            <div class="channel-card-meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>
+            <div class="channel-card-actions">
+              <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
+              <button class="btn btn-sm" onclick="channelarr.editChannel('${ch.id}')">Edit</button>
+              <button class="btn btn-sm" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    // Scheduled channel
     const np = ch.now_playing;
     const items = ch.items || [];
     const bc = ch.bump_config || {};
@@ -169,7 +206,6 @@ function renderChannels() {
       meta.push("Shuffle");
     }
     if (ch.loop) meta.push("Loop");
-    const logoUrl = `${API}/logo/${ch.id}`;
 
     // Now playing info
     let nowPlayingHtml = "";
@@ -197,7 +233,7 @@ function renderChannels() {
     if (schedEntries > 0) meta.push(`${schedEntries} scheduled`);
 
     return `
-      <div class="channel-card" data-id="${ch.id}">
+      <div class="channel-card" data-id="${ch.id}" data-type="scheduled">
         <div class="channel-card-logo-row">
           <img class="channel-card-logo" src="${logoUrl}" alt="" onerror="this.classList.add('no-logo')" onload="this.classList.remove('no-logo')" />
         </div>
@@ -261,9 +297,18 @@ $("#modal-save").addEventListener("click", saveChannel);
 
 function openEditor(ch) {
   editingChannel = ch;
-  editorItems = ch ? JSON.parse(JSON.stringify(ch.items || [])) : [];
-  $("#modal-title").textContent = ch ? "Edit Channel" : "New Channel";
+  const isResolved = !!(ch && ch.type === "resolved");
+  editorItems = (ch && !isResolved) ? JSON.parse(JSON.stringify(ch.items || [])) : [];
+  $("#modal-title").textContent = ch ? (isResolved ? "Edit Resolved Channel" : "Edit Channel") : "New Channel";
   $("#ch-name").value = ch ? ch.name : "";
+
+  // Toggle scheduled-only vs resolved-only sections
+  $("#ch-scheduled-only").style.display = isResolved ? "none" : "";
+  $("#ch-resolved-only").style.display = isResolved ? "" : "none";
+  if (isResolved) {
+    $("#ch-resolved-url").value = ch.manifest_url || "";
+  }
+
   const bc = ch ? (ch.bump_config || {}) : {};
   $("#ch-bump-enabled").checked = !!bc.enabled;
   $("#ch-bump-start").checked = !!bc.start_bumps;
@@ -298,14 +343,15 @@ function openEditor(ch) {
     logoDelete.style.display = "none";
   }
 
-  const selectedFolders = bc.folders || (bc.folder ? [bc.folder] : []);
-  loadBumpFolders(selectedFolders);
-
-  pickerTab = "movies";
-  pickerShowEpisodes = null;
-  renderEditorItems();
-  renderPicker();
-  updateSchedulePreview();
+  if (!isResolved) {
+    const selectedFolders = bc.folders || (bc.folder ? [bc.folder] : []);
+    loadBumpFolders(selectedFolders);
+    pickerTab = "movies";
+    pickerShowEpisodes = null;
+    renderEditorItems();
+    renderPicker();
+    updateSchedulePreview();
+  }
   overlay.classList.remove("hidden");
 }
 
@@ -729,29 +775,36 @@ async function saveChannel() {
   const name = $("#ch-name").value.trim();
   if (!name) { toast("error", "Channel name required"); return; }
 
-  const shuffleMode = $("#ch-shuffle-mode").value;
-  const shuffleConfig = { mode: shuffleMode };
-  if (shuffleMode === "weighted") {
-    const total = Object.values(editorWeights).reduce((a, b) => a + b, 0);
-    if (total !== 100) { toast("error", "Weights must total 100%"); return; }
-    shuffleConfig.weights = Object.assign({}, editorWeights);
-  }
+  const isResolved = !!(editingChannel && editingChannel.type === "resolved");
 
-  const data = {
-    name,
-    items: editorItems,
-    bump_config: {
-      enabled: $("#ch-bump-enabled").checked,
-      folders: getSelectedBumpFolders(),
-      frequency: $("#ch-bump-freq").value,
-      count: parseInt($("#ch-bump-count").value) || 1,
-      start_bumps: $("#ch-bump-start").checked,
-      show_next: $("#ch-bump-next").checked,
-    },
-    shuffle: shuffleMode === "random",
-    shuffle_config: shuffleConfig,
-    loop: $("#ch-loop").checked,
-  };
+  let data;
+  if (isResolved) {
+    // Resolved channels: only name is editable in B2.
+    data = { name };
+  } else {
+    const shuffleMode = $("#ch-shuffle-mode").value;
+    const shuffleConfig = { mode: shuffleMode };
+    if (shuffleMode === "weighted") {
+      const total = Object.values(editorWeights).reduce((a, b) => a + b, 0);
+      if (total !== 100) { toast("error", "Weights must total 100%"); return; }
+      shuffleConfig.weights = Object.assign({}, editorWeights);
+    }
+    data = {
+      name,
+      items: editorItems,
+      bump_config: {
+        enabled: $("#ch-bump-enabled").checked,
+        folders: getSelectedBumpFolders(),
+        frequency: $("#ch-bump-freq").value,
+        count: parseInt($("#ch-bump-count").value) || 1,
+        start_bumps: $("#ch-bump-start").checked,
+        show_next: $("#ch-bump-next").checked,
+      },
+      shuffle: shuffleMode === "random",
+      shuffle_config: shuffleConfig,
+      loop: $("#ch-loop").checked,
+    };
+  }
 
   try {
     if (editingChannel) {
@@ -1207,7 +1260,16 @@ playerOverlay.addEventListener("click", (e) => {
 });
 
 channelarr.watchChannel = function(id, name) {
-  const url = `/live/${id}/stream.m3u8`;
+  // Type-aware URL: resolved channels use the proxy endpoint, scheduled
+  // channels use the FFmpeg-fed HLS endpoint.
+  const ch = (channels || []).find(c => c.id === id);
+  let url;
+  if (ch && ch.type === "resolved") {
+    if (!ch.manifest_id) { toast("error", "Resolved channel missing manifest"); return; }
+    url = `/live-resolved/${ch.manifest_id}.m3u8`;
+  } else {
+    url = `/live/${id}/stream.m3u8`;
+  }
   $("#player-title").textContent = name || "Watch";
   playerOverlay.classList.remove("hidden");
 

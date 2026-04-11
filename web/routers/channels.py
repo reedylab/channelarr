@@ -12,6 +12,27 @@ from core.channels import materialize_schedule, get_now_playing
 router = APIRouter()
 
 
+def _enrich(ch: dict) -> dict:
+    """Attach runtime fields (stream_url, logo_url, status, now_playing) to a
+    channel dict before returning it from the API. Type-aware: scheduled
+    channels get streamer status + now_playing; resolved channels get the
+    /live-resolved/ URL pattern and skip the streamer lookup."""
+    cid = ch["id"]
+    logo_path = os.path.join(shared_state.LOGO_DIR, f"{cid}.png")
+    ch["logo_url"] = f"/api/logo/{cid}" if os.path.isfile(logo_path) else None
+
+    if ch.get("type") == "resolved":
+        mid = ch.get("manifest_id")
+        ch["stream_url"] = f"/live-resolved/{mid}.m3u8" if mid else None
+        ch["stream_status"] = {"running": False, "uptime": 0}
+        ch["now_playing"] = None
+    else:
+        ch["stream_url"] = f"/live/{cid}/stream.m3u8"
+        ch["stream_status"] = shared_state.streamer_mgr.get_status(cid)
+        ch["now_playing"] = get_now_playing(ch)
+    return ch
+
+
 @router.get("/status")
 def api_status():
     channels = shared_state.channel_mgr.list_channels()
@@ -89,23 +110,23 @@ def api_shuffle_modes():
 @router.get("/channels")
 def api_list_channels():
     channels = shared_state.channel_mgr.list_channels()
-    statuses = shared_state.streamer_mgr.get_all_status()
-    for ch in channels:
-        st = statuses.get(ch["id"], {"running": False, "uptime": 0})
-        ch["stream_status"] = st
-        now_playing = get_now_playing(ch)
-        ch["now_playing"] = now_playing
-    return channels
+    return [_enrich(ch) for ch in channels]
 
 
 @router.post("/channels")
 async def api_create_channel(request: Request):
+    """Create a scheduled (local/YouTube) channel.
+
+    Resolved channels are not created via this endpoint in B2 — they're still
+    created by the resolver flow. The "create channel from resolver library"
+    flow lands in B4.
+    """
     data = await request.json()
     ch = shared_state.channel_mgr.create_channel(data)
     materialize_schedule(ch, shared_state.bump_mgr, media_library=shared_state.media_lib)
     shared_state.channel_mgr.save_channel(ch)
     shared_state.regenerate_m3u()
-    return JSONResponse(ch, status_code=201)
+    return JSONResponse(_enrich(ch), status_code=201)
 
 
 @router.get("/channels/{channel_id}")
@@ -113,27 +134,35 @@ def api_get_channel(channel_id: str):
     ch = shared_state.channel_mgr.get_channel(channel_id)
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
-    ch["stream_status"] = shared_state.streamer_mgr.get_status(channel_id)
-    ch["now_playing"] = get_now_playing(ch)
-    return ch
+    return _enrich(ch)
 
 
 @router.put("/channels/{channel_id}")
 async def api_update_channel(channel_id: str, request: Request):
     data = await request.json()
+    existing = shared_state.channel_mgr.get_channel(channel_id)
+    if not existing:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
     ch = shared_state.channel_mgr.update_channel(channel_id, data)
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
-    materialize_schedule(ch, shared_state.bump_mgr, media_library=shared_state.media_lib)
-    shared_state.channel_mgr.save_channel(ch)
-    shared_state.streamer_mgr.stop_channel(channel_id)
+
+    if existing.get("type") != "resolved":
+        # Re-materialize schedule on scheduled channels (resolved have none)
+        materialize_schedule(ch, shared_state.bump_mgr, media_library=shared_state.media_lib)
+        shared_state.channel_mgr.save_channel(ch)
+        shared_state.streamer_mgr.stop_channel(channel_id)
+
     shared_state.regenerate_m3u()
-    return ch
+    return _enrich(ch)
 
 
 @router.delete("/channels/{channel_id}")
 def api_delete_channel(channel_id: str):
-    shared_state.streamer_mgr.stop_channel(channel_id)
+    existing = shared_state.channel_mgr.get_channel(channel_id)
+    if existing and existing.get("type") != "resolved":
+        shared_state.streamer_mgr.stop_channel(channel_id)
     ok = shared_state.channel_mgr.delete_channel(channel_id)
     if not ok:
         return JSONResponse({"error": "Not found"}, status_code=404)
