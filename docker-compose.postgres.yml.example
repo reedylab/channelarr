@@ -12,21 +12,50 @@ services:
       - internal
     restart: unless-stopped
 
-  # Selenium undetected-chromedriver sidecar.
-  # Not behind gluetun in this example — if your host already runs another
-  # gluetun (e.g. for manifold) using the same Mullvad key, a second one on
-  # the same host will fail to handshake. Add gluetun back here once you have
-  # a separate Mullvad device/key.
+  gluetun:
+    # v3.41.1+ required — older versions ship a stale Mullvad server list
+    # (June 2023) and WG handshakes will silently fail against retired servers.
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: channelarr-vpn
+    cap_add:
+      - NET_ADMIN
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER:-mullvad}
+      - VPN_TYPE=${VPN_TYPE:-wireguard}
+      - WIREGUARD_PRIVATE_KEY=${WG_PRIVATE_KEY:?Set WG_PRIVATE_KEY in .env}
+      - WIREGUARD_ADDRESSES=${WG_ADDRESSES:?Set WG_ADDRESSES in .env}
+      # Pin to cities close to your location for lower latency. Gluetun picks
+      # a random server from this list on each start.
+      - SERVER_CITIES=${VPN_CITIES:-Atlanta GA,Raleigh NC,Ashburn VA}
+      # 127.0.0.1/32 is REQUIRED for chromedriver → Chrome loopback traffic
+      - FIREWALL_OUTBOUND_SUBNETS=127.0.0.1/32,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      - DNS_KEEP_NAMESERVER=on
+      # Pull fresh Mullvad server list every 24h — Mullvad retires WG servers
+      # constantly, stale lists cause silent handshake failures
+      - UPDATER_PERIOD=24h
+      - CONTROL_SERVER=true
+      - CONTROL_SERVER_USERNAME=${VPN_CONTROL_USER:-admin}
+      - CONTROL_SERVER_PASSWORD=${VPN_CONTROL_PASS:?Set VPN_CONTROL_PASS in .env}
+    ports:
+      - "4445:4445"
+    networks:
+      - internal
+    volumes:
+      - ./gluetun:/gluetun
+    restart: unless-stopped
+
   selenium-uc:
     build: ./selenium-uc
     container_name: channelarr-selenium-uc
+    network_mode: service:gluetun
     shm_size: 2g
-    ports:
-      - "4445:4445"
+    depends_on:
+      - gluetun
     volumes:
       - selenium_profile:/data
-    networks:
-      - internal
     restart: unless-stopped
     logging:
       driver: syslog
@@ -46,7 +75,8 @@ services:
       - PG_USER=${PG_USER:-channelarr}
       - PG_PASS=${PG_PASS}
       - PG_DB=${PG_DB:-channelarr}
-      - SELENIUM_URL=http://channelarr-selenium-uc:4445
+      # selenium-uc shares gluetun's netns; reach it via gluetun's hostname
+      - SELENIUM_URL=http://channelarr-vpn:4445
     ports:
       - "5045:5045"
     volumes:
