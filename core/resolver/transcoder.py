@@ -74,6 +74,7 @@ class QueueItem:
     source_path: str     # local file path
     duration: float      # seconds; for bumps may be shorter than file's actual length
     label: str           # for logging
+    cue_remaining_at_start: Optional[float] = None  # for bumps: total seconds left in cue at this bump's start
 
 
 # ── Bump fitting ────────────────────────────────────────────────────────────
@@ -241,6 +242,9 @@ class ResolvedChannelStream:
         bump_durations: dict,
         hls_dir: str,
         *,
+        channel_name: str = "",
+        logo_path: str = "",
+        show_next: bool = False,
         hls_time: int = 6,
         hls_list_size: int = 10,
         loglevel: str = "warning",
@@ -256,6 +260,9 @@ class ResolvedChannelStream:
         self.bump_paths = list(bump_paths or [])
         self.bump_durations = dict(bump_durations or {})
         self.hls_dir = hls_dir
+        self.channel_name = channel_name or "Live"
+        self.logo_path = logo_path
+        self.show_next = show_next
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
         self.loglevel = loglevel
@@ -404,13 +411,16 @@ class ResolvedChannelStream:
                         bump_seq = build_bump_sequence(
                             self.bump_paths, self.bump_durations, cue_remaining,
                         )
+                        cue_left = cue_remaining
                         for bump_path, bump_dur in bump_seq:
                             self._segment_queue.put(QueueItem(
                                 kind="bump",
                                 source_path=bump_path,
                                 duration=bump_dur,
                                 label=os.path.basename(bump_path),
+                                cue_remaining_at_start=cue_left,
                             ))
+                            cue_left -= bump_dur
                         if not bump_seq:
                             logging.warning(
                                 "[RESOLVED-XCODE] %s no bumps configured — joining mid-cue with no replacement",
@@ -439,13 +449,16 @@ class ResolvedChannelStream:
                         self._enqueue_upstream(seg)
                         continue
                     # Discard the upstream ad segments and queue bumps instead
+                    cue_left = cue_remaining
                     for bump_path, bump_dur in bump_seq:
                         self._segment_queue.put(QueueItem(
                             kind="bump",
                             source_path=bump_path,
                             duration=bump_dur,
                             label=os.path.basename(bump_path),
+                            cue_remaining_at_start=cue_left,
                         ))
+                        cue_left -= bump_dur
                     continue
 
                 # Inside an active cue: skip the upstream ad segments
@@ -659,27 +672,159 @@ class ResolvedChannelStream:
             playlist,
         ]
 
+    @staticmethod
+    def _wrap_title(text: str, max_chars: int = 28) -> list:
+        """Word-wrap a title to fit a fixed-width overlay box."""
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            if current and len(current) + 1 + len(word) > max_chars:
+                lines.append(current)
+                current = word
+            else:
+                current = f"{current} {word}" if current else word
+        if current:
+            lines.append(current)
+        return lines
+
+    def _build_overlay_vf(self, item: QueueItem, base_vf: str) -> str:
+        """Build the video filter chain with overlay drawtext for a bump.
+
+        Mirrors the scheduled-channel overlay (RESUMING IN H:MM countdown +
+        UP NEXT box) but the countdown counts down toward the end of the
+        WHOLE cue, not just the current bump. So a 6-bump 180s cue shows
+        '3:00' on the first bump, '2:30' on the second, etc., reaching
+        '0:00' exactly when the upstream show resumes.
+        """
+        if item.kind != "bump" or not self.show_next:
+            return base_vf
+        if not item.cue_remaining_at_start or item.cue_remaining_at_start <= 0:
+            return base_vf
+
+        font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        font_bold = font
+
+        # Countdown is from cue_remaining_at_start, decrementing as bump time
+        # progresses (ffmpeg's `t` is current playback time in this bump).
+        cue_left = f"{item.cue_remaining_at_start:.2f}"
+        countdown = (
+            f"drawbox=x=(w-400)/2:y=h-80:w=400:h=50:color=black@0.6:t=fill,"
+            f"drawtext=fontfile={font}:"
+            f"text='RESUMING IN "
+            f"%{{eif\\:trunc(max(0\\,{cue_left}-t)/60)\\:d}}"
+            f"\\:"
+            f"%{{eif\\:mod(max(0\\,{cue_left}-t)\\,60)\\:d\\:2}}':"
+            f"fontsize=28:fontcolor=white@0.9:"
+            f"x=(w-text_w)/2:y=h-70"
+        )
+
+        # UP NEXT box: title is the channel name; poster is the channel logo
+        # if one exists on disk.
+        next_title = self.channel_name
+        use_poster = bool(self.logo_path and os.path.isfile(self.logo_path))
+        safe_title = (
+            next_title.replace("'", "\u2019")
+            .replace(":", "\\:")
+            .replace("\\", "\\\\")
+        )
+
+        if use_poster:
+            text_x = 280
+            box_w = 640
+            box_h = 220
+            text_lines = self._wrap_title(safe_title, max_chars=28)
+            title_draws = ""
+            for li, line in enumerate(text_lines):
+                y = 100 + li * 30
+                title_draws += (
+                    f",drawtext=fontfile={font}:"
+                    f"text='{line}':"
+                    f"fontsize=22:fontcolor=white@0.95:"
+                    f"x={text_x}:y={y}"
+                )
+            next_overlay = (
+                f",drawbox=x=40:y=35:w={box_w}:h={box_h}:color=black@0.65:t=fill,"
+                f"drawtext=fontfile={font_bold}:"
+                f"text='UP NEXT':"
+                f"fontsize=22:fontcolor=0x5aa9ff:"
+                f"x={text_x}:y=60"
+                f"{title_draws}"
+            )
+        else:
+            text_lines = self._wrap_title(safe_title, max_chars=40)
+            box_h = 60 + len(text_lines) * 30
+            title_draws = ""
+            for li, line in enumerate(text_lines):
+                y = 80 + li * 30
+                title_draws += (
+                    f",drawtext=fontfile={font}:"
+                    f"text='{line}':"
+                    f"fontsize=22:fontcolor=white@0.95:"
+                    f"x=(w-text_w)/2:y={y}"
+                )
+            next_overlay = (
+                f",drawbox=x=(w-600)/2:y=40:w=600:h={box_h}:color=black@0.65:t=fill,"
+                f"drawtext=fontfile={font_bold}:"
+                f"text='UP NEXT':"
+                f"fontsize=18:fontcolor=0x5aa9ff:"
+                f"x=(w-text_w)/2:y=50"
+                f"{title_draws}"
+            )
+
+        return f"{base_vf},{countdown}{next_overlay}"
+
     def _build_encoder_cmd(self, item: QueueItem, ts_offset: float) -> list:
         """Build the per-source encoder command. Re-encodes everything to
         identical MPEG-TS params so the segmenter sees one coherent bitstream
-        across source switches."""
-        vf = (
+        across source switches.
+
+        For bump items with show_next enabled, draws the same RESUMING IN
+        countdown + UP NEXT overlay as scheduled channels do.
+        """
+        base_vf = (
             f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
+        use_poster = (
+            item.kind == "bump"
+            and self.show_next
+            and item.cue_remaining_at_start
+            and self.logo_path
+            and os.path.isfile(self.logo_path)
+        )
+        vf = self._build_overlay_vf(item, base_vf)
+
         cmd = [
             "ffmpeg", "-y",
             "-threads", self.ffmpeg_threads,
             "-loglevel", self.loglevel,
             "-re",
         ]
-        # For bumps with truncated duration, set -t after -i to limit the read
         cmd.extend(["-i", item.source_path])
+        # Logo as a second input for the poster overlay
+        if use_poster:
+            cmd.extend(["-i", self.logo_path])
         if item.kind == "bump" and item.duration > 0:
             cmd.extend(["-t", f"{item.duration:.3f}"])
+
+        if use_poster:
+            poster_filter = (
+                f"[1:v]scale=200:200[poster];"
+                f"[0:v]{vf}[main];"
+                f"[main][poster]overlay=55:50"
+            )
+            cmd.extend([
+                "-filter_complex", poster_filter,
+                "-map", "0:a:0?",
+            ])
+        else:
+            cmd.extend([
+                "-map", "0:v:0?", "-map", "0:a:0?",
+                "-vf", vf,
+            ])
+
         cmd.extend([
-            "-map", "0:v:0?", "-map", "0:a:0?",
-            "-vf", vf,
             "-r", str(TARGET_FPS),
             "-c:v", "libx264",
             "-x264-params", f"threads={self.x264_threads}",

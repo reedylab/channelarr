@@ -575,7 +575,8 @@ class StreamerManager:
 
     def start_resolved_channel(self, channel_id: str, manifest_id: str,
                                 manifest_url: str, bump_config: dict,
-                                bump_manager) -> bool:
+                                bump_manager, channel_name: str = "",
+                                logo_dir: str = "/app/data/logos") -> bool:
         """Start a transcode-mediated resolved channel.
 
         Builds a ResolvedChannelStream that polls the upstream playlist,
@@ -619,6 +620,11 @@ class StreamerManager:
         hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
         hls_dir = os.path.join(hls_base, channel_id)
 
+        # Channel logo path — used for the UP NEXT overlay during bumps
+        logo_path = os.path.join(logo_dir, f"{channel_id}.png")
+        if not os.path.isfile(logo_path):
+            logo_path = ""
+
         stream = ResolvedChannelStream(
             channel_id=channel_id,
             manifest_id=manifest_id,
@@ -626,6 +632,9 @@ class StreamerManager:
             bump_paths=bump_paths,
             bump_durations=bump_durations,
             hls_dir=hls_dir,
+            channel_name=channel_name,
+            logo_path=logo_path,
+            show_next=bool((bump_config or {}).get("show_next", False)),
             hls_time=int(self._get("HLS_TIME", "6")),
             hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
             loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),

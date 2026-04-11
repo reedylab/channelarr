@@ -393,6 +393,11 @@
                 <div id="ch-resolved-bump-folders" class="bump-folders-checklist"></div>
               </div>
               <div class="muted" style="margin-top:4px;font-size:11px">Bumps are picked at random from the selected folders and packed to fit each ad break exactly. The last bump is truncated as needed.</div>
+              <label class="toggle-label" style="margin-top:10px">
+                <input type="checkbox" id="ch-resolved-shownext" />
+                Show "RESUMING IN" countdown + UP NEXT overlay during bumps
+              </label>
+              <div class="muted" style="margin-top:4px;font-size:11px">Same overlay style as scheduled channels. The countdown ticks down across all bumps in a break, hitting 0:00 right when the upstream show resumes. Channel logo (if uploaded) appears as the UP NEXT poster.</div>
             </div>
           </div>
         </div>
@@ -480,6 +485,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=29"></script>
+  <script src="/static/ui.js?v=30"></script>
 </body>
 </html>

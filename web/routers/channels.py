@@ -174,6 +174,12 @@ async def api_update_channel(channel_id: str, request: Request):
         materialize_schedule(ch, shared_state.bump_mgr, media_library=shared_state.media_lib)
         shared_state.channel_mgr.save_channel(ch)
         shared_state.streamer_mgr.stop_channel(channel_id)
+    else:
+        # Resolved channels: any settings change (transcode toggle, bump
+        # folders, show_next) needs the running stream to restart so the
+        # orchestrator picks up the new config. The next /live request will
+        # boot a fresh stream.
+        shared_state.streamer_mgr.stop_channel(channel_id)
 
     shared_state.regenerate_m3u()
     return _enrich(ch)
