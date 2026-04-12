@@ -153,7 +153,7 @@ class ResolvedChannelStream:
         hls_time: int = 6,
         hls_list_size: int = 10,
         loglevel: str = "warning",
-        video_preset: str = "fast",
+        video_preset: str = "veryfast",
         crf: str = "",
         ffmpeg_threads: str = "1",
         x264_threads: str = "4",
@@ -180,9 +180,8 @@ class ResolvedChannelStream:
         self.audio_bitrate = audio_bitrate
 
         self._enc_proc: Optional[subprocess.Popen] = None
-        self._hls_proc: Optional[subprocess.Popen] = None
         self._poller_thread: Optional[threading.Thread] = None
-        self._encoder_thread: Optional[threading.Thread] = None
+        self._feeder_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._segment_queue: queue.Queue[QueueItem] = queue.Queue(maxsize=200)
         self._download_dir = tempfile.mkdtemp(prefix=f"channelarr-res-{channel_id}-")
@@ -212,18 +211,18 @@ class ResolvedChannelStream:
         self._poller_thread = threading.Thread(
             target=self._poller_loop, daemon=True, name=f"resolved-poller-{self.channel_id}",
         )
-        self._encoder_thread = threading.Thread(
-            target=self._encoder_loop, daemon=True, name=f"resolved-encoder-{self.channel_id}",
+        self._feeder_thread = threading.Thread(
+            target=self._feeder_loop, daemon=True, name=f"resolved-feeder-{self.channel_id}",
         )
         self._poller_thread.start()
-        self._encoder_thread.start()
+        self._feeder_thread.start()
         logging.info("[RESOLVED-XCODE] Started channel %s (manifest=%s)",
                      self.channel_id, self.manifest_id)
 
     def status(self) -> dict:
         alive = (
-            self._encoder_thread is not None
-            and self._encoder_thread.is_alive()
+            self._feeder_thread is not None
+            and self._feeder_thread.is_alive()
         )
         uptime = 0
         if self._started_at and alive:
@@ -236,18 +235,16 @@ class ResolvedChannelStream:
 
     def stop(self):
         self._stop_event.set()
-        for proc in (self._enc_proc, self._hls_proc):
-            if proc:
+        if self._enc_proc:
+            try:
+                self._enc_proc.terminate()
+                self._enc_proc.wait(timeout=5)
+            except Exception:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
+                    self._enc_proc.kill()
                 except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    pass
         self._enc_proc = None
-        self._hls_proc = None
         self._clean_hls_dir()
         try:
             shutil.rmtree(self._download_dir, ignore_errors=True)
@@ -514,17 +511,29 @@ class ResolvedChannelStream:
                             self.channel_id, seg.seq, e)
 
     def _download_segment(self, seg: UpstreamSegment) -> str:
-        """Download a segment to local disk. If AES-128 encrypted, decrypt
-        in-place using ffmpeg as the demuxer (it handles the key fetch).
+        """Download a segment to local disk via ffmpeg.
+
+        Both AES-encrypted and plain segments are routed through ffmpeg with
+        `-c copy -f mpegts`. This serves two purposes:
+
+          1. AES-128 segments need decryption — ffmpeg handles the key fetch
+             via a synthesized one-segment playlist with the EXT-X-KEY tag.
+          2. Plain segments get a remux pass that normalizes their MPEG-TS
+             container structure to ffmpeg's defaults (PMT pid 4096, single
+             video + single audio stream, dropping any extras like alternate
+             audio tracks or closed-caption streams). This makes WSPA's
+             Lura-native segments look the same as ffmpeg-produced bump
+             segments so a downstream long-running encoder can concatenate
+             them cleanly without seeing them as separate streams.
 
         Returns the local file path. Caller is responsible for cleanup
         (the encoder loop deletes after encoding).
         """
         local_path = os.path.join(self._download_dir, f"seg_{seg.seq}.ts")
-        # Use ffmpeg to fetch + decrypt + remux to local .ts. ffmpeg follows
-        # the EXT-X-KEY URI we synthesize via -allowed_extensions.
+
         if seg.key_method == "AES-128" and seg.key_uri:
-            # Build a tiny one-segment playlist that ffmpeg can parse with the key
+            # Build a tiny one-segment playlist so ffmpeg's HLS demuxer
+            # picks up the key URI and decrypts the segment.
             mini = (
                 "#EXTM3U\n"
                 "#EXT-X-VERSION:3\n"
@@ -557,102 +566,189 @@ class ResolvedChannelStream:
                 err = result.stderr.decode("utf-8", errors="replace")[-300:]
                 raise RuntimeError(f"decrypt failed: {err}")
         else:
-            # Plain segment — just download
-            r = http_requests.get(seg.uri, timeout=15, stream=True)
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
+            # Plain segment — fetch + remux through ffmpeg to normalize the
+            # mpegts container. The video/audio bytes themselves are copied
+            # (no re-encode), only the container metadata is rewritten.
+            cmd = [
+                "ffmpeg", "-y",
+                "-loglevel", "error",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+                "-i", seg.uri,
+                "-c", "copy",
+                "-f", "mpegts",
+                local_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode != 0:
+                err = result.stderr.decode("utf-8", errors="replace")[-300:]
+                raise RuntimeError(f"download failed: {err}")
         return local_path
 
-    # ── Encoder loop ───────────────────────────────────────────────────────
+    # ── Feeder loop ─────────────────────────────────────────────────────────
+    # ONE long-running encoder reads MPEG-TS from stdin, decodes, re-encodes
+    # to target params, and segments to HLS. The feeder thread drains the
+    # segment queue and writes source bytes into the encoder's stdin.
 
-    def _encoder_loop(self):
+    def _feeder_loop(self):
         try:
-            self._encoder_loop_inner()
+            self._feeder_loop_inner()
         finally:
             self._clean_hls_dir()
 
-    def _encoder_loop_inner(self):
-        hls_cmd = self._build_hls_cmd()
-        logging.info("[RESOLVED-XCODE] %s HLS segmenter: %s", self.channel_id, " ".join(hls_cmd))
-        self._hls_proc = subprocess.Popen(
-            hls_cmd, stdin=subprocess.PIPE,
+    def _feeder_loop_inner(self):
+        enc_cmd = self._build_combined_encoder_cmd()
+        logging.info("[RESOLVED-XCODE] %s combined encoder: %s",
+                     self.channel_id, " ".join(enc_cmd))
+        self._enc_proc = subprocess.Popen(
+            enc_cmd, stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
 
-        ts_offset = 0.0
-        while not self._stop_event.is_set():
+        def _drain_stderr():
             try:
-                item = self._segment_queue.get(timeout=10)
-            except queue.Empty:
-                continue
-
-            logging.info("[RESOLVED-XCODE] %s encode: %s (%s, %.1fs)",
-                         self.channel_id, item.label, item.kind, item.duration)
-            enc_cmd = self._build_encoder_cmd(item, ts_offset)
-            file_start = time.time()
-
-            try:
-                self._enc_proc = subprocess.Popen(
-                    enc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
-                while not self._stop_event.is_set():
-                    chunk = self._enc_proc.stdout.read(65536)
-                    if not chunk:
+                while True:
+                    line = self._enc_proc.stderr.readline()
+                    if not line:
                         break
-                    try:
-                        self._hls_proc.stdin.write(chunk)
-                    except (BrokenPipeError, OSError):
-                        logging.error("[RESOLVED-XCODE] %s HLS pipe broke", self.channel_id)
-                        self._stop_event.set()
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if text and ("error" in text.lower() or "fatal" in text.lower()):
+                        logging.warning("[RESOLVED-XCODE] %s encoder: %s",
+                                        self.channel_id, text[-200:])
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_stderr, daemon=True,
+                          name=f"resolved-encoder-stderr-{self.channel_id}").start()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    item = self._segment_queue.get(timeout=10)
+                except queue.Empty:
+                    if self._enc_proc.poll() is not None:
+                        logging.error("[RESOLVED-XCODE] %s encoder died unexpectedly",
+                                      self.channel_id)
                         break
-                self._enc_proc.stdout.close()
-                self._enc_proc.wait()
-                rc = self._enc_proc.returncode
-                file_elapsed = time.time() - file_start
-                if rc != 0 and not self._stop_event.is_set():
-                    err = self._enc_proc.stderr.read().decode("utf-8", errors="replace")[-300:]
-                    logging.warning("[RESOLVED-XCODE] %s encoder rc=%d for %s: %s",
-                                    self.channel_id, rc, item.label, err)
-                else:
-                    ts_offset += file_elapsed
-                if self._enc_proc and self._enc_proc.stderr:
-                    self._enc_proc.stderr.close()
-            except Exception as e:
-                logging.error("[RESOLVED-XCODE] %s encoder failed for %s: %s",
-                              self.channel_id, item.label, e)
-            finally:
-                self._enc_proc = None
-                # Delete the temp upstream file once encoded
-                if item.kind == "upstream":
+                    continue
+
+                logging.info("[RESOLVED-XCODE] %s feed: %s (%s, %.1fs)",
+                             self.channel_id, item.label, item.kind, item.duration)
+
+                try:
+                    if item.kind == "upstream":
+                        self._feed_upstream_file(item)
+                    elif item.kind == "bump":
+                        self._feed_bump_file(item)
+                except (BrokenPipeError, OSError) as e:
+                    logging.error("[RESOLVED-XCODE] %s encoder pipe broke: %s",
+                                  self.channel_id, e)
+                    self._stop_event.set()
+                    break
+                except Exception as e:
+                    logging.warning("[RESOLVED-XCODE] %s feed failed for %s: %s",
+                                    self.channel_id, item.label, e)
+                finally:
+                    if item.kind == "upstream":
+                        try:
+                            os.remove(item.source_path)
+                        except OSError:
+                            pass
+        finally:
+            if self._enc_proc and self._enc_proc.stdin:
+                try:
+                    self._enc_proc.stdin.close()
+                except Exception:
+                    pass
+            if self._enc_proc:
+                try:
+                    self._enc_proc.wait(timeout=5)
+                except Exception:
                     try:
-                        os.remove(item.source_path)
-                    except OSError:
+                        self._enc_proc.kill()
+                    except Exception:
                         pass
+                self._enc_proc = None
 
-        if self._hls_proc and self._hls_proc.stdin:
+    def _feed_upstream_file(self, item: QueueItem):
+        """Copy bytes from a downloaded upstream segment file directly into
+        the encoder's stdin."""
+        with open(item.source_path, "rb") as f:
+            while not self._stop_event.is_set():
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self._enc_proc.stdin.write(chunk)
+        try:
+            self._enc_proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise
+
+    def _feed_bump_file(self, item: QueueItem):
+        """Run a per-bump ffmpeg that decodes the bump, applies overlay
+        filters, and outputs MPEG-TS bytes into the main encoder's stdin."""
+        sub_cmd = self._build_bump_subffmpeg_cmd(item)
+        sub = subprocess.Popen(
+            sub_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            while not self._stop_event.is_set():
+                chunk = sub.stdout.read(65536)
+                if not chunk:
+                    break
+                self._enc_proc.stdin.write(chunk)
+        finally:
             try:
-                self._hls_proc.stdin.close()
+                sub.stdout.close()
             except Exception:
                 pass
-        if self._hls_proc:
             try:
-                self._hls_proc.wait(timeout=5)
+                sub.wait(timeout=5)
+            except Exception:
+                try:
+                    sub.kill()
+                except Exception:
+                    pass
+            if sub.returncode and sub.returncode != 0 and not self._stop_event.is_set():
+                try:
+                    err = sub.stderr.read().decode("utf-8", errors="replace")[-200:]
+                    logging.warning("[RESOLVED-XCODE] %s bump rc=%d for %s: %s",
+                                    self.channel_id, sub.returncode, item.label, err)
+                except Exception:
+                    pass
+            try:
+                sub.stderr.close()
             except Exception:
                 pass
-            self._hls_proc = None
 
-    def _build_hls_cmd(self) -> list:
+    def _build_combined_encoder_cmd(self) -> list:
         playlist = os.path.join(self.hls_dir, "stream.m3u8")
         segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
-        return [
+        vf = (
+            f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        )
+        cmd = [
             "ffmpeg", "-y",
+            "-threads", self.ffmpeg_threads,
             "-loglevel", self.loglevel,
+            "-fflags", "+genpts+discardcorrupt",
+            "-re",
             "-f", "mpegts",
             "-i", "pipe:0",
-            "-c", "copy",
+            "-map", "0:v:0?", "-map", "0:a:0?",
+            "-vf", vf,
+            "-r", str(TARGET_FPS),
+            "-c:v", "libx264",
+            "-x264-params", f"threads={self.x264_threads}",
+            "-preset", self.video_preset,
+            "-profile:v", TARGET_VIDEO_PROFILE,
+            "-pix_fmt", "yuv420p",
+            "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
+            "-c:a", "aac",
+            "-b:a", self.audio_bitrate,
+            "-ar", str(TARGET_AUDIO_RATE),
+            "-ac", str(TARGET_AUDIO_CHANNELS),
+            "-async", "1",
             "-f", "hls",
             "-hls_time", str(self.hls_time),
             "-hls_list_size", str(self.hls_list_size),
@@ -660,6 +756,11 @@ class ResolvedChannelStream:
             "-hls_segment_filename", segment_pattern,
             playlist,
         ]
+        if self.crf:
+            idx = cmd.index("-profile:v")
+            cmd.insert(idx, self.crf)
+            cmd.insert(idx, "-crf")
+        return cmd
 
     @staticmethod
     def _wrap_title(text: str, max_chars: int = 28) -> list:
@@ -688,25 +789,33 @@ class ResolvedChannelStream:
         """
         if item.kind != "bump" or not self.show_next:
             return base_vf
-        if not item.cue_remaining_at_start or item.cue_remaining_at_start <= 0:
-            return base_vf
 
         font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         font_bold = font
 
-        # Countdown is from cue_remaining_at_start, decrementing as bump time
-        # progresses (ffmpeg's `t` is current playback time in this bump).
-        cue_left = f"{item.cue_remaining_at_start:.2f}"
-        countdown = (
-            f"drawbox=x=(w-400)/2:y=h-80:w=400:h=50:color=black@0.6:t=fill,"
-            f"drawtext=fontfile={font}:"
-            f"text='RESUMING IN "
-            f"%{{eif\\:trunc(max(0\\,{cue_left}-t)/60)\\:d}}"
-            f"\\:"
-            f"%{{eif\\:mod(max(0\\,{cue_left}-t)\\,60)\\:d\\:2}}':"
-            f"fontsize=28:fontcolor=white@0.9:"
-            f"x=(w-text_w)/2:y=h-70"
-        )
+        # Countdown is only shown when we know the full break duration.
+        # Pod-hint bumps have cue_remaining_at_start; continuous-mode bumps
+        # don't, so they get the UP NEXT overlay without the timer.
+        if item.cue_remaining_at_start and item.cue_remaining_at_start > 0:
+            cue_left = f"{item.cue_remaining_at_start:.2f}"
+            countdown = (
+                f"drawbox=x=(w-400)/2:y=h-80:w=400:h=50:color=black@0.6:t=fill,"
+                f"drawtext=fontfile={font}:"
+                f"text='RESUMING IN "
+                f"%{{eif\\:trunc(max(0\\,{cue_left}-t)/60)\\:d}}"
+                f"\\:"
+                f"%{{eif\\:mod(max(0\\,{cue_left}-t)\\,60)\\:d\\:2}}':"
+                f"fontsize=28:fontcolor=white@0.9:"
+                f"x=(w-text_w)/2:y=h-70"
+            )
+        else:
+            countdown = (
+                f"drawbox=x=(w-400)/2:y=h-80:w=400:h=50:color=black@0.6:t=fill,"
+                f"drawtext=fontfile={font}:"
+                f"text='RETURNING SHORTLY':"
+                f"fontsize=28:fontcolor=white@0.9:"
+                f"x=(w-text_w)/2:y=h-70"
+            )
 
         # UP NEXT box: title is the channel name; poster is the channel logo
         # if one exists on disk.
@@ -761,24 +870,21 @@ class ResolvedChannelStream:
                 f"{title_draws}"
             )
 
-        return f"{base_vf},{countdown}{next_overlay}"
+        parts = [base_vf]
+        if countdown:
+            parts.append(countdown)
+        return ",".join(parts) + next_overlay
 
-    def _build_encoder_cmd(self, item: QueueItem, ts_offset: float) -> list:
-        """Build the per-source encoder command. Re-encodes everything to
-        identical MPEG-TS params so the segmenter sees one coherent bitstream
-        across source switches.
-
-        For bump items with show_next enabled, draws the same RESUMING IN
-        countdown + UP NEXT overlay as scheduled channels do.
-        """
+    def _build_bump_subffmpeg_cmd(self, item: QueueItem) -> list:
+        """Build the per-bump sub-ffmpeg command. Decodes the bump mp4,
+        applies overlay drawtext filters, and outputs MPEG-TS bytes that
+        the main encoder consumes via stdin."""
         base_vf = (
             f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
         use_poster = (
-            item.kind == "bump"
-            and self.show_next
-            and item.cue_remaining_at_start
+            self.show_next
             and self.logo_path
             and os.path.isfile(self.logo_path)
         )
@@ -787,14 +893,12 @@ class ResolvedChannelStream:
         cmd = [
             "ffmpeg", "-y",
             "-threads", self.ffmpeg_threads,
-            "-loglevel", self.loglevel,
-            "-re",
+            "-loglevel", "error",
         ]
         cmd.extend(["-i", item.source_path])
-        # Logo as a second input for the poster overlay
         if use_poster:
             cmd.extend(["-i", self.logo_path])
-        if item.kind == "bump" and item.duration > 0:
+        if item.duration > 0:
             cmd.extend(["-t", f"{item.duration:.3f}"])
 
         if use_poster:
@@ -816,21 +920,14 @@ class ResolvedChannelStream:
         cmd.extend([
             "-r", str(TARGET_FPS),
             "-c:v", "libx264",
-            "-x264-params", f"threads={self.x264_threads}",
-            "-preset", self.video_preset,
+            "-preset", "veryfast",
             "-profile:v", TARGET_VIDEO_PROFILE,
             "-pix_fmt", "yuv420p",
-            "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
             "-c:a", "aac",
             "-b:a", self.audio_bitrate,
             "-ar", str(TARGET_AUDIO_RATE),
             "-ac", str(TARGET_AUDIO_CHANNELS),
-            "-output_ts_offset", f"{ts_offset:.3f}",
             "-f", "mpegts",
             "pipe:1",
         ])
-        if self.crf:
-            idx = cmd.index("-profile:v")
-            cmd.insert(idx, self.crf)
-            cmd.insert(idx, "-crf")
         return cmd
