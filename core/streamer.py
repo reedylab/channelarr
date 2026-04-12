@@ -592,7 +592,12 @@ class StreamerManager:
         if channel_id in self._streams:
             existing = self._streams[channel_id]
             try:
-                if existing.status()["running"]:
+                st = existing.status()
+                if st.get("holding"):
+                    # Pre-warmed holding pattern — upgrade to live
+                    existing.upgrade_to_live()
+                    return True
+                if st.get("running"):
                     return False
             except Exception:
                 pass
@@ -649,6 +654,78 @@ class StreamerManager:
         stream.start()
         self._streams[channel_id] = stream
         return True
+
+    def upgrade_holding(self, channel_id: str):
+        """Upgrade a holding-only resolved channel to full live pipeline."""
+        stream = self._streams.get(channel_id)
+        if stream and hasattr(stream, 'upgrade_to_live'):
+            stream.upgrade_to_live()
+
+    def pre_warm_resolved(self, channel_mgr, bump_manager, logo_dir="/app/data/logos"):
+        """Start holding patterns for all transcode-mediated resolved channels
+        so clients get instant video on first request."""
+        from core.resolver.transcoder import ResolvedChannelStream
+        from core.channels import ffprobe_duration
+
+        channels = channel_mgr.list_channels()
+        count = 0
+        for ch in channels:
+            if ch.get("type") != "resolved" or not ch.get("transcode_mediated"):
+                continue
+            cid = ch["id"]
+            if cid in self._streams:
+                continue
+            manifest_id = ch.get("manifest_id")
+            manifest_url = ch.get("manifest_url")
+            if not manifest_id or not manifest_url:
+                continue
+
+            bump_config = ch.get("bump_config", {})
+            folders = (bump_config or {}).get("folders") or []
+            if not folders and (bump_config or {}).get("folder"):
+                folders = [bump_config["folder"]]
+            bump_paths = []
+            bump_durations = {}
+            for folder in folders:
+                try:
+                    clips = bump_manager.get_clips(folder)
+                except Exception:
+                    continue
+                for clip_path in clips:
+                    bump_paths.append(clip_path)
+                    bump_durations[clip_path] = ffprobe_duration(clip_path)
+
+            hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
+            hls_dir = os.path.join(hls_base, cid)
+            logo_path = os.path.join(logo_dir, f"{cid}.png")
+            if not os.path.isfile(logo_path):
+                logo_path = ""
+
+            stream = ResolvedChannelStream(
+                channel_id=cid,
+                manifest_id=manifest_id,
+                manifest_url=manifest_url,
+                bump_paths=bump_paths,
+                bump_durations=bump_durations,
+                hls_dir=hls_dir,
+                channel_name=ch.get("name", ""),
+                logo_path=logo_path,
+                show_next=bool((bump_config or {}).get("show_next", False)),
+                profile_name=ch.get("profile_name", "auto"),
+                hls_time=int(self._get("HLS_TIME", "6")),
+                hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+                loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
+                video_preset=self._get("VIDEO_PRESET", "veryfast"),
+                crf=self._get("VIDEO_CRF", ""),
+                ffmpeg_threads=self._get("FFMPEG_THREADS", "1"),
+                x264_threads=self._get("X264_THREADS", "4"),
+                audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
+            )
+            stream.start_holding()
+            self._streams[cid] = stream
+            count += 1
+        if count:
+            logging.info("[STREAM] Pre-warmed %d resolved channels with holding patterns", count)
 
     def stop_channel(self, channel_id: str) -> bool:
         stream = self._streams.get(channel_id)

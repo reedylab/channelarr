@@ -147,6 +147,8 @@ async def lifespan(app: FastAPI):
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)
 
+    streamer_mgr.pre_warm_resolved(channel_mgr, bump_mgr)
+
     logging.info("[APP] Channelarr ready")
 
     yield
