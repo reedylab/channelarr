@@ -302,6 +302,13 @@ class ResolvedChannelStream:
         seen_seqs: set[int] = set()
         profile_state: dict = {}      # opaque per-profile classifier state
         in_break: bool = False        # tracks whether we're currently replacing
+        # When a pod_hint queues a perfect-fit bump sequence, this tracks how
+        # many seconds of that pod we've already covered. Subsequent in-break
+        # segments arriving in the playlist decrement this; while it's > 0
+        # they're SKIPPED (not queued as additional continuous bumps).
+        # Prevents the "extra no-overlay bumps tail" pattern after pod_hint
+        # bumps finish playing.
+        break_coverage_remaining: float = 0.0
         backfilled = False
         consecutive_403s = 0
 
@@ -387,21 +394,21 @@ class ResolvedChannelStream:
                 if cls == CLASS_SHOW:
                     if in_break:
                         in_break = False
+                        break_coverage_remaining = 0.0
                         logging.info("[RESOLVED-XCODE] %s break ended, master resumed",
                                      self.channel_id)
                     self._enqueue_upstream(seg)
                     continue
 
-                # CLASS_REPLACE — break content, queue a bump instead
+                # CLASS_REPLACE — break content, queue a bump (or skip if covered)
                 if not in_break:
                     in_break = True
                     logging.info("[RESOLVED-XCODE] %s break started (type=%s)",
                                  self.channel_id, seg.anvato_type or "scte35")
 
-                # When the profile reports a pod_hint (e.g. Lura's pod-duration
-                # at ad-index=0, or Adult Swim's CUE-OUT duration), build a
-                # full perfect-fit bump sequence right now. Otherwise enqueue
-                # one bump matching this segment's duration.
+                # When the profile reports a pod_hint (Lura's pod-duration at
+                # ad-index=0, or Adult Swim's CUE-OUT duration), build a full
+                # perfect-fit bump sequence right now and mark coverage.
                 if pod_hint and pod_hint > 0:
                     bump_seq = build_bump_sequence(
                         self.bump_paths, self.bump_durations, pod_hint,
@@ -417,8 +424,12 @@ class ResolvedChannelStream:
                                 cue_remaining_at_start=cue_left,
                             ))
                             cue_left -= bump_dur
+                        # Mark coverage so subsequent in-break segments (the
+                        # rest of the pod) get SKIPPED instead of queueing
+                        # additional no-overlay continuous bumps on top.
+                        break_coverage_remaining = pod_hint
                         logging.info(
-                            "[RESOLVED-XCODE] %s queued %d bumps for %.1fs pod",
+                            "[RESOLVED-XCODE] %s queued %d bumps for %.1fs pod (coverage set)",
                             self.channel_id, len(bump_seq), pod_hint,
                         )
                     else:
@@ -427,28 +438,36 @@ class ResolvedChannelStream:
                             self.channel_id,
                         )
                         self._enqueue_upstream(seg)
+                    continue
+
+                # Already covered by an earlier pod_hint sequence — skip this
+                # segment entirely (the perfect-fit bumps already queued cover
+                # the time this segment would occupy in the encoder).
+                if break_coverage_remaining > 0:
+                    break_coverage_remaining = max(0.0, break_coverage_remaining - seg.duration)
+                    continue
+
+                # Continuous mode: queue one bump per replaced segment. Used
+                # when there's no upfront pod duration (e.g. Lura SLATE before
+                # the ad pod starts, or joining mid-cue without continuation
+                # markers).
+                bump_seq = build_bump_sequence(
+                    self.bump_paths, self.bump_durations, seg.duration,
+                )
+                if bump_seq:
+                    for bump_path, bump_dur in bump_seq:
+                        self._segment_queue.put(QueueItem(
+                            kind="bump",
+                            source_path=bump_path,
+                            duration=bump_dur,
+                            label=os.path.basename(bump_path),
+                        ))
                 else:
-                    # Continuous mode: queue one bump per replaced segment.
-                    # Used when we don't have an upfront pod duration (e.g.
-                    # Lura SLATE segments before the ad pod starts, or
-                    # joining mid-cue without continuation markers).
-                    bump_seq = build_bump_sequence(
-                        self.bump_paths, self.bump_durations, seg.duration,
+                    logging.warning(
+                        "[RESOLVED-XCODE] %s no bumps configured — passing through",
+                        self.channel_id,
                     )
-                    if bump_seq:
-                        for bump_path, bump_dur in bump_seq:
-                            self._segment_queue.put(QueueItem(
-                                kind="bump",
-                                source_path=bump_path,
-                                duration=bump_dur,
-                                label=os.path.basename(bump_path),
-                            ))
-                    else:
-                        logging.warning(
-                            "[RESOLVED-XCODE] %s no bumps configured — passing through",
-                            self.channel_id,
-                        )
-                        self._enqueue_upstream(seg)
+                    self._enqueue_upstream(seg)
 
             self._stop_event.wait(POLL_INTERVAL_SECONDS)
 
