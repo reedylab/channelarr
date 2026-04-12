@@ -11,8 +11,7 @@ services keep their network namespace.
 """
 
 import logging
-import re
-import subprocess
+import socket
 import threading
 import time
 from collections import deque
@@ -40,19 +39,22 @@ def _get_auth_and_url():
     return url, auth
 
 
-def _ping_rtt(target: str = "1.1.1.1", timeout: int = 2) -> float | None:
-    """Ping target once. Return RTT in milliseconds or None on failure."""
+def _ping_rtt(target: str = "1.1.1.1", port: int = 443, timeout: int = 2) -> float | None:
+    """Measure RTT via TCP connect to target:port. Return ms or None on failure.
+
+    Uses a TCP handshake instead of ICMP ping so we don't need the ping
+    binary or CAP_NET_RAW in the container.
+    """
     try:
-        r = subprocess.run(
-            ["ping", "-c", "1", "-W", str(timeout), target],
-            capture_output=True, text=True, timeout=timeout + 2,
-        )
-        if r.returncode != 0:
-            return None
-        m = re.search(r"time=([\d.]+)", r.stdout)
-        return float(m.group(1)) if m else None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.monotonic()
+        sock.connect((target, port))
+        rtt = (time.monotonic() - start) * 1000
+        sock.close()
+        return round(rtt, 2)
     except Exception as e:
-        logger.debug("[VPN-MONITOR] ping failed: %s", e)
+        logger.debug("[VPN-MONITOR] tcp ping failed: %s", e)
         return None
 
 
