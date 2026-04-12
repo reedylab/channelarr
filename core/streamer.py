@@ -27,7 +27,8 @@ class ChannelStream:
                  loop: bool = True, channel_mgr=None,
                  video_preset: str = "fast", crf: str = "",
                  ffmpeg_threads: str = "1", x264_threads: str = "4",
-                 audio_bitrate: str = "192k", show_next: bool = False):
+                 audio_bitrate: str = "192k", show_next: bool = False,
+                 branding_logo_path: str = ""):
         self.channel_id = channel_id
         self.schedule = schedule
         self.start_index = start_index
@@ -44,6 +45,7 @@ class ChannelStream:
         self.x264_threads = x264_threads
         self.audio_bitrate = audio_bitrate
         self.show_next = show_next
+        self.branding_logo_path = branding_logo_path
 
         self._enc_proc = None
         self._hls_proc = None
@@ -188,66 +190,65 @@ class ChannelStream:
         else:
             vf = base_vf
 
-        if use_poster:
-            poster_filter = (
+        use_wm = self.branding_logo_path and os.path.isfile(self.branding_logo_path)
+        wm_chain = ""
+        if use_wm:
+            wm_scale = "scale=80:-1,format=rgba,colorchannelmixer=aa=0.6"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-threads", self.ffmpeg_threads,
+            "-loglevel", self.loglevel,
+            "-re",
+        ]
+        if seek_seconds > 0:
+            cmd.extend(["-ss", f"{seek_seconds:.3f}"])
+        cmd.extend(["-i", filepath])
+
+        if use_poster and use_wm:
+            cmd.extend(["-i", next_poster, "-loop", "1", "-i", self.branding_logo_path])
+            fc = (
+                f"[1:v]scale=200:300[poster];"
+                f"[2:v]{wm_scale}[wm];"
+                f"[0:v]{vf}[main];"
+                f"[main][poster]overlay=55:50[wp];"
+                f"[wp][wm]overlay=W-w-20:H-h-20:shortest=1"
+            )
+            cmd.extend(["-filter_complex", fc, "-map", "0:a:0"])
+        elif use_poster:
+            cmd.extend(["-i", next_poster])
+            fc = (
                 f"[1:v]scale=200:300[poster];"
                 f"[0:v]{vf}[main];"
                 f"[main][poster]overlay=55:50"
             )
-            cmd = [
-                "ffmpeg", "-y",
-                "-threads", self.ffmpeg_threads,
-                "-loglevel", self.loglevel,
-                "-re",
-            ]
-            if seek_seconds > 0:
-                cmd.extend(["-ss", f"{seek_seconds:.3f}"])
-            cmd.extend([
-                "-i", filepath,
-                "-i", next_poster,
-                "-filter_complex", poster_filter,
-                "-map", "0:a:0",
-                "-r", "30",
-                "-c:v", "libx264",
-                "-x264-params", f"threads={self.x264_threads}",
-                "-preset", preset,
-                "-profile:v", "high",
-                "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
-                "-c:a", "aac",
-                "-b:a", self.audio_bitrate,
-                "-ac", "2",
-                "-ar", "48000",
-                "-output_ts_offset", f"{ts_offset:.3f}",
-                "-f", "mpegts",
-                "pipe:1",
-            ])
+            cmd.extend(["-filter_complex", fc, "-map", "0:a:0"])
+        elif use_wm:
+            cmd.extend(["-loop", "1", "-i", self.branding_logo_path])
+            fc = (
+                f"[1:v]{wm_scale}[wm];"
+                f"[0:v]{vf}[main];"
+                f"[main][wm]overlay=W-w-20:H-h-20:shortest=1"
+            )
+            cmd.extend(["-filter_complex", fc, "-map", "0:a:0"])
         else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-threads", self.ffmpeg_threads,
-                "-loglevel", self.loglevel,
-                "-re",
-            ]
-            if seek_seconds > 0:
-                cmd.extend(["-ss", f"{seek_seconds:.3f}"])
-            cmd.extend([
-                "-i", filepath,
-                "-map", "0:v:0", "-map", "0:a:0",
-                "-vf", vf,
-                "-r", "30",
-                "-c:v", "libx264",
-                "-x264-params", f"threads={self.x264_threads}",
-                "-preset", preset,
-                "-profile:v", "high",
-                "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
-                "-c:a", "aac",
-                "-b:a", self.audio_bitrate,
-                "-ac", "2",
-                "-ar", "48000",
-                "-output_ts_offset", f"{ts_offset:.3f}",
-                "-f", "mpegts",
-                "pipe:1",
-            ])
+            cmd.extend(["-map", "0:v:0", "-map", "0:a:0", "-vf", vf])
+
+        cmd.extend([
+            "-r", "30",
+            "-c:v", "libx264",
+            "-x264-params", f"threads={self.x264_threads}",
+            "-preset", preset,
+            "-profile:v", "high",
+            "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
+            "-c:a", "aac",
+            "-b:a", self.audio_bitrate,
+            "-ac", "2",
+            "-ar", "48000",
+            "-output_ts_offset", f"{ts_offset:.3f}",
+            "-f", "mpegts",
+            "pipe:1",
+        ])
         if self.crf:
             idx = cmd.index("-profile:v")
             cmd.insert(idx, self.crf)
@@ -540,10 +541,17 @@ class StreamerManager:
         self._cleanup_thread = None
         self._cleanup_stop = threading.Event()
 
+    def _resolve_branding_path(self, branding_logo):
+        if not branding_logo:
+            return ""
+        base = self._get("DATA_PATH", "/app/data")
+        path = os.path.join(base, "branding", branding_logo)
+        return path if os.path.isfile(path) else ""
+
     def start_channel(self, channel_id: str, schedule: list,
                       start_index: int = 0, start_seek: float = 0.0,
                       loop: bool = True, show_next: bool = False,
-                      channel_mgr=None) -> bool:
+                      channel_mgr=None, branding_logo_path: str = "") -> bool:
         if channel_id in self._streams:
             if self._streams[channel_id].status()["running"]:
                 return False
@@ -568,6 +576,7 @@ class StreamerManager:
             x264_threads=self._get("X264_THREADS", "4"),
             audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
             show_next=show_next,
+            branding_logo_path=branding_logo_path,
         )
         stream.start()
         self._streams[channel_id] = stream
@@ -578,7 +587,7 @@ class StreamerManager:
                                 bump_manager, channel_name: str = "",
                                 logo_dir: str = "/app/data/logos",
                                 profile_name: str = "auto",
-                                watermark: bool = False) -> bool:
+                                branding_logo_path: str = "") -> bool:
         """Start a transcode-mediated resolved channel.
 
         Builds a ResolvedChannelStream that polls the upstream playlist,
@@ -643,7 +652,7 @@ class StreamerManager:
             logo_path=logo_path,
             show_next=bool((bump_config or {}).get("show_next", False)),
             profile_name=profile_name or "auto",
-            watermark=watermark,
+            branding_logo_path=branding_logo_path,
             hls_time=int(self._get("HLS_TIME", "6")),
             hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
             loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
@@ -714,7 +723,7 @@ class StreamerManager:
                 logo_path=logo_path,
                 show_next=bool((bump_config or {}).get("show_next", False)),
                 profile_name=ch.get("profile_name", "auto"),
-                watermark=ch.get("watermark", False),
+                branding_logo_path=self._resolve_branding_path(ch.get("branding_logo")),
                 hls_time=int(self._get("HLS_TIME", "6")),
                 hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
                 loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),

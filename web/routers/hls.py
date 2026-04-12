@@ -46,7 +46,7 @@ def _start_from_schedule(channel_id):
             channel_name=ch.get("name", ""),
             logo_dir=shared_state.LOGO_DIR,
             profile_name=ch.get("profile_name", "auto"),
-            watermark=ch.get("watermark", False),
+            branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
         )
         return ok, "Started" if ok else "Already running"
 
@@ -67,6 +67,7 @@ def _start_from_schedule(channel_id):
         loop=ch.get("loop", True),
         show_next=bump_cfg.get("show_next", False),
         channel_mgr=shared_state.channel_mgr,
+        branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
     )
     return ok, "Started" if ok else "Already running"
 

@@ -150,7 +150,7 @@ class ResolvedChannelStream:
         logo_path: str = "",
         show_next: bool = False,
         profile_name: str = "auto",
-        watermark: bool = False,
+        branding_logo_path: str = "",
         hls_time: int = 6,
         hls_list_size: int = 10,
         loglevel: str = "warning",
@@ -170,8 +170,7 @@ class ResolvedChannelStream:
         self.logo_path = logo_path
         self.show_next = show_next
         self.profile_name = profile_name
-        self.watermark = watermark
-        self.watermark_path = os.path.join(os.path.dirname(os.path.dirname(hls_dir)), "watermark.png")  # /app/data/watermark.png
+        self.branding_logo_path = branding_logo_path
         self.profile: Optional[StreamProfile] = None  # resolved on first poll
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
@@ -306,20 +305,37 @@ class ResolvedChannelStream:
         hold_src = random.choice(cache_files)
         playlist = os.path.join(self.hls_dir, "stream.m3u8")
         segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
+        use_wm = self.branding_logo_path and os.path.isfile(self.branding_logo_path)
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "error",
             "-stream_loop", "-1",
             "-re",
             "-i", hold_src,
-            "-c", "copy",
+        ]
+        if use_wm:
+            cmd.extend(["-loop", "1", "-i", self.branding_logo_path])
+            vf = (
+                f"[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.6[wm];"
+                f"[0:v]null[main];"
+                f"[main][wm]overlay=W-w-20:H-h-20:shortest=1"
+            )
+            cmd.extend([
+                "-filter_complex", vf,
+                "-map", "0:a:0?",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac",
+            ])
+        else:
+            cmd.extend(["-c", "copy"])
+        cmd.extend([
             "-f", "hls",
             "-hls_time", str(self.hls_time),
             "-hls_list_size", "3",
             "-hls_flags", "delete_segments+omit_endlist",
             "-hls_segment_filename", segment_pattern,
             playlist,
-        ]
+        ])
         self._holding_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -873,8 +889,8 @@ class ResolvedChannelStream:
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
         use_watermark = (
-            self.watermark
-            and os.path.isfile(self.watermark_path)
+            self.branding_logo_path
+            and os.path.isfile(self.branding_logo_path)
         )
         cmd = [
             "ffmpeg", "-y",
@@ -885,11 +901,11 @@ class ResolvedChannelStream:
             "-i", "pipe:0",
         ]
         if use_watermark:
-            cmd.extend(["-i", self.watermark_path])
+            cmd.extend(["-loop", "1", "-i", self.branding_logo_path])
             wm_filter = (
                 f"[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.6[wm];"
                 f"[0:v]{base_vf}[main];"
-                f"[main][wm]overlay=W-w-20:H-h-20"
+                f"[main][wm]overlay=W-w-20:H-h-20:shortest=1"
             )
             cmd.extend([
                 "-filter_complex", wm_filter,

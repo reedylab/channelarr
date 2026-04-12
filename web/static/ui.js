@@ -480,6 +480,7 @@ function openEditor(ch) {
     loadResolvedBumpFolders(selected);
     $("#ch-resolved-shownext").checked = !!bc.show_next;
     $("#ch-resolved-profile").value = ch.profile_name || "auto";
+    loadBrandingDropdown("ch-resolved-branding", ch.branding_logo || "");
   }
 
   const bc = ch ? (ch.bump_config || {}) : {};
@@ -500,6 +501,7 @@ function openEditor(ch) {
   editorWeights = (sc && sc.weights) ? Object.assign({}, sc.weights) : {};
   updateWeightsUI();
   $("#ch-loop").checked = ch ? !!ch.loop : true;
+  loadBrandingDropdown("ch-branding", ch ? (ch.branding_logo || "") : "");
 
   const logoPreview = $("#ch-logo-preview");
   const logoInput = $("#ch-logo-input");
@@ -990,6 +992,7 @@ async function saveChannel() {
       name,
       transcode_mediated: transcodeOn,
       profile_name: $("#ch-resolved-profile").value || "auto",
+      branding_logo: $("#ch-resolved-branding").value || null,
     };
     if (transcodeOn) {
       data.bump_config = {
@@ -1020,6 +1023,7 @@ async function saveChannel() {
       shuffle: shuffleMode === "random",
       shuffle_config: shuffleConfig,
       loop: $("#ch-loop").checked,
+      branding_logo: $("#ch-branding").value || null,
     };
   }
 
@@ -1382,6 +1386,7 @@ async function loadSettings() {
     settingsOriginal = {...data.values};
     settingsModified = {...data.values};
     renderAllSettings();
+    loadBrandingGrid();
   } catch(e) {}
 }
 
@@ -1464,6 +1469,75 @@ $("#save-settings").addEventListener("click", async () => {
     toast("error", "Failed to save settings");
   }
   setTimeout(() => { status.textContent = ""; status.className = "settings-status"; }, 3000);
+});
+
+// ─── Branding Logos ───
+async function loadBrandingDropdown(selectId, selected) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  try {
+    const r = await fetch(`${API}/branding`);
+    const logos = await r.json();
+    sel.innerHTML = '<option value="">None</option>';
+    for (const logo of logos) {
+      const opt = document.createElement("option");
+      opt.value = logo.filename;
+      opt.textContent = logo.filename.replace(/\.[^.]+$/, "");
+      if (logo.filename === selected) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  } catch(e) {}
+}
+
+async function loadBrandingGrid() {
+  const grid = document.getElementById("branding-grid");
+  if (!grid) return;
+  try {
+    const r = await fetch(`${API}/branding`);
+    const logos = await r.json();
+    grid.innerHTML = "";
+    if (!logos.length) {
+      grid.innerHTML = '<div style="color:#666;font-size:13px;">No branding logos uploaded yet.</div>';
+      return;
+    }
+    for (const logo of logos) {
+      const card = document.createElement("div");
+      card.style.cssText = "position:relative;background:#1a1a2e;border-radius:8px;padding:8px;text-align:center;width:100px;";
+      card.innerHTML = `
+        <img src="${logo.url}?t=${Date.now()}" style="max-width:80px;max-height:80px;display:block;margin:0 auto 6px;">
+        <div style="font-size:11px;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${logo.filename.replace(/\.[^.]+$/, "")}</div>
+        <button onclick="channelarr.deleteBranding('${logo.filename}')" style="position:absolute;top:2px;right:2px;background:none;border:none;color:#f44;cursor:pointer;font-size:14px;">x</button>
+      `;
+      grid.appendChild(card);
+    }
+  } catch(e) {}
+}
+
+channelarr.deleteBranding = async function(filename) {
+  if (!confirm(`Delete branding logo "${filename}"?`)) return;
+  try {
+    await fetch(`${API}/branding/${filename}`, { method: "DELETE" });
+    toast("success", "Branding logo deleted");
+    loadBrandingGrid();
+  } catch(e) { toast("error", "Delete failed"); }
+};
+
+document.getElementById("branding-upload")?.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch(`${API}/branding`, { method: "POST", body: fd });
+    if (r.ok) {
+      toast("success", "Branding logo uploaded");
+      loadBrandingGrid();
+    } else {
+      const d = await r.json();
+      toast("error", d.error || "Upload failed");
+    }
+  } catch(e) { toast("error", "Upload failed"); }
+  e.target.value = "";
 });
 
 // ─── Web Player ───

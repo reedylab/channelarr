@@ -271,6 +271,15 @@
               </div>
             </div>
             <div id="settings-container" class="settings-content"></div>
+            <div class="settings-section" style="margin-top:24px;">
+              <h3>Branding Logos</h3>
+              <p style="color:#888;font-size:13px;margin-bottom:12px;">Upload logos to overlay on channel streams. Assign per-channel in the channel editor.</p>
+              <div id="branding-grid" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;"></div>
+              <label class="btn btn-secondary" style="cursor:pointer;">
+                Upload Logo
+                <input type="file" id="branding-upload" accept="image/png,image/jpeg" style="display:none;">
+              </label>
+            </div>
           </div>
         </div>
       </section>
@@ -366,6 +375,13 @@
               <div id="ch-weights-total" class="ch-weights-total"></div>
             </div>
             <label class="toggle-label" style="margin-top:8px"><input type="checkbox" id="ch-loop" checked /> Loop</label>
+            <div class="setting-field" style="margin-top:10px">
+              <label>Branding Logo</label>
+              <select id="ch-branding">
+                <option value="">None</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Overlay a branding logo in the bottom-right corner.</div>
+            </div>
           </div>
         </div>
 
@@ -395,6 +411,14 @@
                 <option value="anvato_lura">Anvato / Lura Live (local TV affiliates, e.g. WSPA)</option>
               </select>
               <div class="muted" style="margin-top:4px;font-size:11px">How channelarr detects ad breaks in the upstream playlist. Auto picks based on marker fingerprints and is correct for most sources. Pick a named profile if auto-detect chooses wrong.</div>
+            </div>
+
+            <div class="setting-field" style="margin-top:10px">
+              <label>Branding Logo</label>
+              <select id="ch-resolved-branding">
+                <option value="">None</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Overlay a branding logo in the bottom-right corner of the stream. Upload logos in Settings.</div>
             </div>
 
             <div id="ch-resolved-bump-section" style="display:none;margin-top:12px">
@@ -495,6 +519,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=31"></script>
+  <script src="/static/ui.js?v=32"></script>
 </body>
 </html>
