@@ -638,7 +638,15 @@ class ResolvedChannelStream:
                     if item.kind == "upstream":
                         self._feed_upstream_file(item)
                     elif item.kind == "bump":
-                        self._feed_bump_file(item)
+                        cache_path = item.source_path + ".cache.ts"
+                        has_cache = os.path.isfile(cache_path)
+                        needs_overlay = self.show_next
+                        if has_cache and not needs_overlay:
+                            self._feed_cached_bump(item, cache_path)
+                        elif has_cache and needs_overlay:
+                            self._feed_bump_file(item, cache_path=cache_path)
+                        else:
+                            self._feed_bump_file(item)
                 except (BrokenPipeError, OSError) as e:
                     logging.error("[RESOLVED-XCODE] %s encoder pipe broke: %s",
                                   self.channel_id, e)
@@ -683,10 +691,47 @@ class ResolvedChannelStream:
         except (BrokenPipeError, OSError):
             raise
 
-    def _feed_bump_file(self, item: QueueItem):
+    def _feed_cached_bump(self, item: QueueItem, cache_path: str):
+        """Feed a pre-encoded cached bump into the encoder's stdin via a
+        lightweight copy-trim ffmpeg. No decode/encode — just copies TS
+        bytes with accurate time trimming for truncated bumps."""
+        cmd = [
+            "ffmpeg", "-y",
+            "-loglevel", "error",
+            "-i", cache_path,
+            "-c", "copy",
+        ]
+        if item.duration > 0:
+            cmd.extend(["-t", f"{item.duration:.3f}"])
+        cmd.extend(["-f", "mpegts", "pipe:1"])
+        sub = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            while not self._stop_event.is_set():
+                chunk = sub.stdout.read(65536)
+                if not chunk:
+                    break
+                self._enc_proc.stdin.write(chunk)
+        finally:
+            try:
+                sub.stdout.close()
+            except Exception:
+                pass
+            try:
+                sub.wait(timeout=5)
+            except Exception:
+                try:
+                    sub.kill()
+                except Exception:
+                    pass
+            try:
+                sub.stderr.close()
+            except Exception:
+                pass
+
+    def _feed_bump_file(self, item: QueueItem, cache_path: str = None):
         """Run a per-bump ffmpeg that decodes the bump, applies overlay
         filters, and outputs MPEG-TS bytes into the main encoder's stdin."""
-        sub_cmd = self._build_bump_subffmpeg_cmd(item)
+        sub_cmd = self._build_bump_subffmpeg_cmd(item, cache_path=cache_path)
         sub = subprocess.Popen(
             sub_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -732,7 +777,6 @@ class ResolvedChannelStream:
             "-threads", self.ffmpeg_threads,
             "-loglevel", self.loglevel,
             "-fflags", "+genpts+discardcorrupt",
-            "-re",
             "-f", "mpegts",
             "-i", "pipe:0",
             "-map", "0:v:0?", "-map", "0:a:0?",
@@ -875,14 +919,18 @@ class ResolvedChannelStream:
             parts.append(countdown)
         return ",".join(parts) + next_overlay
 
-    def _build_bump_subffmpeg_cmd(self, item: QueueItem) -> list:
-        """Build the per-bump sub-ffmpeg command. Decodes the bump mp4,
-        applies overlay drawtext filters, and outputs MPEG-TS bytes that
-        the main encoder consumes via stdin."""
-        base_vf = (
-            f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-        )
+    def _build_bump_subffmpeg_cmd(self, item: QueueItem, cache_path: str = None) -> list:
+        """Build the per-bump sub-ffmpeg command. When a cache_path is
+        provided, uses the pre-encoded TS (already at target resolution)
+        as input — skipping the mp4 decode and scale step."""
+        input_path = cache_path or item.source_path
+        if cache_path:
+            base_vf = "null"
+        else:
+            base_vf = (
+                f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+                f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+            )
         use_poster = (
             self.show_next
             and self.logo_path
@@ -895,7 +943,7 @@ class ResolvedChannelStream:
             "-threads", self.ffmpeg_threads,
             "-loglevel", "error",
         ]
-        cmd.extend(["-i", item.source_path])
+        cmd.extend(["-i", input_path])
         if use_poster:
             cmd.extend(["-i", self.logo_path])
         if item.duration > 0:
@@ -920,7 +968,7 @@ class ResolvedChannelStream:
         cmd.extend([
             "-r", str(TARGET_FPS),
             "-c:v", "libx264",
-            "-preset", "veryfast",
+            "-preset", "ultrafast",
             "-profile:v", TARGET_VIDEO_PROFILE,
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",

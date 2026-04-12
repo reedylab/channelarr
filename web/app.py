@@ -117,6 +117,7 @@ async def lifespan(app: FastAPI):
 
     bump_mgr = BumpManager(get_setting_fn=get_setting)
     bump_mgr.scan()
+    bump_mgr.precache_bumps()
     media_lib = MediaLibrary(get_setting_fn=get_setting)
     channel_mgr = ChannelManager()
     streamer_mgr = StreamerManager(get_setting_fn=get_setting)
