@@ -770,11 +770,17 @@ class StreamerManager:
         return sum(1 for s in self._streams.values() if s.status()["running"])
 
     def cleanup_idle(self, timeout_seconds: int = 300):
-        """Stop channels that haven't been accessed recently."""
+        """Stop channels that haven't been accessed recently.
+        Holding-only streams (pre-warmed) are exempt — they exist to
+        provide instant startup and should persist until a client upgrades
+        them to live."""
         now = time.time()
         to_stop = []
         for cid, stream in self._streams.items():
-            if stream.status()["running"] and (now - stream.last_access) > timeout_seconds:
+            st = stream.status()
+            if st.get("holding"):
+                continue
+            if st.get("running") and (now - stream.last_access) > timeout_seconds:
                 to_stop.append(cid)
         for cid in to_stop:
             logging.info("[STREAM] Idle timeout — stopping channel %s", cid)
