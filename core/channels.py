@@ -47,6 +47,7 @@ def _row_to_dict(row, manifest=None) -> dict:
         "manifest_id": row.manifest_id,
         "transcode_mediated": bool(getattr(row, "transcode_mediated", False)),
         "profile_name": getattr(row, "profile_name", "auto") or "auto",
+        "watermark": bool(getattr(row, "watermark", False)),
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
@@ -225,6 +226,8 @@ def _apply_dict_to_row(row, channel: dict):
         row.schedule_epoch = None
     if "transcode_mediated" in channel:
         row.transcode_mediated = bool(channel["transcode_mediated"])
+    if "watermark" in channel:
+        row.watermark = bool(channel["watermark"])
 
 
 def backfill_resolved_manifests_to_channels():
@@ -390,6 +393,8 @@ class ChannelManager:
                     row.bump_config = data["bump_config"] or {}
                 if "profile_name" in data:
                     row.profile_name = data["profile_name"] or "auto"
+                if "watermark" in data:
+                    row.watermark = bool(data["watermark"])
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None

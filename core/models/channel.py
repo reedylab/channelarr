@@ -66,6 +66,11 @@ class Channel(Base):
     # segments — used by WSPA News and other local affiliates).
     profile_name = Column(String, nullable=False, default="auto")
 
+    # Overlay the global watermark image (data/watermark.png) in the bottom
+    # right corner of the transcoded output. Only applies when
+    # transcode_mediated is also true.
+    watermark = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

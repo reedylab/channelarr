@@ -577,7 +577,8 @@ class StreamerManager:
                                 manifest_url: str, bump_config: dict,
                                 bump_manager, channel_name: str = "",
                                 logo_dir: str = "/app/data/logos",
-                                profile_name: str = "auto") -> bool:
+                                profile_name: str = "auto",
+                                watermark: bool = False) -> bool:
         """Start a transcode-mediated resolved channel.
 
         Builds a ResolvedChannelStream that polls the upstream playlist,
@@ -642,6 +643,7 @@ class StreamerManager:
             logo_path=logo_path,
             show_next=bool((bump_config or {}).get("show_next", False)),
             profile_name=profile_name or "auto",
+            watermark=watermark,
             hls_time=int(self._get("HLS_TIME", "6")),
             hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
             loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
@@ -712,6 +714,7 @@ class StreamerManager:
                 logo_path=logo_path,
                 show_next=bool((bump_config or {}).get("show_next", False)),
                 profile_name=ch.get("profile_name", "auto"),
+                watermark=ch.get("watermark", False),
                 hls_time=int(self._get("HLS_TIME", "6")),
                 hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
                 loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),

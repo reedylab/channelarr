@@ -46,6 +46,7 @@ def _start_from_schedule(channel_id):
             channel_name=ch.get("name", ""),
             logo_dir=shared_state.LOGO_DIR,
             profile_name=ch.get("profile_name", "auto"),
+            watermark=ch.get("watermark", False),
         )
         return ok, "Started" if ok else "Already running"
 
