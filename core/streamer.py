@@ -773,15 +773,29 @@ class StreamerManager:
         """Stop channels that haven't been accessed recently.
         Holding-only streams (pre-warmed) are exempt — they exist to
         provide instant startup and should persist until a client upgrades
-        them to live."""
+        them to live.
+
+        Transcode-mediated resolved channels are downgraded back to their
+        holding pattern instead of being fully stopped, so the next viewer
+        still gets instant startup."""
+        from core.resolver.transcoder import ResolvedChannelStream
+
         now = time.time()
         to_stop = []
+        to_downgrade = []
         for cid, stream in self._streams.items():
             st = stream.status()
             if st.get("holding"):
                 continue
             if st.get("running") and (now - stream.last_access) > timeout_seconds:
-                to_stop.append(cid)
+                if isinstance(stream, ResolvedChannelStream):
+                    to_downgrade.append(cid)
+                else:
+                    to_stop.append(cid)
+        for cid in to_downgrade:
+            stream = self._streams.get(cid)
+            if stream:
+                stream.downgrade_to_holding()
         for cid in to_stop:
             logging.info("[STREAM] Idle timeout — stopping channel %s", cid)
             self.stop_channel(cid)

@@ -232,6 +232,39 @@ class ResolvedChannelStream:
         logging.info("[RESOLVED-XCODE] Started channel %s (manifest=%s)",
                      self.channel_id, self.manifest_id)
 
+    def downgrade_to_holding(self):
+        """Stop the live pipeline (poller+feeder+encoder) and restart the
+        holding pattern. Used by idle cleanup to return to the pre-warmed
+        state instead of destroying the stream entirely."""
+        self._stop_event.set()
+        if self._enc_proc:
+            try:
+                self._enc_proc.terminate()
+                self._enc_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._enc_proc.kill()
+                except Exception:
+                    pass
+            self._enc_proc = None
+        # Wait for threads to finish (they check _stop_event)
+        if self._poller_thread and self._poller_thread.is_alive():
+            self._poller_thread.join(timeout=5)
+        if self._feeder_thread and self._feeder_thread.is_alive():
+            self._feeder_thread.join(timeout=5)
+        self._poller_thread = None
+        self._feeder_thread = None
+        try:
+            shutil.rmtree(self._download_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self._download_dir = tempfile.mkdtemp(prefix=f"channelarr-res-{self.channel_id}-")
+        # Restart holding pattern
+        self._stop_event.clear()
+        self._start_holding_pattern()
+        self._last_access = time.time()
+        logging.info("[RESOLVED-XCODE] %s downgraded to holding pattern (idle)", self.channel_id)
+
     def start(self):
         """Full start — holding pattern + poller + feeder."""
         self.start_holding()
