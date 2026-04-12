@@ -5,5 +5,7 @@ __pycache__/
 *.pyc
 *.log
 data/
-.env*
+.env
+.env.*
+!.env.example
 .DS_Store

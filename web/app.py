@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -48,6 +50,47 @@ def _materialize_missing(channel_mgr, bump_mgr, media_lib):
             materialize_schedule(ch, bump_mgr, media_library=media_lib)
             channel_mgr.save_channel(ch)
     logging.info("[APP] Schedule materialization complete")
+
+
+def _start_vpn_threads():
+    """Start VPN latency sampler and auto-rotate checker as daemon threads.
+
+    Both threads run every 60s. The sampler runs in all modes (vpn and local)
+    so the chart always has data. The auto-rotate checker only acts when
+    gluetun is configured AND the vpn_auto_rotate_minutes setting is > 0.
+    """
+    from core.vpn_monitor import sample_latency, maybe_auto_rotate
+
+    # Take one immediate sample so the chart isn't empty for the first 60s
+    try:
+        sample_latency()
+    except Exception:
+        pass
+
+    def _vpn_sample_loop():
+        while True:
+            time.sleep(60)
+            try:
+                sample_latency()
+            except Exception as e:
+                logging.error("[VPN-MONITOR] sample failed: %s", e)
+
+    def _vpn_rotate_loop():
+        while True:
+            time.sleep(60)
+            try:
+                maybe_auto_rotate()
+            except Exception as e:
+                logging.error("[VPN-MONITOR] rotate check failed: %s", e)
+
+    import threading
+    threading.Thread(target=_vpn_sample_loop, daemon=True).start()
+
+    if get_setting("GLUETUN_CONTROL_URL", ""):
+        threading.Thread(target=_vpn_rotate_loop, daemon=True).start()
+        logging.info("[VPN-MONITOR] Started VPN sample + auto-rotate threads")
+    else:
+        logging.info("[VPN-MONITOR] Started network latency sampler (no gluetun configured)")
 
 
 @asynccontextmanager
@@ -143,6 +186,9 @@ async def lifespan(app: FastAPI):
     shared_state.regenerate_m3u()
     shared_state.start_stats_collector()
     streamer_mgr.start_idle_cleanup(interval=60, timeout=300)
+
+    # VPN latency sampling + auto-rotate (only when gluetun is wired in)
+    _start_vpn_threads()
 
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)

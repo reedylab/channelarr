@@ -30,6 +30,10 @@ DEFAULTS = {
     "PG_DB": "channelarr",
     # Selenium-uc sidecar URL
     "SELENIUM_URL": "http://localhost:4445",
+    # Gluetun VPN control (optional — set GLUETUN_CONTROL_URL to enable VPN features)
+    "GLUETUN_CONTROL_URL": "",
+    "GLUETUN_CONTROL_USER": "",
+    "GLUETUN_CONTROL_PASS": "",
 }
 
 

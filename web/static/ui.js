@@ -83,6 +83,7 @@ async function updateStatus() {
       badge.classList.add("hidden");
     }
   } catch(e) {}
+  loadVpnStatus();
 }
 
 // ─── Header buttons ───
@@ -1637,6 +1638,7 @@ async function updateSystemStats() {
     renderDiskGauge();
     renderYTCacheChart();
   } catch(e) {}
+  loadVpnChart();
 }
 
 function renderStatGauges() {
@@ -2199,6 +2201,218 @@ document.addEventListener("DOMContentLoaded", () => {
   const closeBtn = $("#resolver-player-close");
   if (closeBtn) closeBtn.addEventListener("click", closeResolverPlayer);
 });
+
+// ─── VPN ───
+let vpnHistory = [];
+const VPN_MAX_POINTS = 60;
+
+async function loadVpnStatus() {
+  try {
+    const r = await fetch(`${API}/vpn/status`);
+    const d = await r.json();
+    const badge = $("#vpn-badge");
+    if (!d.enabled) {
+      badge.classList.add("hidden");
+      return;
+    }
+    badge.classList.remove("hidden");
+    badge.classList.remove("vpn-connected", "vpn-disconnected", "vpn-unconfigured");
+    if (d.status === "running") {
+      badge.classList.add("vpn-connected");
+      badge.textContent = d.city ? `VPN: ${d.city}` : `VPN: ${d.ip || "connected"}`;
+    } else if (d.status === "not configured") {
+      badge.classList.add("vpn-unconfigured");
+      badge.textContent = "VPN: --";
+    } else {
+      badge.classList.add("vpn-disconnected");
+      badge.textContent = `VPN: ${d.status}`;
+    }
+  } catch(e) {
+    const badge = $("#vpn-badge");
+    badge.classList.add("hidden");
+  }
+}
+
+async function loadVpnChart() {
+  try {
+    const r = await fetch(`${API}/vpn/history?minutes=60`);
+    const v = await r.json();
+    const series = (v.samples || [])
+      .map(x => x.rtt_ms)
+      .filter(x => x !== null && x !== undefined);
+    vpnHistory.length = 0;
+    vpnHistory.push(...series.slice(-VPN_MAX_POINTS));
+    const sum = v.summary || {};
+    const mode = sum.mode || "vpn";
+    const isVpn = mode === "vpn";
+
+    $("#vpn-card-title").textContent = isVpn ? "VPN Latency" : "Network Latency";
+    $("#vpn-live").textContent = sum.current_rtt_ms != null ? sum.current_rtt_ms.toFixed(1) + "ms" : "--ms";
+    if (isVpn) {
+      $("#vpn-exit").textContent = sum.current_city ? `${sum.current_city} \u00b7 ${sum.current_ip || ""}` : "--";
+    } else {
+      $("#vpn-exit").textContent = "Direct connection";
+    }
+    $("#vpn-rotate-btn").style.display = isVpn ? "" : "none";
+    $("#vpn-history-section").style.display = isVpn ? "" : "none";
+
+    // Auto-scale Y to ~120% of observed max (min 100ms)
+    if (vpnHistory.length) {
+      const observed = Math.max(...vpnHistory);
+      const maxMs = Math.max(observed * 1.2, 100);
+      renderVpnChart(vpnHistory, maxMs);
+    } else {
+      const container = $("#vpn-chart");
+      container.innerHTML = '<div class="empty-state">Collecting data...</div>';
+    }
+
+    if (isVpn) loadVpnServers();
+  } catch(e) {}
+}
+
+function renderVpnChart(values, maxVal) {
+  const container = $("#vpn-chart");
+  const W = 600, H = 170;
+  const pad = {l:40, r:10, t:10, b:22};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const n = values.length;
+  const color = "var(--ok)";
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:100%">`;
+  const steps = 4;
+  for (let g = 0; g <= steps; g++) {
+    const y = pad.t + (ch * (1 - g / steps));
+    const label = Math.round(maxVal * g / steps);
+    svg += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" class="chart-grid"/>`;
+    svg += `<text x="${pad.l - 4}" y="${y + 3}" class="chart-label" text-anchor="end">${label}ms</text>`;
+  }
+
+  const pts = values.map((v, i) => {
+    const x = pad.l + (i / Math.max(1, n - 1)) * cw;
+    const y = pad.t + ch * (1 - Math.min(v, maxVal) / maxVal);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  const firstX = pad.l;
+  const lastX = (pad.l + ((n - 1) / Math.max(1, n - 1)) * cw).toFixed(1);
+  const bottom = (pad.t + ch).toFixed(1);
+  svg += `<polygon class="chart-area" fill="${color}" points="${firstX},${bottom} ${pts.join(" ")} ${lastX},${bottom}"/>`;
+  svg += `<polyline class="chart-line" stroke="${color}" points="${pts.join(" ")}"/>`;
+  svg += "</svg>";
+
+  svg += `<div class="chart-tooltip" style="display:none" id="vpn-chart-tip"></div>`;
+  container.innerHTML = svg;
+
+  const svgEl = container.querySelector("svg");
+  const tip = container.querySelector("#vpn-chart-tip");
+  svgEl.addEventListener("mousemove", (e) => {
+    const rect = svgEl.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / rect.width;
+    const adjFrac = (frac * W - pad.l) / cw;
+    const idx = Math.max(0, Math.min(n - 1, Math.round(adjFrac * (n - 1))));
+    tip.textContent = `${values[idx].toFixed(1)}ms`;
+    tip.style.display = "block";
+    tip.style.left = `${e.clientX - rect.left + 12}px`;
+    tip.style.top = `${e.clientY - rect.top - 30}px`;
+  });
+  svgEl.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+}
+
+function vpnFmtDuration(seconds) {
+  if (!seconds || seconds < 60) return (seconds || 0) + "s";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 24) {
+    const d = Math.floor(h / 24);
+    return `${d}d ${h % 24}h`;
+  }
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function vpnFmtRelative(iso) {
+  if (!iso) return "--";
+  const then = new Date(iso).getTime();
+  const sec = Math.floor((Date.now() - then) / 1000);
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.floor(sec / 60) + "m ago";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+  return Math.floor(sec / 86400) + "d ago";
+}
+
+async function loadVpnServers(sort) {
+  sort = sort || ($("#vpn-history-sort") ? $("#vpn-history-sort").value : "avg_rtt");
+  try {
+    const r = await fetch(`${API}/vpn/servers?sort=${sort}&limit=100`);
+    const data = await r.json();
+    const servers = data.servers || [];
+    $("#vpn-history-count").textContent = `${servers.length} server${servers.length === 1 ? "" : "s"}`;
+    const body = $("#vpn-history-body");
+    if (servers.length === 0) {
+      body.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:24px">No server history yet — samples accumulate every minute.</td></tr>`;
+      return;
+    }
+    body.innerHTML = servers.map((s, i) => {
+      const cls = [];
+      if (s.is_current) cls.push("is-current");
+      if (sort === "avg_rtt" && i < 3 && s.avg_rtt_ms != null) cls.push("top-rank");
+      const rankMarker = s.is_current
+        ? '<span class="rank-marker rank-current" title="Current">\u25cf</span>'
+        : (sort === "avg_rtt" && i < 3 && s.avg_rtt_ms != null)
+          ? `<span class="rank-marker rank-gold" title="Top ${i+1}">${["\u2605","\u2461","\u2462"][i]}</span>`
+          : '<span class="rank-marker"></span>';
+      return `<tr class="${cls.join(" ")}">
+        <td>${rankMarker}${esc(s.city || "?")}${s.country ? ", " + esc(s.country) : ""}</td>
+        <td class="ip-cell">${esc(s.ip)}</td>
+        <td>${esc(s.org || "--")}</td>
+        <td class="num">${s.avg_rtt_ms != null ? s.avg_rtt_ms.toFixed(1) : "--"}</td>
+        <td class="num">${s.min_rtt_ms != null ? s.min_rtt_ms.toFixed(1) : "--"}</td>
+        <td class="num">${s.max_rtt_ms != null ? s.max_rtt_ms.toFixed(1) : "--"}</td>
+        <td class="num">${(s.success_rate * 100).toFixed(1)}%</td>
+        <td class="num">${s.total_samples}</td>
+        <td class="num">${vpnFmtDuration(s.total_seconds_connected)}</td>
+        <td>${vpnFmtRelative(s.last_seen_at)}</td>
+      </tr>`;
+    }).join("");
+  } catch(e) {
+    $("#vpn-history-body").innerHTML = `<tr><td colspan="10" style="color:var(--danger);padding:24px">Failed to load: ${e}</td></tr>`;
+  }
+}
+
+// VPN history sort change
+(function() {
+  const histSort = document.getElementById("vpn-history-sort");
+  if (histSort) histSort.addEventListener("change", () => loadVpnServers());
+})();
+
+// VPN rotate button
+(function() {
+  const btn = document.getElementById("vpn-rotate-btn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    if (!confirm("Rotate VPN — picks a new server from your SERVER_CITIES list. Brief connectivity blip while the tunnel reconnects.")) return;
+    btn.disabled = true;
+    const orig = btn.innerHTML;
+    btn.textContent = "Rotating...";
+    try {
+      const r = await fetch(`${API}/vpn/rotate`, {method: "POST"});
+      const j = await r.json();
+      if (j.ok) {
+        toast("success", `Rotated to ${j.to.city || j.to.ip || "new exit"}`);
+        loadVpnChart();
+        loadVpnStatus();
+      } else {
+        toast("error", j.error || "Rotate failed");
+      }
+    } catch(e) {
+      toast("error", "Rotate request failed");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+    }
+  });
+})();
 
 // Initial
 updateStatus();

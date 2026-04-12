@@ -9,5 +9,6 @@ the source of truth for scheduled channels during B1; reads switch in B2.
 from core.models.base import Base
 from core.models.channel import Channel
 from core.models.manifest import Capture, Manifest, Variant, HeaderProfile
+from core.models.vpn_server import VpnServer
 
-__all__ = ["Base", "Channel", "Capture", "Manifest", "Variant", "HeaderProfile"]
+__all__ = ["Base", "Channel", "Capture", "Manifest", "Variant", "HeaderProfile", "VpnServer"]

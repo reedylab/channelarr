@@ -112,6 +112,21 @@ SETTINGS_SCHEMA = {
             },
         },
     },
+    "vpn": {
+        "label": "VPN",
+        "fields": {
+            "vpn_auto_rotate_minutes": {
+                "label": "Auto-Rotate Interval", "type": "select",
+                "options": [
+                    {"value": "0", "label": "Disabled"},
+                    {"value": "30", "label": "Every 30 min"},
+                    {"value": "60", "label": "Every 60 min"},
+                    {"value": "120", "label": "Every 2 hours"},
+                    {"value": "240", "label": "Every 4 hours"},
+                ],
+            },
+        },
+    },
 }
 
 # ── Stats collector ──

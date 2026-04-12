@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=22" />
+  <link rel="stylesheet" href="/static/style.css?v=23" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -24,6 +24,7 @@
       </svg>
     </div>
     <div class="header-actions">
+      <span id="vpn-badge" class="badge vpn-badge hidden">VPN: --</span>
       <span id="streaming-badge" class="streaming-badge hidden" title="Active streams">0 streaming</span>
       <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
       <div class="output-links">
@@ -243,6 +244,52 @@
           <div class="stat-card" id="yt-cache-card">
             <div class="stat-card-header"><h4>YouTube Cache</h4><span class="stat-live" id="yt-cache-live">--</span></div>
             <div class="stat-chart" id="yt-cache-chart"></div>
+          </div>
+          <div class="stat-card vpn-stat-card" id="vpn-card">
+            <div class="stat-card-header">
+              <h4 id="vpn-card-title">VPN Latency</h4>
+              <span class="stat-live" id="vpn-live">--ms</span>
+            </div>
+            <div class="stat-chart" id="vpn-chart"></div>
+            <div class="vpn-stat-footer">
+              <span id="vpn-exit" class="text-muted">--</span>
+              <button id="vpn-rotate-btn" class="btn btn-sm" title="Cycle VPN tunnel — picks a new server from your SERVER_CITIES list">&#x21BB; Rotate</button>
+            </div>
+            <div class="vpn-history-section" id="vpn-history-section">
+              <div class="vpn-history-controls">
+                <h5>Server History</h5>
+                <label>Sort:
+                  <select id="vpn-history-sort" class="filter-status">
+                    <option value="avg_rtt">Best avg latency</option>
+                    <option value="success_rate">Best success rate</option>
+                    <option value="last_seen">Most recently used</option>
+                    <option value="connected">Most time connected</option>
+                    <option value="total_samples">Most samples</option>
+                    <option value="first_seen">Oldest first</option>
+                  </select>
+                </label>
+                <span id="vpn-history-count" class="text-muted"></span>
+              </div>
+              <div class="vpn-history-table-wrap">
+                <table class="tbl vpn-history-tbl" id="vpn-history-table">
+                  <thead>
+                    <tr>
+                      <th>City</th>
+                      <th>IP</th>
+                      <th>Org</th>
+                      <th class="num">Avg</th>
+                      <th class="num">Min</th>
+                      <th class="num">Max</th>
+                      <th class="num">Success</th>
+                      <th class="num">Samples</th>
+                      <th class="num">Connected</th>
+                      <th>Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vpn-history-body"></tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -519,6 +566,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=32"></script>
+  <script src="/static/ui.js?v=33"></script>
 </body>
 </html>
