@@ -589,7 +589,6 @@ class ResolvedChannelStream:
             cmd = [
                 "ffmpeg", "-y",
                 "-loglevel", "error",
-                *ffmpeg_headers,
                 "-allowed_extensions", "ALL",
                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
                 "-i", mini_path,
