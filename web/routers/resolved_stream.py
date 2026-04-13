@@ -77,14 +77,36 @@ def _refresh_and_get_url(mid: str) -> str | None:
     return row[0] if row else None
 
 
-def _proxy_m3u8(mid: str, url: str, _retried: bool = False):
+def _get_source_domain(mid: str) -> str:
+    """Look up the source_domain for a manifest. Used to set the Referer
+    header when proxying upstream requests — some CDNs (e.g. mainstreams.pro)
+    require a valid Referer from the originating site."""
     try:
-        r = http_requests.get(url, headers={"User-Agent": UA}, timeout=15, allow_redirects=True)
+        with get_session() as session:
+            row = session.query(Manifest.source_domain).filter_by(id=mid).first()
+        return row[0] if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _build_headers(source_domain: str) -> dict:
+    """Build request headers for upstream fetches, including Referer if known."""
+    headers = {"User-Agent": UA}
+    if source_domain:
+        headers["Referer"] = f"https://{source_domain}/"
+        headers["Origin"] = f"https://{source_domain}"
+    return headers
+
+
+def _proxy_m3u8(mid: str, url: str, source_domain: str = "", _retried: bool = False):
+    headers = _build_headers(source_domain)
+    try:
+        r = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         if r.status_code in (401, 403) and not _retried:
             logger.warning("[RESOLVED-STREAM] upstream %s for %s — triggering sync refresh", r.status_code, mid)
             new_url = _refresh_and_get_url(mid)
             if new_url and new_url != url:
-                return _proxy_m3u8(mid, new_url, _retried=True)
+                return _proxy_m3u8(mid, new_url, source_domain=source_domain, _retried=True)
         r.raise_for_status()
     except http_requests.HTTPError as e:
         logger.error("[RESOLVED-STREAM] proxy m3u8 failed: %s", e)
@@ -93,6 +115,7 @@ def _proxy_m3u8(mid: str, url: str, _retried: bool = False):
         logger.error("[RESOLVED-STREAM] proxy m3u8 failed: %s", e)
         raise HTTPException(status_code=502)
 
+    ref_param = f"&ref={quote(source_domain, safe='')}" if source_domain else ""
     lines = []
     for line in r.text.splitlines():
         s = line.strip()
@@ -101,14 +124,15 @@ def _proxy_m3u8(mid: str, url: str, _retried: bool = False):
             if any(s.endswith(x) for x in (".m3u8", ".m3u")):
                 s = f"/live-resolved/{mid}.m3u8?src={quote(a, safe='')}"
             else:
-                s = f"/live-resolved/proxy?url={quote(a, safe='')}"
+                s = f"/live-resolved/proxy?url={quote(a, safe='')}{ref_param}"
         lines.append(s)
     return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl")
 
 
-def _proxy_bytes(url: str):
+def _proxy_bytes(url: str, source_domain: str = ""):
+    headers = _build_headers(source_domain)
     try:
-        r = http_requests.get(url, headers={"User-Agent": UA}, stream=True, timeout=15, allow_redirects=True)
+        r = http_requests.get(url, headers=headers, stream=True, timeout=15, allow_redirects=True)
         r.raise_for_status()
     except Exception as e:
         logger.error("[RESOLVED-STREAM] proxy bytes failed: %s", e)
@@ -130,9 +154,12 @@ def _proxy_bytes(url: str):
 def resolved_playlist(manifest_id: str, src: str = Query(default=None)):
     if not MANIFEST_ID_RE.match(manifest_id):
         raise HTTPException(status_code=400)
+
+    source_domain = _get_source_domain(manifest_id)
+
     # Nested playlist fetch (when HLS.js follows a variant) keeps the same mid
     if src:
-        return _proxy_m3u8(manifest_id, src)
+        return _proxy_m3u8(manifest_id, src, source_domain=source_domain)
 
     # Safety net for stale clients: if any active channel using this manifest
     # has transcode_mediated enabled, redirect to the unified /live/ endpoint
@@ -152,11 +179,11 @@ def resolved_playlist(manifest_id: str, src: str = Query(default=None)):
         raise HTTPException(status_code=404)
     url = row[0]
     _touch_access(manifest_id)
-    return _proxy_m3u8(manifest_id, url)
+    return _proxy_m3u8(manifest_id, url, source_domain=source_domain)
 
 
 @router.get("/live-resolved/proxy")
-def resolved_proxy(url: str = Query(default=None)):
+def resolved_proxy(url: str = Query(default=None), ref: str = Query(default="")):
     if not url:
         raise HTTPException(status_code=400)
-    return _proxy_bytes(url)
+    return _proxy_bytes(url, source_domain=ref)
