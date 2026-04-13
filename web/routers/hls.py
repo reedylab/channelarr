@@ -83,11 +83,6 @@ def hls_playlist(channel_id: str):
     stream_status = shared_state.streamer_mgr.get_status(channel_id)
     need_start = not stream_status.get("running", False)
 
-    # If channel is in holding mode (pre-warmed), upgrade to live pipeline
-    # in the background. The client gets the holding pattern's video instantly.
-    if stream_status.get("holding"):
-        shared_state.streamer_mgr.upgrade_holding(channel_id)
-
     if need_start:
         lock = _get_boot_lock(channel_id)
         if not lock.acquire(timeout=95):

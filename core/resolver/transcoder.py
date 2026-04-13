@@ -182,7 +182,6 @@ class ResolvedChannelStream:
         self.audio_bitrate = audio_bitrate
 
         self._enc_proc: Optional[subprocess.Popen] = None
-        self._holding_proc: Optional[subprocess.Popen] = None
         self._poller_thread: Optional[threading.Thread] = None
         self._feeder_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -200,10 +199,8 @@ class ResolvedChannelStream:
     def last_access(self) -> float:
         return self._last_access
 
-    def start_holding(self):
-        """Start only the holding pattern — no poller, no encoder. Used to
-        pre-warm the channel on container startup so clients get instant
-        video. Call upgrade_to_live() when a client actually requests it."""
+    def start(self):
+        """Start the full resolved channel pipeline: poller + feeder + encoder."""
         os.makedirs(self.hls_dir, exist_ok=True)
         for f in os.listdir(self.hls_dir):
             if f.endswith(".ts") or f.endswith(".m3u8"):
@@ -214,13 +211,6 @@ class ResolvedChannelStream:
         self._stop_event.clear()
         self._started_at = time.time()
         self._last_access = time.time()
-        self._start_holding_pattern()
-
-    def upgrade_to_live(self):
-        """Start the real poller+feeder pipeline. The feeder will kill the
-        holding pattern when the first real segment is ready."""
-        if self._feeder_thread and self._feeder_thread.is_alive():
-            return
         self._poller_thread = threading.Thread(
             target=self._poller_loop, daemon=True, name=f"resolved-poller-{self.channel_id}",
         )
@@ -232,69 +222,22 @@ class ResolvedChannelStream:
         logging.info("[RESOLVED-XCODE] Started channel %s (manifest=%s)",
                      self.channel_id, self.manifest_id)
 
-    def downgrade_to_holding(self):
-        """Stop the live pipeline (poller+feeder+encoder) and restart the
-        holding pattern. Used by idle cleanup to return to the pre-warmed
-        state instead of destroying the stream entirely."""
-        self._stop_event.set()
-        if self._enc_proc:
-            try:
-                self._enc_proc.terminate()
-                self._enc_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self._enc_proc.kill()
-                except Exception:
-                    pass
-            self._enc_proc = None
-        # Wait for threads to finish (they check _stop_event)
-        if self._poller_thread and self._poller_thread.is_alive():
-            self._poller_thread.join(timeout=5)
-        if self._feeder_thread and self._feeder_thread.is_alive():
-            self._feeder_thread.join(timeout=5)
-        self._poller_thread = None
-        self._feeder_thread = None
-        try:
-            shutil.rmtree(self._download_dir, ignore_errors=True)
-        except Exception:
-            pass
-        self._download_dir = tempfile.mkdtemp(prefix=f"channelarr-res-{self.channel_id}-")
-        # Restart holding pattern
-        self._stop_event.clear()
-        self._start_holding_pattern()
-        self._last_access = time.time()
-        logging.info("[RESOLVED-XCODE] %s downgraded to holding pattern (idle)", self.channel_id)
-
-    def start(self):
-        """Full start — holding pattern + poller + feeder."""
-        self.start_holding()
-        self.upgrade_to_live()
-
     def status(self) -> dict:
         feeder_alive = (
             self._feeder_thread is not None
             and self._feeder_thread.is_alive()
         )
-        holding_alive = self._holding_proc is not None and self._holding_proc.poll() is None
-        alive = feeder_alive or holding_alive
         uptime = 0
-        if self._started_at and alive:
+        if self._started_at and feeder_alive:
             uptime = int(time.time() - self._started_at)
         return {
-            "running": alive,
+            "running": feeder_alive,
             "uptime": uptime,
-            "holding": holding_alive and not feeder_alive,
-            "now_playing": "Live (transcode-mediated)" if alive else "",
+            "now_playing": "Live (transcode-mediated)" if feeder_alive else "",
         }
 
     def stop(self):
         self._stop_event.set()
-        if self._holding_proc:
-            try:
-                self._holding_proc.kill()
-            except Exception:
-                pass
-            self._holding_proc = None
         if self._enc_proc:
             try:
                 self._enc_proc.terminate()
@@ -321,60 +264,6 @@ class ResolvedChannelStream:
                     os.remove(os.path.join(self.hls_dir, f))
                 except OSError:
                     pass
-
-    # ── Holding pattern ─────────────────────────────────────────────────────
-
-    def _start_holding_pattern(self):
-        """Start a lightweight ffmpeg that loops a cached bump into the HLS
-        directory. Always uses -c copy (no encoding) so the holding pattern
-        costs <1% CPU. Branding watermarks are skipped — they'll appear once
-        the real encoder takes over."""
-        cache_files = [
-            p + ".cache.ts" for p in self.bump_paths
-            if os.path.isfile(p + ".cache.ts")
-        ]
-        if not cache_files:
-            return
-        hold_src = random.choice(cache_files)
-        playlist = os.path.join(self.hls_dir, "stream.m3u8")
-        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
-        cmd = [
-            "ffmpeg", "-y",
-            "-loglevel", "error",
-            "-stream_loop", "-1",
-            "-re",
-            "-i", hold_src,
-            "-c", "copy",
-            "-f", "hls",
-            "-hls_time", str(self.hls_time),
-            "-hls_list_size", "3",
-            "-hls_flags", "delete_segments+omit_endlist",
-            "-hls_segment_filename", segment_pattern,
-            playlist,
-        ]
-        self._holding_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        logging.info("[RESOLVED-XCODE] %s holding pattern started (%s)",
-                     self.channel_id, os.path.basename(hold_src))
-
-    def _stop_holding_pattern(self):
-        """Kill the holding pattern ffmpeg. Called by the feeder loop just
-        before the real encoder starts writing. Leaves the HLS files on disk
-        so clients can keep playing them until the real encoder overwrites."""
-        if not self._holding_proc:
-            return
-        try:
-            self._holding_proc.terminate()
-            self._holding_proc.wait(timeout=3)
-        except Exception:
-            try:
-                self._holding_proc.kill()
-            except Exception:
-                pass
-        self._holding_proc = None
-        logging.info("[RESOLVED-XCODE] %s holding pattern stopped, real encoder taking over",
-                     self.channel_id)
 
     # ── Playlist poller ────────────────────────────────────────────────────
 
@@ -720,10 +609,8 @@ class ResolvedChannelStream:
             except queue.Empty:
                 continue
         if self._stop_event.is_set() or not first_item:
-            self._stop_holding_pattern()
             return
 
-        self._stop_holding_pattern()
         enc_cmd = self._build_combined_encoder_cmd()
         logging.info("[RESOLVED-XCODE] %s combined encoder: %s",
                      self.channel_id, " ".join(enc_cmd))

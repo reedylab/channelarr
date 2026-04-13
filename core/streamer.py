@@ -12,7 +12,6 @@ The first file may be seeked into (via -ss) to match the schedule position.
 
 import json
 import os
-import random
 import subprocess
 import threading
 import time
@@ -29,8 +28,7 @@ class ChannelStream:
                  video_preset: str = "fast", crf: str = "",
                  ffmpeg_threads: str = "1", x264_threads: str = "4",
                  audio_bitrate: str = "192k", show_next: bool = False,
-                 branding_logo_path: str = "",
-                 holding_clips: list = None):
+                 branding_logo_path: str = ""):
         self.channel_id = channel_id
         self.schedule = schedule
         self.start_index = start_index
@@ -48,11 +46,9 @@ class ChannelStream:
         self.audio_bitrate = audio_bitrate
         self.show_next = show_next
         self.branding_logo_path = branding_logo_path
-        self.holding_clips = holding_clips or []
 
         self._enc_proc = None
         self._hls_proc = None
-        self._holding_proc = None
         self._thread = None
         self._stop_event = threading.Event()
         self._started_at = None
@@ -70,120 +66,6 @@ class ChannelStream:
     @property
     def last_access(self) -> float:
         return self._last_access
-
-    # ── Holding pattern ────────────────────────────────────────────────────
-
-    def _start_holding_pattern(self):
-        """Start a lightweight ffmpeg that loops a cached bump into the HLS
-        directory. Always uses -c copy (no encoding) so the holding pattern
-        costs <1% CPU. Branding watermarks are skipped — they'll appear once
-        the real encoder takes over."""
-        if not self.holding_clips:
-            return
-        hold_src = random.choice(self.holding_clips)
-        os.makedirs(self.hls_dir, exist_ok=True)
-        playlist = os.path.join(self.hls_dir, "stream.m3u8")
-        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
-        cmd = [
-            "ffmpeg", "-y",
-            "-loglevel", "error",
-            "-stream_loop", "-1",
-            "-re",
-            "-i", hold_src,
-            "-c", "copy",
-            "-f", "hls",
-            "-hls_time", str(self.hls_time),
-            "-hls_list_size", "3",
-            "-hls_flags", "delete_segments+omit_endlist",
-            "-hls_segment_filename", segment_pattern,
-            playlist,
-        ]
-        self._holding_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        logging.info("[STREAM] %s holding pattern started (%s)",
-                     self.channel_id, os.path.basename(hold_src))
-
-    def _stop_holding_pattern(self):
-        """Kill the holding pattern ffmpeg."""
-        if not self._holding_proc:
-            return
-        try:
-            self._holding_proc.terminate()
-            self._holding_proc.wait(timeout=3)
-        except Exception:
-            try:
-                self._holding_proc.kill()
-            except Exception:
-                pass
-        self._holding_proc = None
-
-    def start_holding(self):
-        """Start only the holding pattern — no encoder, no schedule playback.
-        Used to pre-warm the channel so clients get instant video."""
-        os.makedirs(self.hls_dir, exist_ok=True)
-        for f in os.listdir(self.hls_dir):
-            if f.endswith(".ts") or f.endswith(".m3u8") or f == "concat.txt":
-                try:
-                    os.remove(os.path.join(self.hls_dir, f))
-                except OSError:
-                    pass
-        self._stop_event.clear()
-        self._started_at = time.time()
-        self._last_access = time.time()
-        self._start_holding_pattern()
-
-    def upgrade_to_live(self):
-        """Start the real schedule pipeline. The HLS segmenter will overwrite
-        the holding pattern's output. Holding is killed once the segmenter
-        starts writing."""
-        if self._thread and self._thread.is_alive():
-            return
-        # Recalculate schedule position for current time (may have drifted
-        # while the channel was in holding)
-        if self.channel_mgr:
-            from core.channels import find_schedule_position
-            ch = self.channel_mgr.get_channel(self.channel_id)
-            if ch:
-                idx, seek = find_schedule_position(ch)
-                if idx is not None:
-                    self.start_index = idx
-                    self.start_seek = seek
-        self._stop_event.clear()
-        self._started_at = time.time()
-        self._last_access = time.time()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        logging.info("[STREAM] %s upgraded from holding to live at index %d",
-                     self.channel_id, self.start_index)
-
-    def downgrade_to_holding(self):
-        """Stop the live pipeline and restart the holding pattern. Used by
-        idle cleanup to return to pre-warmed state."""
-        self._stop_event.set()
-        for proc in (self._enc_proc, self._hls_proc):
-            if proc:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        self._enc_proc = None
-        self._hls_proc = None
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
-        self._clean_hls_dir()
-        self._stop_event.clear()
-        self._start_holding_pattern()
-        self._last_access = time.time()
-        logging.info("[STREAM] %s downgraded to holding pattern (idle)",
-                     self.channel_id)
-
-    # ── Full start (no holding, direct to live) ────────────────────────────
 
     def start(self):
         os.makedirs(self.hls_dir, exist_ok=True)
@@ -470,8 +352,6 @@ class ChannelStream:
                 hls_cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
-            # Kill holding pattern now that the real segmenter owns the HLS dir
-            self._stop_holding_pattern()
 
             ts_offset = 0.0
             is_first_file = True
@@ -612,7 +492,6 @@ class ChannelStream:
 
     def stop(self):
         self._stop_event.set()
-        self._stop_holding_pattern()
         for proc in (self._enc_proc, self._hls_proc):
             if proc:
                 try:
@@ -641,17 +520,14 @@ class ChannelStream:
                     pass
 
     def status(self) -> dict:
-        thread_alive = self._thread is not None and self._thread.is_alive()
-        holding_alive = self._holding_proc is not None and self._holding_proc.poll() is None
-        alive = thread_alive or holding_alive
+        alive = self._thread is not None and self._thread.is_alive()
         uptime = 0
         if self._started_at and alive:
             uptime = int(time.time() - self._started_at)
         return {
             "running": alive,
             "uptime": uptime,
-            "holding": holding_alive and not thread_alive,
-            "now_playing": self._current_title if thread_alive else "",
+            "now_playing": self._current_title if alive else "",
         }
 
 
@@ -726,12 +602,7 @@ class StreamerManager:
         if channel_id in self._streams:
             existing = self._streams[channel_id]
             try:
-                st = existing.status()
-                if st.get("holding"):
-                    # Pre-warmed holding pattern — upgrade to live
-                    existing.upgrade_to_live()
-                    return True
-                if st.get("running"):
+                if existing.status().get("running"):
                     return False
             except Exception:
                 pass
@@ -790,142 +661,6 @@ class StreamerManager:
         self._streams[channel_id] = stream
         return True
 
-    def upgrade_holding(self, channel_id: str):
-        """Upgrade a holding-only channel to its full live pipeline."""
-        stream = self._streams.get(channel_id)
-        if stream and hasattr(stream, 'upgrade_to_live'):
-            stream.upgrade_to_live()
-
-    def _resolve_holding_clips(self, bump_config, bump_manager):
-        """Collect pre-cached .cache.ts bump files for holding pattern use."""
-        folders = (bump_config or {}).get("folders") or []
-        if not folders and (bump_config or {}).get("folder"):
-            folders = [bump_config["folder"]]
-        clips = []
-        for folder in folders:
-            try:
-                for clip_path in bump_manager.get_clips(folder):
-                    cache = clip_path + ".cache.ts"
-                    if os.path.isfile(cache):
-                        clips.append(cache)
-            except Exception:
-                continue
-        return clips
-
-    def pre_warm_all(self, channel_mgr, bump_manager, logo_dir="/app/data/logos"):
-        """Start holding patterns for all channels so clients get instant
-        video on first request. Resolved transcode-mediated channels get
-        a ResolvedChannelStream holding, scheduled channels get a
-        ChannelStream holding."""
-        from core.resolver.transcoder import ResolvedChannelStream
-        from core.channels import ffprobe_duration, find_schedule_position
-
-        channels = channel_mgr.list_channels()
-        resolved_count = 0
-        scheduled_count = 0
-        for ch in channels:
-            cid = ch["id"]
-            if cid in self._streams:
-                continue
-
-            bump_config = ch.get("bump_config", {})
-            holding_clips = self._resolve_holding_clips(bump_config, bump_manager)
-
-            # ── Resolved transcode-mediated channels ──
-            if ch.get("type") == "resolved" and ch.get("transcode_mediated"):
-                manifest_id = ch.get("manifest_id")
-                manifest_url = ch.get("manifest_url")
-                if not manifest_id or not manifest_url:
-                    continue
-
-                folders = (bump_config or {}).get("folders") or []
-                if not folders and (bump_config or {}).get("folder"):
-                    folders = [bump_config["folder"]]
-                bump_paths = []
-                bump_durations = {}
-                for folder in folders:
-                    try:
-                        clips = bump_manager.get_clips(folder)
-                    except Exception:
-                        continue
-                    for clip_path in clips:
-                        bump_paths.append(clip_path)
-                        bump_durations[clip_path] = ffprobe_duration(clip_path)
-
-                hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
-                hls_dir = os.path.join(hls_base, cid)
-                logo_path = os.path.join(logo_dir, f"{cid}.png")
-                if not os.path.isfile(logo_path):
-                    logo_path = ""
-
-                stream = ResolvedChannelStream(
-                    channel_id=cid,
-                    manifest_id=manifest_id,
-                    manifest_url=manifest_url,
-                    bump_paths=bump_paths,
-                    bump_durations=bump_durations,
-                    hls_dir=hls_dir,
-                    channel_name=ch.get("name", ""),
-                    logo_path=logo_path,
-                    show_next=bool((bump_config or {}).get("show_next", False)),
-                    profile_name=ch.get("profile_name", "auto"),
-                    branding_logo_path=self._resolve_branding_path(ch.get("branding_logo")),
-                    hls_time=int(self._get("HLS_TIME", "6")),
-                    hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
-                    loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
-                    video_preset=self._get("VIDEO_PRESET", "veryfast"),
-                    crf=self._get("VIDEO_CRF", ""),
-                    ffmpeg_threads=self._get("FFMPEG_THREADS", "1"),
-                    x264_threads=self._get("X264_THREADS", "4"),
-                    audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
-                )
-                stream.start_holding()
-                self._streams[cid] = stream
-                resolved_count += 1
-                continue
-
-            # ── Scheduled channels ──
-            if ch.get("type") != "resolved":
-                if not holding_clips:
-                    continue
-                schedule = ch.get("materialized_schedule", [])
-                if not schedule:
-                    continue
-                idx, seek = find_schedule_position(ch)
-                if idx is None:
-                    continue
-
-                hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
-                hls_dir = os.path.join(hls_base, cid)
-                stream = ChannelStream(
-                    channel_id=cid,
-                    schedule=schedule,
-                    start_index=idx,
-                    start_seek=seek,
-                    hls_dir=hls_dir,
-                    hls_time=int(self._get("HLS_TIME", "6")),
-                    hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
-                    loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
-                    loop=ch.get("loop", True),
-                    channel_mgr=channel_mgr,
-                    video_preset=self._get("VIDEO_PRESET", "veryfast"),
-                    crf=self._get("VIDEO_CRF", ""),
-                    ffmpeg_threads=self._get("FFMPEG_THREADS", "1"),
-                    x264_threads=self._get("X264_THREADS", "4"),
-                    audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
-                    show_next=bool((bump_config or {}).get("show_next", False)),
-                    branding_logo_path=self._resolve_branding_path(ch.get("branding_logo")),
-                    holding_clips=holding_clips,
-                )
-                stream.start_holding()
-                self._streams[cid] = stream
-                scheduled_count += 1
-
-        total = resolved_count + scheduled_count
-        if total:
-            logging.info("[STREAM] Pre-warmed %d channels (%d scheduled, %d resolved)",
-                         total, scheduled_count, resolved_count)
-
     def stop_channel(self, channel_id: str) -> bool:
         stream = self._streams.get(channel_id)
         if not stream:
@@ -957,30 +692,13 @@ class StreamerManager:
         return sum(1 for s in self._streams.values() if s.status()["running"])
 
     def cleanup_idle(self, timeout_seconds: int = 300):
-        """Stop channels that haven't been accessed recently.
-        Holding-only streams (pre-warmed) are exempt — they exist to
-        provide instant startup and should persist until a client upgrades
-        them to live.
-
-        Channels that support holding patterns (resolved transcode-mediated
-        and scheduled channels with cached bumps) are downgraded back to
-        holding instead of being fully stopped."""
+        """Stop channels that haven't been accessed recently."""
         now = time.time()
         to_stop = []
-        to_downgrade = []
         for cid, stream in self._streams.items():
             st = stream.status()
-            if st.get("holding"):
-                continue
             if st.get("running") and (now - stream.last_access) > timeout_seconds:
-                if hasattr(stream, 'downgrade_to_holding'):
-                    to_downgrade.append(cid)
-                else:
-                    to_stop.append(cid)
-        for cid in to_downgrade:
-            stream = self._streams.get(cid)
-            if stream:
-                stream.downgrade_to_holding()
+                to_stop.append(cid)
         for cid in to_stop:
             logging.info("[STREAM] Idle timeout — stopping channel %s", cid)
             self.stop_channel(cid)
