@@ -467,6 +467,7 @@ function openEditor(ch) {
   editorItems = (ch && !isResolved) ? JSON.parse(JSON.stringify(ch.items || [])) : [];
   $("#modal-title").textContent = ch ? (isResolved ? "Edit Resolved Channel" : "Edit Channel") : "New Channel";
   $("#ch-name").value = ch ? ch.name : "";
+  $("#ch-tags").value = ch && ch.tags ? ch.tags.join(", ") : "";
 
   // Toggle scheduled-only vs resolved-only sections
   $("#ch-scheduled-only").style.display = isResolved ? "none" : "";
@@ -483,6 +484,9 @@ function openEditor(ch) {
     $("#ch-resolved-profile").value = ch.profile_name || "auto";
     $("#ch-resolved-encoder-mode").value = ch.encoder_mode || "single";
     loadBrandingDropdown("ch-resolved-branding", ch.branding_logo || "");
+    // Event times — convert ISO to datetime-local format (YYYY-MM-DDTHH:MM)
+    $("#ch-event-start").value = ch.event_start ? ch.event_start.slice(0, 16) : "";
+    $("#ch-event-end").value = ch.event_end ? ch.event_end.slice(0, 16) : "";
   }
 
   const bc = ch ? (ch.bump_config || {}) : {};
@@ -980,6 +984,10 @@ function updateSchedulePreview() {
 });
 // Note: ch-shuffle-mode change listener is set up in the shuffle weights UI section above
 
+function parseTags() {
+  return ($("#ch-tags").value || "").split(",").map(s => s.trim()).filter(Boolean);
+}
+
 async function saveChannel() {
   const name = $("#ch-name").value.trim();
   if (!name) { toast("error", "Channel name required"); return; }
@@ -990,12 +998,17 @@ async function saveChannel() {
   if (isResolved) {
     // Resolved channels: name + transcode_mediated toggle + bump folders + overlay + profile.
     const transcodeOn = $("#ch-resolved-transcode").checked;
+    const evStart = $("#ch-event-start").value;
+    const evEnd = $("#ch-event-end").value;
     data = {
       name,
+      tags: parseTags(),
       transcode_mediated: transcodeOn,
       profile_name: $("#ch-resolved-profile").value || "auto",
       encoder_mode: $("#ch-resolved-encoder-mode").value || "single",
       branding_logo: $("#ch-resolved-branding").value || null,
+      event_start: evStart ? new Date(evStart).toISOString() : null,
+      event_end: evEnd ? new Date(evEnd).toISOString() : null,
     };
     if (transcodeOn) {
       data.bump_config = {
@@ -1027,6 +1040,7 @@ async function saveChannel() {
       shuffle_config: shuffleConfig,
       loop: $("#ch-loop").checked,
       branding_logo: $("#ch-branding").value || null,
+      tags: parseTags(),
     };
   }
 

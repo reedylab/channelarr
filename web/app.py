@@ -144,6 +144,21 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN encoder_mode VARCHAR NOT NULL DEFAULT 'single'"))
                     conn.commit()
                 logging.info("[DB] Added column channels.encoder_mode")
+            if "tags" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN tags JSONB NOT NULL DEFAULT '[]'"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.tags")
+            if "event_start" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN event_start TIMESTAMPTZ"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.event_start")
+            if "event_end" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN event_end TIMESTAMPTZ"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.event_end")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # Start demand-driven refresh worker (only if DB is reachable)
@@ -194,6 +209,18 @@ async def lifespan(app: FastAPI):
 
     # VPN latency sampling + auto-rotate (only when gluetun is wired in)
     _start_vpn_threads()
+
+    # Event channel auto-cleanup (checks every 60s for expired event channels)
+    def _event_cleanup_loop():
+        while True:
+            time.sleep(60)
+            try:
+                from core.channels import cleanup_expired_event_channels
+                cleanup_expired_event_channels()
+            except Exception as e:
+                logging.error("[CLEANUP] event cleanup failed: %s", e)
+    threading.Thread(target=_event_cleanup_loop, daemon=True).start()
+    logging.info("[CLEANUP] Started event channel cleanup thread (60s interval)")
 
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)

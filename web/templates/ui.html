@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=23" />
+  <link rel="stylesheet" href="/static/style.css?v=24" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -355,6 +355,11 @@
             </div>
           </div>
         </div>
+        <div class="setting-field" style="margin-top:8px">
+          <label>Tags</label>
+          <input type="text" id="ch-tags" placeholder="Events, Sports, 24-7" />
+          <div class="muted" style="margin-top:4px;font-size:11px">Comma-separated. Tags control M3U grouping and can trigger auto-cleanup for event channels.</div>
+        </div>
 
         <div id="ch-scheduled-only">
         <div class="modal-three-col">
@@ -444,6 +449,17 @@
               <label>Source URL</label>
               <input type="text" id="ch-resolved-url" readonly />
             </div>
+            <div style="display:flex;gap:12px;margin-top:10px">
+              <div class="setting-field" style="flex:1">
+                <label>Event Start</label>
+                <input type="datetime-local" id="ch-event-start" />
+              </div>
+              <div class="setting-field" style="flex:1">
+                <label>Event End</label>
+                <input type="datetime-local" id="ch-event-end" />
+              </div>
+            </div>
+            <div class="muted" style="margin-top:4px;font-size:11px">Optional. Sets real EPG blocks for the event window. Channels with auto-cleanup tags are deleted after the event ends.</div>
             <label class="toggle-label" style="margin-top:12px">
               <input type="checkbox" id="ch-resolved-transcode" />
               Transcode-mediated streaming (insert bumps during ad breaks)
@@ -575,6 +591,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=34"></script>
+  <script src="/static/ui.js?v=35"></script>
 </body>
 </html>

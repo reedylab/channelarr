@@ -44,9 +44,16 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
         # current_placeholder_block() helper so the EPG and the channel tile
         # always agree on which block is current.
         if ch.get("type") == "resolved":
-            total_programmes += _generate_placeholder_programmes(
-                tv, cid, ch["name"], now, horizon, base_url, is_live=True
-            )
+            ev_start = ch.get("event_start")
+            ev_end = ch.get("event_end")
+            if ev_start and ev_end:
+                total_programmes += _generate_event_programme(
+                    tv, cid, ch, now, horizon, base_url, ev_start, ev_end
+                )
+            else:
+                total_programmes += _generate_placeholder_programmes(
+                    tv, cid, ch["name"], now, horizon, base_url, is_live=True
+                )
             continue
 
         schedule = ch.get("materialized_schedule", [])
@@ -235,6 +242,54 @@ def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: 
         SubElement(prog, "icon", src=logo_url)
         current = stop
         count += 1
+    return count
+
+
+def _generate_event_programme(tv_element, channel_id: str, ch: dict,
+                              window_start, window_end, base_url: str,
+                              ev_start_str: str, ev_end_str: str) -> int:
+    """Generate a real programme block for an event channel, padded with
+    placeholders before and after to fill the EPG window."""
+    ev_start = datetime.fromisoformat(ev_start_str)
+    ev_end = datetime.fromisoformat(ev_end_str)
+    name = ch["name"]
+    tags = ch.get("tags") or []
+    category = tags[0] if tags else "Event"
+    logo_url = f"{base_url}/api/logo/{channel_id}"
+    count = 0
+
+    # Placeholder blocks before the event
+    if ev_start > window_start:
+        count += _generate_placeholder_programmes(
+            tv_element, channel_id, name, window_start, min(ev_start, window_end),
+            base_url, is_live=True
+        )
+
+    # The event block itself (clamp to window)
+    block_start = max(ev_start, window_start)
+    block_end = min(ev_end, window_end)
+    if block_start < block_end:
+        prog = SubElement(tv_element, "programme", attrib={
+            "start": _xmltv_ts(block_start),
+            "stop": _xmltv_ts(block_end),
+            "channel": channel_id,
+        })
+        title_el = SubElement(prog, "title", lang="en")
+        title_el.text = name
+        desc_el = SubElement(prog, "desc", lang="en")
+        desc_el.text = f"{name} — Live Event"
+        cat_el = SubElement(prog, "category", lang="en")
+        cat_el.text = category
+        SubElement(prog, "icon", src=logo_url)
+        count += 1
+
+    # Placeholder blocks after the event
+    if ev_end < window_end:
+        count += _generate_placeholder_programmes(
+            tv_element, channel_id, name, max(ev_end, window_start), window_end,
+            base_url, is_live=True
+        )
+
     return count
 
 

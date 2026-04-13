@@ -49,6 +49,9 @@ def _row_to_dict(row, manifest=None) -> dict:
         "profile_name": getattr(row, "profile_name", "auto") or "auto",
         "encoder_mode": getattr(row, "encoder_mode", "single") or "single",
         "branding_logo": getattr(row, "branding_logo", None),
+        "tags": getattr(row, "tags", None) or [],
+        "event_start": row.event_start.isoformat() if getattr(row, "event_start", None) else None,
+        "event_end": row.event_end.isoformat() if getattr(row, "event_end", None) else None,
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
@@ -229,6 +232,8 @@ def _apply_dict_to_row(row, channel: dict):
         row.transcode_mediated = bool(channel["transcode_mediated"])
     if "branding_logo" in channel:
         row.branding_logo = channel["branding_logo"] or None
+    if "tags" in channel:
+        row.tags = channel["tags"] if isinstance(channel["tags"], list) else []
 
 
 def backfill_resolved_manifests_to_channels():
@@ -277,7 +282,10 @@ class ChannelManager:
     def get_channel(self, channel_id: str) -> dict | None:
         return _db_get_one(channel_id)
 
-    def create_resolved_channel(self, manifest_id: str, name: str | None = None) -> dict | None:
+    def create_resolved_channel(self, manifest_id: str, name: str | None = None,
+                                tags: list | None = None,
+                                event_start: str | None = None,
+                                event_end: str | None = None) -> dict | None:
         """Create a new resolved-type Channel referencing an existing manifest.
 
         Used by the library "Create Channel" flow. The manifest must exist
@@ -328,7 +336,20 @@ class ChannelManager:
                 loop=False,
                 schedule_cycle_duration=0,
                 materialized_schedule=[],
+                tags=tags or [],
             )
+            if event_start:
+                from datetime import datetime as _dt, timezone as _tz
+                try:
+                    row.event_start = _dt.fromisoformat(event_start)
+                except (ValueError, TypeError):
+                    pass
+            if event_end:
+                from datetime import datetime as _dt, timezone as _tz
+                try:
+                    row.event_end = _dt.fromisoformat(event_end)
+                except (ValueError, TypeError):
+                    pass
             session.add(row)
             session.flush()
 
@@ -366,7 +387,7 @@ class ChannelManager:
         return self._update_scheduled(channel_id, existing, data)
 
     def _update_scheduled(self, channel_id: str, existing: dict, data: dict) -> dict | None:
-        for key in ("name", "items", "bump_config", "shuffle", "shuffle_config", "loop", "branding_logo"):
+        for key in ("name", "items", "bump_config", "shuffle", "shuffle_config", "loop", "branding_logo", "tags"):
             if key in data:
                 existing[key] = data[key]
         try:
@@ -398,6 +419,24 @@ class ChannelManager:
                     row.encoder_mode = data["encoder_mode"] or "single"
                 if "branding_logo" in data:
                     row.branding_logo = data["branding_logo"] or None
+                if "tags" in data:
+                    row.tags = data["tags"] if isinstance(data["tags"], list) else []
+                if "event_start" in data:
+                    if data["event_start"]:
+                        try:
+                            row.event_start = datetime.fromisoformat(data["event_start"])
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        row.event_start = None
+                if "event_end" in data:
+                    if data["event_end"]:
+                        try:
+                            row.event_end = datetime.fromisoformat(data["event_end"])
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        row.event_end = None
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None
@@ -773,6 +812,59 @@ def materialize_all_channels(channel_mgr, bump_mgr, media_lib):
         materialize_schedule(ch, bump_mgr, media_library=media_lib)
         channel_mgr.save_channel(ch)
     logging.info("[MATERIALIZE] All %d channels materialized", len(channels))
+
+
+# ---------------------------------------------------------------------------
+# Event channel auto-cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_expired_event_channels():
+    """Delete channels whose event has ended and whose tags include an
+    auto-cleanup tag. Called periodically by a daemon thread."""
+    from core.config import get_tag_config
+    tag_config = get_tag_config()
+    cleanup_tags = {tag for tag, cfg in tag_config.items() if cfg.get("auto_cleanup")}
+    if not cleanup_tags:
+        return
+
+    try:
+        from core.database import get_session
+        from core.models import Channel as ChannelRow, Manifest
+        now = datetime.now(timezone.utc)
+        deleted = []
+        with get_session() as session:
+            rows = (
+                session.query(ChannelRow)
+                .filter(ChannelRow.event_end.isnot(None))
+                .filter(ChannelRow.event_end < now)
+                .all()
+            )
+            for row in rows:
+                channel_tags = set(row.tags or [])
+                if not channel_tags.intersection(cleanup_tags):
+                    continue
+                mid = row.manifest_id
+                cid = row.id
+                session.delete(row)
+                session.flush()
+                # Delete the manifest too if no other channels reference it
+                if mid:
+                    other = session.query(ChannelRow.id).filter(ChannelRow.manifest_id == mid).first()
+                    if not other:
+                        m = session.query(Manifest).filter_by(id=mid).first()
+                        if m:
+                            session.delete(m)
+                deleted.append(cid)
+        if deleted:
+            logging.info("[CLEANUP] Deleted %d expired event channel(s): %s",
+                         len(deleted), ", ".join(deleted))
+            try:
+                from web import shared_state
+                shared_state.regenerate_m3u()
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error("[CLEANUP] Event cleanup failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,13 @@ class Channel(Base):
 
     branding_logo = Column(String, nullable=True)
 
+    # Channel tags for grouping and auto-cleanup behavior
+    tags = Column(JSONB, default=list, nullable=False)
+
+    # Event window for resolved channels (sports games, live broadcasts)
+    event_start = Column(DateTime(timezone=True), nullable=True)
+    event_end = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

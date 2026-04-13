@@ -112,6 +112,16 @@ SETTINGS_SCHEMA = {
             },
         },
     },
+    "channel_tags": {
+        "label": "Channel Tags",
+        "fields": {
+            "CHANNEL_TAG_CONFIG": {
+                "label": "Tag Configuration (JSON)",
+                "type": "textarea",
+                "placeholder": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
+            },
+        },
+    },
     "vpn": {
         "label": "VPN",
         "fields": {
@@ -214,9 +224,10 @@ def regenerate_m3u():
             logo_tag = ""
             if os.path.isfile(logo_path):
                 logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
+            group = (ch.get("tags") or [None])[0] or "Channelarr"
             f.write(
                 f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
-                f'group-title="Channelarr",{name}\n'
+                f'group-title="{group}",{name}\n'
             )
             f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
             chno += 1
@@ -235,9 +246,10 @@ def regenerate_m3u():
             logo_tag = ""
             if os.path.isfile(logo_path):
                 logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
+            group = (ch.get("tags") or [None])[0] or "Channelarr Resolved"
             f.write(
                 f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
-                f'group-title="Channelarr Resolved",{name}\n'
+                f'group-title="{group}",{name}\n'
             )
             if ch.get("transcode_mediated"):
                 f.write(f"{base_url}/live/{cid}/stream.m3u8\n")

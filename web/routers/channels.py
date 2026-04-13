@@ -136,7 +136,12 @@ async def api_create_channel(request: Request):
         manifest_id = data.get("manifest_id")
         if not manifest_id:
             return JSONResponse({"error": "manifest_id required for resolved channel"}, status_code=400)
-        ch = shared_state.channel_mgr.create_resolved_channel(manifest_id, data.get("name"))
+        ch = shared_state.channel_mgr.create_resolved_channel(
+            manifest_id, data.get("name"),
+            tags=data.get("tags"),
+            event_start=data.get("event_start"),
+            event_end=data.get("event_end"),
+        )
         if not ch:
             return JSONResponse({"error": "manifest not found"}, status_code=404)
         shared_state.regenerate_m3u()
@@ -195,6 +200,21 @@ def api_delete_channel(channel_id: str):
         return JSONResponse({"error": "Not found"}, status_code=404)
     shared_state.regenerate_m3u()
     return {"status": "deleted"}
+
+
+@router.get("/channel-tags")
+def api_channel_tags():
+    """Return all known tags (in-use + configured) and tag config."""
+    from core.config import get_tag_config
+    tag_config = get_tag_config()
+    # Collect tags in use across all channels
+    in_use = set()
+    for ch in shared_state.channel_mgr.list_channels():
+        for tag in (ch.get("tags") or []):
+            in_use.add(tag)
+    # Union with configured tags
+    all_tags = sorted(in_use | set(tag_config.keys()))
+    return {"tags": all_tags, "config": tag_config}
 
 
 @router.get("/logo/{channel_id}")

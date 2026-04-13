@@ -30,6 +30,8 @@ DEFAULTS = {
     "PG_DB": "channelarr",
     # Selenium-uc sidecar URL
     "SELENIUM_URL": "http://localhost:4445",
+    # Channel tag behavior config (JSON string)
+    "CHANNEL_TAG_CONFIG": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
     # Gluetun VPN control (optional — set GLUETUN_CONTROL_URL to enable VPN features)
     "GLUETUN_CONTROL_URL": "",
     "GLUETUN_CONTROL_USER": "",
@@ -76,6 +78,16 @@ def get_all_settings() -> dict:
         if val != "":
             result[key] = str(val)
     return result
+
+
+def get_tag_config() -> dict:
+    """Parse CHANNEL_TAG_CONFIG from settings. Returns {tag_name: {auto_cleanup: bool}}."""
+    import json as _json
+    raw = get_setting("CHANNEL_TAG_CONFIG", "{}")
+    try:
+        return _json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
 
 
 def save_settings(data: dict):
