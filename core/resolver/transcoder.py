@@ -183,6 +183,17 @@ class ResolvedChannelStream:
         self.audio_bitrate = audio_bitrate
         self.encoder_mode = encoder_mode  # "single" or "multi"
 
+        # Look up source_domain for Referer headers on upstream requests
+        self.source_domain = ""
+        try:
+            from core.database import get_session
+            from core.models.manifest import Manifest as _M
+            with get_session() as _s:
+                _row = _s.query(_M.source_domain).filter_by(id=manifest_id).first()
+                self.source_domain = (_row[0] if _row and _row[0] else "") or ""
+        except Exception:
+            pass
+
         self._enc_proc: Optional[subprocess.Popen] = None
         self._hls_proc: Optional[subprocess.Popen] = None  # multi mode only
         self._poller_thread: Optional[threading.Thread] = None
@@ -192,6 +203,17 @@ class ResolvedChannelStream:
         self._download_dir = tempfile.mkdtemp(prefix=f"channelarr-res-{channel_id}-")
         self._started_at: Optional[float] = None
         self._last_access = time.time()
+
+    def _upstream_headers(self) -> dict:
+        """Build HTTP headers for upstream requests, including Referer if
+        the source domain is known. Some CDNs (e.g. mainstreams.pro) reject
+        requests without a valid Referer from the originating site."""
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+        if self.source_domain:
+            h["Referer"] = f"https://{self.source_domain}/"
+            h["Origin"] = f"https://{self.source_domain}"
+        return h
 
     # ── Public lifecycle ────────────────────────────────────────────────────
 
@@ -323,7 +345,7 @@ class ResolvedChannelStream:
 
         while not self._stop_event.is_set():
             try:
-                resp = http_requests.get(variant_url, timeout=10)
+                resp = http_requests.get(variant_url, headers=self._upstream_headers(), timeout=10)
                 if resp.status_code in (401, 403):
                     consecutive_403s += 1
                     logging.warning(
@@ -480,7 +502,7 @@ class ResolvedChannelStream:
         """If `url` is a master playlist, pick the highest-bandwidth variant.
         If it's already a variant (no #EXT-X-STREAM-INF), return as-is."""
         try:
-            resp = http_requests.get(url, timeout=10)
+            resp = http_requests.get(url, headers=self._upstream_headers(), timeout=10)
             text = resp.text
         except Exception as e:
             logging.warning("[RESOLVED-XCODE] couldn't fetch master, using as-is: %s", e)
@@ -539,6 +561,15 @@ class ResolvedChannelStream:
         """
         local_path = os.path.join(self._download_dir, f"seg_{seg.seq}.ts")
 
+        # Build ffmpeg -headers string for Referer if source_domain is set
+        ffmpeg_headers = []
+        if self.source_domain:
+            ffmpeg_headers = [
+                "-headers",
+                f"Referer: https://{self.source_domain}/\r\n"
+                f"Origin: https://{self.source_domain}\r\n",
+            ]
+
         if seg.key_method == "AES-128" and seg.key_uri:
             # Build a tiny one-segment playlist so ffmpeg's HLS demuxer
             # picks up the key URI and decrypts the segment.
@@ -558,6 +589,7 @@ class ResolvedChannelStream:
             cmd = [
                 "ffmpeg", "-y",
                 "-loglevel", "error",
+                *ffmpeg_headers,
                 "-allowed_extensions", "ALL",
                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
                 "-i", mini_path,
@@ -580,6 +612,7 @@ class ResolvedChannelStream:
             cmd = [
                 "ffmpeg", "-y",
                 "-loglevel", "error",
+                *ffmpeg_headers,
                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
                 "-i", seg.uri,
                 "-c", "copy",
