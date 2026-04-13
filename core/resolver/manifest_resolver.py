@@ -8,6 +8,8 @@ in channelarr's resolver Postgres tables (parallel to existing JSON storage).
 import hashlib
 import logging
 import re
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urljoin
 
@@ -25,6 +27,54 @@ _status = {"running": False, "last_url": None, "last_error": None, "last_manifes
 
 # Batch state
 _batch = {"running": False, "total": 0, "completed": 0, "current_url": None, "results": []}
+
+# ── Circuit breaker for sidecar calls ──────────────────────────────────
+# Tracks consecutive failures per page_url. After MAX_FAILURES, the URL is
+# blocked for COOLDOWN_SECONDS to prevent one bad source from DOS-ing the
+# sidecar and starving legitimate refresh requests.
+_CB_MAX_FAILURES = 3
+_CB_COOLDOWN_SECONDS = 600  # 10 minutes
+_circuit_breaker: dict[str, dict] = {}  # page_url -> {"failures": int, "blocked_until": float}
+_cb_lock = threading.Lock()
+
+# ── In-flight dedup ────────────────────────────────────────────────────
+# If a resolve/refresh is already in progress for a page_url, subsequent
+# callers wait for it instead of queuing another sidecar capture.
+_inflight: dict[str, threading.Event] = {}  # page_url -> Event (set when done)
+_inflight_results: dict[str, dict] = {}     # page_url -> result dict
+_inflight_lock = threading.Lock()
+
+
+def _cb_check(page_url: str) -> str | None:
+    """Return an error string if this URL is circuit-broken, else None."""
+    with _cb_lock:
+        cb = _circuit_breaker.get(page_url)
+        if not cb:
+            return None
+        if cb["blocked_until"] and time.time() < cb["blocked_until"]:
+            remaining = int(cb["blocked_until"] - time.time())
+            return f"Circuit breaker: {page_url} blocked for {remaining}s after {cb['failures']} consecutive failures"
+        # Cooldown expired — reset
+        if cb["blocked_until"] and time.time() >= cb["blocked_until"]:
+            del _circuit_breaker[page_url]
+    return None
+
+
+def _cb_record_failure(page_url: str):
+    """Record a capture failure. Trips the breaker after MAX_FAILURES."""
+    with _cb_lock:
+        cb = _circuit_breaker.setdefault(page_url, {"failures": 0, "blocked_until": 0})
+        cb["failures"] += 1
+        if cb["failures"] >= _CB_MAX_FAILURES:
+            cb["blocked_until"] = time.time() + _CB_COOLDOWN_SECONDS
+            logger.warning("[RESOLVER] Circuit breaker tripped for %s — blocked for %ds after %d failures",
+                           page_url, _CB_COOLDOWN_SECONDS, cb["failures"])
+
+
+def _cb_record_success(page_url: str):
+    """Clear the circuit breaker on success."""
+    with _cb_lock:
+        _circuit_breaker.pop(page_url, None)
 
 
 def _default_resolved_name(title: str | None, manifest_url: str, source_domain: str | None) -> str:
@@ -210,9 +260,33 @@ class ManifestResolverService:
         If existing_manifest_id is provided, the specified row is updated in place
         (used for token refresh — keeps the same manifest ID so streams don't break).
         """
+        # Circuit breaker — reject if this URL has failed too many times recently
+        cb_err = _cb_check(url)
+        if cb_err:
+            logger.info("[RESOLVER] %s", cb_err)
+            return {"ok": False, "manifest_id": existing_manifest_id, "manifest_url": None, "error": cb_err}
+
+        # In-flight dedup — if another thread is already resolving this URL, wait for it
+        with _inflight_lock:
+            if url in _inflight:
+                event = _inflight[url]
+                logger.info("[RESOLVER] Waiting on in-flight resolve for %s", url)
+            else:
+                event = None
+                _inflight[url] = threading.Event()
+
+        if event:
+            event.wait(timeout=timeout + 45)
+            result = _inflight_results.pop(url, None)
+            if result:
+                return result
+            return {"ok": False, "manifest_id": existing_manifest_id, "manifest_url": None,
+                    "error": "In-flight resolve timed out"}
+
         _status["running"] = True
         _status["last_url"] = url
         _status["last_error"] = None
+        result = None
 
         try:
             capture = _call_sidecar(url, timeout)
@@ -220,13 +294,15 @@ class ManifestResolverService:
             if not capture.get("ok"):
                 err = capture.get("error", "Unknown error from sidecar")
                 _status["last_error"] = err
-                return {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+                result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+                return result
 
             body_text = _sanitize_body(capture.get("body"))
             if not body_text or "#EXTM3U" not in body_text:
                 err = "Captured body is not valid HLS"
                 _status["last_error"] = err
-                return {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+                result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+                return result
 
             # Build context with heartbeat info
             context = {}
@@ -261,33 +337,47 @@ class ManifestResolverService:
             expires_at = parse_body_expiry(body_text, manifest_url) or (now_utc + timedelta(minutes=30))
             logger.info("[RESOLVER] Manifest resolved and stored: %s -> %s (expires %s)",
                         url, manifest_id, expires_at.isoformat())
-            # Regenerate M3U so the channel shows up in the export right away
             try:
                 from web import shared_state
                 shared_state.regenerate_m3u()
             except Exception as e:
                 logger.debug("[RESOLVER] regenerate_m3u after resolve failed: %s", e)
-            return {
+            result = {
                 "ok": True,
                 "manifest_id": manifest_id,
                 "manifest_url": manifest_url,
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "error": None,
             }
+            return result
 
         except http_requests.exceptions.RequestException as e:
             err = f"Sidecar communication failed: {e}"
             logger.exception("Sidecar call failed for %s", url)
             _status["last_error"] = err
-            return {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+            result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
+            return result
 
         except Exception as e:
             logger.exception("Resolve failed for %s", url)
             _status["last_error"] = str(e)
-            return {"ok": False, "manifest_id": None, "manifest_url": None, "error": str(e)}
+            result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": str(e)}
+            return result
 
         finally:
             _status["running"] = False
+            # Circuit breaker bookkeeping
+            if result and result.get("ok"):
+                _cb_record_success(url)
+            elif result:
+                _cb_record_failure(url)
+            # Signal in-flight waiters
+            with _inflight_lock:
+                evt = _inflight.pop(url, None)
+            if evt:
+                if result:
+                    _inflight_results[url] = result
+                evt.set()
 
     @staticmethod
     def refresh_manifest(manifest_id: str, timeout: int = 60) -> dict:

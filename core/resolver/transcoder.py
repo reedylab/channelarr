@@ -348,6 +348,13 @@ class ResolvedChannelStream:
                 resp = http_requests.get(variant_url, headers=self._upstream_headers(), timeout=10)
                 if resp.status_code in (401, 403):
                     consecutive_403s += 1
+                    if consecutive_403s > 3:
+                        logging.error(
+                            "[RESOLVED-XCODE] %s giving up after %d consecutive auth failures",
+                            self.channel_id, consecutive_403s,
+                        )
+                        self._stop_event.set()
+                        break
                     logging.warning(
                         "[RESOLVED-XCODE] %s variant HTTP %d (#%d) — refreshing manifest",
                         self.channel_id, resp.status_code, consecutive_403s,
