@@ -102,7 +102,7 @@ def _proxy_m3u8(mid: str, url: str, source_domain: str = "", _retried: bool = Fa
     headers = _build_headers(source_domain)
     try:
         r = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        if r.status_code in (401, 403) and not _retried:
+        if r.status_code in (401, 403, 404) and not _retried:
             logger.warning("[RESOLVED-STREAM] upstream %s for %s — triggering sync refresh", r.status_code, mid)
             new_url = _refresh_and_get_url(mid)
             if new_url and new_url != url:
