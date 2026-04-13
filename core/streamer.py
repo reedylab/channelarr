@@ -75,45 +75,29 @@ class ChannelStream:
 
     def _start_holding_pattern(self):
         """Start a lightweight ffmpeg that loops a cached bump into the HLS
-        directory. Produces segments instantly (-c copy) so the client gets
-        video within ~1 second. The real encoder kills this when it starts."""
+        directory. Always uses -c copy (no encoding) so the holding pattern
+        costs <1% CPU. Branding watermarks are skipped — they'll appear once
+        the real encoder takes over."""
         if not self.holding_clips:
             return
         hold_src = random.choice(self.holding_clips)
         os.makedirs(self.hls_dir, exist_ok=True)
         playlist = os.path.join(self.hls_dir, "stream.m3u8")
         segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
-        use_wm = self.branding_logo_path and os.path.isfile(self.branding_logo_path)
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "error",
             "-stream_loop", "-1",
             "-re",
             "-i", hold_src,
-        ]
-        if use_wm:
-            cmd.extend(["-loop", "1", "-i", self.branding_logo_path])
-            vf = (
-                f"[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.6[wm];"
-                f"[0:v]null[main];"
-                f"[main][wm]overlay=W-w-20:H-h-20:shortest=1"
-            )
-            cmd.extend([
-                "-filter_complex", vf,
-                "-map", "0:a:0?",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-c:a", "aac",
-            ])
-        else:
-            cmd.extend(["-c", "copy"])
-        cmd.extend([
+            "-c", "copy",
             "-f", "hls",
             "-hls_time", str(self.hls_time),
             "-hls_list_size", "3",
             "-hls_flags", "delete_segments+omit_endlist",
             "-hls_segment_filename", segment_pattern,
             playlist,
-        ])
+        ]
         self._holding_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
