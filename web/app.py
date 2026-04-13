@@ -139,6 +139,11 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN profile_name VARCHAR NOT NULL DEFAULT 'auto'"))
                     conn.commit()
                 logging.info("[DB] Added column channels.profile_name (B6.2)")
+            if "encoder_mode" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN encoder_mode VARCHAR NOT NULL DEFAULT 'single'"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.encoder_mode")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # Start demand-driven refresh worker (only if DB is reachable)

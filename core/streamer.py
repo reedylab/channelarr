@@ -587,7 +587,8 @@ class StreamerManager:
                                 bump_manager, channel_name: str = "",
                                 logo_dir: str = "/app/data/logos",
                                 profile_name: str = "auto",
-                                branding_logo_path: str = "") -> bool:
+                                branding_logo_path: str = "",
+                                encoder_mode: str = "single") -> bool:
         """Start a transcode-mediated resolved channel.
 
         Builds a ResolvedChannelStream that polls the upstream playlist,
@@ -656,6 +657,7 @@ class StreamerManager:
             ffmpeg_threads=self._get("FFMPEG_THREADS", "1"),
             x264_threads=self._get("X264_THREADS", "4"),
             audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
+            encoder_mode=encoder_mode,
         )
         stream.start()
         self._streams[channel_id] = stream

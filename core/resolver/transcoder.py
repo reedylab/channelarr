@@ -159,6 +159,7 @@ class ResolvedChannelStream:
         ffmpeg_threads: str = "1",
         x264_threads: str = "4",
         audio_bitrate: str = TARGET_AUDIO_BITRATE,
+        encoder_mode: str = "single",
     ):
         self.channel_id = channel_id
         self.manifest_id = manifest_id
@@ -180,8 +181,10 @@ class ResolvedChannelStream:
         self.ffmpeg_threads = ffmpeg_threads
         self.x264_threads = x264_threads
         self.audio_bitrate = audio_bitrate
+        self.encoder_mode = encoder_mode  # "single" or "multi"
 
         self._enc_proc: Optional[subprocess.Popen] = None
+        self._hls_proc: Optional[subprocess.Popen] = None  # multi mode only
         self._poller_thread: Optional[threading.Thread] = None
         self._feeder_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -238,16 +241,18 @@ class ResolvedChannelStream:
 
     def stop(self):
         self._stop_event.set()
-        if self._enc_proc:
-            try:
-                self._enc_proc.terminate()
-                self._enc_proc.wait(timeout=5)
-            except Exception:
+        for proc in (self._enc_proc, self._hls_proc):
+            if proc:
                 try:
-                    self._enc_proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5)
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         self._enc_proc = None
+        self._hls_proc = None
         self._clean_hls_dir()
         try:
             shutil.rmtree(self._download_dir, ignore_errors=True)
@@ -594,11 +599,14 @@ class ResolvedChannelStream:
 
     def _feeder_loop(self):
         try:
-            self._feeder_loop_inner()
+            if self.encoder_mode == "multi":
+                self._feeder_loop_multi()
+            else:
+                self._feeder_loop_single()
         finally:
             self._clean_hls_dir()
 
-    def _feeder_loop_inner(self):
+    def _feeder_loop_single(self):
         # Wait for the first item before starting the real encoder.
         # The holding pattern serves video to clients in the meantime.
         first_item = None
@@ -694,6 +702,83 @@ class ResolvedChannelStream:
                     except Exception:
                         pass
                 self._enc_proc = None
+
+    # ── Multi-encoder feeder loop ──────────────────────────────────────────
+    # Per-item encoder + separate HLS segmenter. Each source file gets its
+    # own short-lived ffmpeg encoder that re-encodes to MPEG-TS on stdout,
+    # piped into a long-running HLS segmenter. This avoids the PSI/PMT
+    # mismatch issues of single-encoder mode at the cost of brief seams
+    # at segment boundaries.
+
+    def _feeder_loop_multi(self):
+        hls_cmd = self._build_hls_cmd()
+        logging.info("[RESOLVED-XCODE] %s HLS segmenter (multi mode): %s",
+                     self.channel_id, " ".join(hls_cmd))
+        self._hls_proc = subprocess.Popen(
+            hls_cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+        ts_offset = 0.0
+        while not self._stop_event.is_set():
+            try:
+                item = self._segment_queue.get(timeout=10)
+            except queue.Empty:
+                continue
+
+            logging.info("[RESOLVED-XCODE] %s encode: %s (%s, %.1fs)",
+                         self.channel_id, item.label, item.kind, item.duration)
+            enc_cmd = self._build_per_item_encoder_cmd(item, ts_offset)
+            file_start = time.time()
+
+            try:
+                self._enc_proc = subprocess.Popen(
+                    enc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                while not self._stop_event.is_set():
+                    chunk = self._enc_proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    try:
+                        self._hls_proc.stdin.write(chunk)
+                    except (BrokenPipeError, OSError):
+                        logging.error("[RESOLVED-XCODE] %s HLS pipe broke", self.channel_id)
+                        self._stop_event.set()
+                        break
+                self._enc_proc.stdout.close()
+                self._enc_proc.wait()
+                rc = self._enc_proc.returncode
+                file_elapsed = time.time() - file_start
+                if rc != 0 and not self._stop_event.is_set():
+                    err = self._enc_proc.stderr.read().decode("utf-8", errors="replace")[-300:]
+                    logging.warning("[RESOLVED-XCODE] %s encoder rc=%d for %s: %s",
+                                    self.channel_id, rc, item.label, err)
+                else:
+                    ts_offset += file_elapsed
+                if self._enc_proc and self._enc_proc.stderr:
+                    self._enc_proc.stderr.close()
+            except Exception as e:
+                logging.error("[RESOLVED-XCODE] %s encoder failed for %s: %s",
+                              self.channel_id, item.label, e)
+            finally:
+                self._enc_proc = None
+                if item.kind == "upstream":
+                    try:
+                        os.remove(item.source_path)
+                    except OSError:
+                        pass
+
+        if self._hls_proc and self._hls_proc.stdin:
+            try:
+                self._hls_proc.stdin.close()
+            except Exception:
+                pass
+        if self._hls_proc:
+            try:
+                self._hls_proc.wait(timeout=5)
+            except Exception:
+                pass
+            self._hls_proc = None
 
     def _feed_upstream_file(self, item: QueueItem):
         """Copy bytes from a downloaded upstream segment file directly into
@@ -838,6 +923,101 @@ class ResolvedChannelStream:
             "-hls_flags", "delete_segments+omit_endlist",
             "-hls_segment_filename", segment_pattern,
             playlist,
+        ])
+        if self.crf:
+            idx = cmd.index("-profile:v")
+            cmd.insert(idx, self.crf)
+            cmd.insert(idx, "-crf")
+        return cmd
+
+    def _build_hls_cmd(self) -> list:
+        """HLS segmenter for multi mode — reads MPEG-TS from stdin, copies
+        to HLS segment files."""
+        playlist = os.path.join(self.hls_dir, "stream.m3u8")
+        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
+        return [
+            "ffmpeg", "-y",
+            "-loglevel", self.loglevel,
+            "-f", "mpegts",
+            "-i", "pipe:0",
+            "-c", "copy",
+            "-f", "hls",
+            "-hls_time", str(self.hls_time),
+            "-hls_list_size", str(self.hls_list_size),
+            "-hls_flags", "delete_segments+omit_endlist",
+            "-hls_segment_filename", segment_pattern,
+            playlist,
+        ]
+
+    def _build_per_item_encoder_cmd(self, item: QueueItem, ts_offset: float) -> list:
+        """Per-source encoder for multi mode — re-encodes one file to MPEG-TS
+        on stdout for the HLS segmenter to consume."""
+        base_vf = (
+            f"scale=w={TARGET_WIDTH}:h={TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        )
+        use_poster = (
+            item.kind == "bump"
+            and self.show_next
+            and item.cue_remaining_at_start
+            and self.logo_path
+            and os.path.isfile(self.logo_path)
+        )
+        use_watermark = (
+            not use_poster
+            and self.branding_logo_path
+            and os.path.isfile(self.branding_logo_path)
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-threads", self.ffmpeg_threads,
+            "-loglevel", self.loglevel,
+            "-re",
+            "-i", item.source_path,
+        ]
+        if use_poster:
+            cmd.extend(["-i", self.logo_path])
+        if item.kind == "bump" and item.duration > 0:
+            cmd.extend(["-t", f"{item.duration:.3f}"])
+
+        if use_poster:
+            overlay_vf = self._build_overlay_vf(item, base_vf)
+            cmd.extend([
+                "-filter_complex",
+                f"[0:v]{overlay_vf}[vout];[1:v]scale=200:-1[poster];"
+                f"[vout][poster]overlay=W-230:30",
+                "-map", "0:a:0?",
+            ])
+        elif use_watermark:
+            cmd.extend(["-loop", "1", "-i", self.branding_logo_path])
+            wm_filter = (
+                f"[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.6[wm];"
+                f"[0:v]{base_vf}[main];"
+                f"[main][wm]overlay=W-w-20:H-h-20:shortest=1"
+            )
+            cmd.extend(["-filter_complex", wm_filter, "-map", "0:a:0?"])
+        else:
+            vf = base_vf
+            if item.kind == "bump" and self.show_next:
+                vf = self._build_overlay_vf(item, base_vf)
+            cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?", "-vf", vf])
+
+        cmd.extend([
+            "-r", str(TARGET_FPS),
+            "-c:v", "libx264",
+            "-x264-params", f"threads={self.x264_threads}",
+            "-preset", self.video_preset,
+            "-profile:v", TARGET_VIDEO_PROFILE,
+            "-pix_fmt", "yuv420p",
+            "-force_key_frames", f"expr:gte(t,n_forced*{self.hls_time})",
+            "-c:a", "aac",
+            "-b:a", self.audio_bitrate,
+            "-ar", str(TARGET_AUDIO_RATE),
+            "-ac", str(TARGET_AUDIO_CHANNELS),
+            "-output_ts_offset", f"{ts_offset:.3f}",
+            "-f", "mpegts",
+            "pipe:1",
         ])
         if self.crf:
             idx = cmd.index("-profile:v")

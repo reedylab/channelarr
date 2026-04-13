@@ -66,6 +66,11 @@ class Channel(Base):
     # segments — used by WSPA News and other local affiliates).
     profile_name = Column(String, nullable=False, default="auto")
 
+    # Encoder pipeline mode for transcode-mediated resolved channels.
+    # "single" = one long-running encoder (seamless, best for short segments)
+    # "multi" = per-item encoder + HLS segmenter (robust, best for Adult Swim)
+    encoder_mode = Column(String, nullable=False, default="single")
+
     branding_logo = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

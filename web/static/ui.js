@@ -481,6 +481,7 @@ function openEditor(ch) {
     loadResolvedBumpFolders(selected);
     $("#ch-resolved-shownext").checked = !!bc.show_next;
     $("#ch-resolved-profile").value = ch.profile_name || "auto";
+    $("#ch-resolved-encoder-mode").value = ch.encoder_mode || "single";
     loadBrandingDropdown("ch-resolved-branding", ch.branding_logo || "");
   }
 
@@ -993,6 +994,7 @@ async function saveChannel() {
       name,
       transcode_mediated: transcodeOn,
       profile_name: $("#ch-resolved-profile").value || "auto",
+      encoder_mode: $("#ch-resolved-encoder-mode").value || "single",
       branding_logo: $("#ch-resolved-branding").value || null,
     };
     if (transcodeOn) {
