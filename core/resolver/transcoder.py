@@ -754,7 +754,9 @@ class ResolvedChannelStream:
                     logging.warning("[RESOLVED-XCODE] %s encoder rc=%d for %s: %s",
                                     self.channel_id, rc, item.label, err)
                 else:
-                    ts_offset += file_elapsed
+                    # Use content duration for offset (not wall-clock, since
+                    # -re is removed and encoding is faster than realtime)
+                    ts_offset += item.duration if item.duration > 0 else file_elapsed
                 if self._enc_proc and self._enc_proc.stderr:
                     self._enc_proc.stderr.close()
             except Exception as e:
@@ -973,7 +975,6 @@ class ResolvedChannelStream:
             "ffmpeg", "-y",
             "-threads", self.ffmpeg_threads,
             "-loglevel", self.loglevel,
-            "-re",
             "-i", item.source_path,
         ]
         if use_poster:
