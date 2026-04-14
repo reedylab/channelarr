@@ -222,6 +222,13 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=_event_cleanup_loop, daemon=True).start()
     logging.info("[CLEANUP] Started event channel cleanup thread (60s interval)")
 
+    # Scraper plugin scheduler
+    try:
+        from core.scraper_runner import start_scraper_scheduler
+        start_scraper_scheduler()
+    except Exception as e:
+        logging.warning("[SCRAPER] Scheduler startup failed: %s", e)
+
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)
 

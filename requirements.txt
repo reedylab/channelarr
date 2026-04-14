@@ -7,3 +7,4 @@ yt-dlp>=2026.1.1
 psutil>=5.9.0
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
+apscheduler>=3.10

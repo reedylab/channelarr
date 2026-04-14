@@ -32,6 +32,8 @@ DEFAULTS = {
     "SELENIUM_URL": "http://localhost:4445",
     # Channel tag behavior config (JSON string)
     "CHANNEL_TAG_CONFIG": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
+    # Scraper plugin config (JSON string)
+    "SCRAPER_CONFIG": '{}',
     # Gluetun VPN control (optional — set GLUETUN_CONTROL_URL to enable VPN features)
     "GLUETUN_CONTROL_URL": "",
     "GLUETUN_CONTROL_USER": "",
@@ -84,6 +86,16 @@ def get_tag_config() -> dict:
     """Parse CHANNEL_TAG_CONFIG from settings. Returns {tag_name: {auto_cleanup: bool}}."""
     import json as _json
     raw = get_setting("CHANNEL_TAG_CONFIG", "{}")
+    try:
+        return _json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def get_scraper_config() -> dict:
+    """Parse SCRAPER_CONFIG from settings. Returns {scrapers: {name: {enabled, interval_hours, ...}}}."""
+    import json as _json
+    raw = get_setting("SCRAPER_CONFIG", "{}")
     try:
         return _json.loads(raw)
     except (ValueError, TypeError):
