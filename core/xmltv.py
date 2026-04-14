@@ -245,27 +245,67 @@ def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: 
     return count
 
 
+def _get_epg_tz():
+    """Return the configured EPG display timezone."""
+    from core.config import get_setting
+    tz_name = get_setting("EPG_TIMEZONE", "America/New_York")
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def _format_local_time(dt, tz) -> str:
+    """Format a datetime as a readable local time string like '7:15 PM'."""
+    local = dt.astimezone(tz)
+    return local.strftime("%-I:%M %p")
+
+
 def _generate_event_programme(tv_element, channel_id: str, ch: dict,
                               window_start, window_end, base_url: str,
                               ev_start_str: str, ev_end_str: str) -> int:
-    """Generate a real programme block for an event channel, padded with
-    placeholders before and after to fill the EPG window."""
+    """Generate descriptive EPG blocks for an event channel.
+
+    Three phases:
+      - Before event: "Starts at 7:15 PM" in 30-min blocks
+      - During event: single block with event title
+      - After event:  "Event Ended" in 30-min blocks
+    """
     ev_start = datetime.fromisoformat(ev_start_str)
     ev_end = datetime.fromisoformat(ev_end_str)
     name = ch["name"]
     tags = ch.get("tags") or []
     category = tags[0] if tags else "Event"
     logo_url = f"{base_url}/api/logo/{channel_id}"
+    epg_tz = _get_epg_tz()
+    local_start = _format_local_time(ev_start, epg_tz)
     count = 0
 
-    # Placeholder blocks before the event
+    # ── Pre-event blocks: "Starts at 7:15 PM" ──
     if ev_start > window_start:
-        count += _generate_placeholder_programmes(
-            tv_element, channel_id, name, window_start, min(ev_start, window_end),
-            base_url, is_live=True
-        )
+        pre_end = min(ev_start, window_end)
+        block = timedelta(minutes=30)
+        block_start_minute = (window_start.minute // 30) * 30
+        current = window_start.replace(minute=block_start_minute, second=0, microsecond=0)
+        while current < pre_end:
+            stop = min(current + block, pre_end)
+            prog = SubElement(tv_element, "programme", attrib={
+                "start": _xmltv_ts(current),
+                "stop": _xmltv_ts(stop),
+                "channel": channel_id,
+            })
+            title_el = SubElement(prog, "title", lang="en")
+            title_el.text = f"{name} — Starts at {local_start}"
+            desc_el = SubElement(prog, "desc", lang="en")
+            desc_el.text = f"{name} begins at {local_start}."
+            cat_el = SubElement(prog, "category", lang="en")
+            cat_el.text = category
+            SubElement(prog, "icon", src=logo_url)
+            current = stop
+            count += 1
 
-    # The event block itself (clamp to window)
+    # ── Event block ──
     block_start = max(ev_start, window_start)
     block_end = min(ev_end, window_end)
     if block_start < block_end:
@@ -277,18 +317,39 @@ def _generate_event_programme(tv_element, channel_id: str, ch: dict,
         title_el = SubElement(prog, "title", lang="en")
         title_el.text = name
         desc_el = SubElement(prog, "desc", lang="en")
-        desc_el.text = f"{name} — Live Event"
+        desc_el.text = f"{name} — Live"
         cat_el = SubElement(prog, "category", lang="en")
         cat_el.text = category
         SubElement(prog, "icon", src=logo_url)
         count += 1
 
-    # Placeholder blocks after the event
+    # ── Post-event blocks: "Event Ended" ──
     if ev_end < window_end:
-        count += _generate_placeholder_programmes(
-            tv_element, channel_id, name, max(ev_end, window_start), window_end,
-            base_url, is_live=True
-        )
+        post_start = max(ev_end, window_start)
+        block = timedelta(minutes=30)
+        block_start_minute = (post_start.minute // 30) * 30
+        current = post_start.replace(minute=block_start_minute, second=0, microsecond=0)
+        if current < post_start:
+            current += block
+        # Use ev_end directly if it doesn't align to a block boundary
+        if current > post_start:
+            current = post_start
+        while current < window_end:
+            stop = current + block
+            prog = SubElement(tv_element, "programme", attrib={
+                "start": _xmltv_ts(current),
+                "stop": _xmltv_ts(stop),
+                "channel": channel_id,
+            })
+            title_el = SubElement(prog, "title", lang="en")
+            title_el.text = f"{name} — Event Ended"
+            desc_el = SubElement(prog, "desc", lang="en")
+            desc_el.text = f"{name} has ended."
+            cat_el = SubElement(prog, "category", lang="en")
+            cat_el.text = category
+            SubElement(prog, "icon", src=logo_url)
+            current = stop
+            count += 1
 
     return count
 

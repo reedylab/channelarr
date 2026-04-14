@@ -32,6 +32,8 @@ DEFAULTS = {
     "SELENIUM_URL": "http://localhost:4445",
     # Channel tag behavior config (JSON string)
     "CHANNEL_TAG_CONFIG": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
+    # EPG display timezone (for event time formatting in descriptions)
+    "EPG_TIMEZONE": "America/New_York",
     # Scraper plugin config (JSON string)
     "SCRAPER_CONFIG": '{}',
     # Gluetun VPN control (optional — set GLUETUN_CONTROL_URL to enable VPN features)

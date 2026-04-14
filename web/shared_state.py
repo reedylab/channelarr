@@ -51,6 +51,7 @@ SETTINGS_SCHEMA = {
                 ],
             },
             "BASE_URL": {"label": "Base URL", "type": "text", "placeholder": "http://your-server-ip:5045"},
+            "EPG_TIMEZONE": {"label": "EPG Timezone", "type": "text", "placeholder": "America/New_York"},
         },
     },
     "encoding": {
