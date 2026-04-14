@@ -818,9 +818,32 @@ def materialize_all_channels(channel_mgr, bump_mgr, media_lib):
 # Event channel auto-cleanup
 # ---------------------------------------------------------------------------
 
+CLEANUP_GRACE_HOURS = 2  # hours after event_end before auto-delete
+
+
+def _manifest_is_dead(manifest_id: str) -> bool:
+    """Check if a manifest's upstream URL returns 404 (stream gone)."""
+    try:
+        from core.database import get_session
+        from core.models.manifest import Manifest
+        import requests as http_requests
+        with get_session() as session:
+            row = session.query(Manifest.url, Manifest.source_domain).filter_by(id=manifest_id).first()
+        if not row or not row[0]:
+            return True
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if row[1]:
+            headers["Referer"] = f"https://{row[1]}/"
+        resp = http_requests.head(row[0], headers=headers, timeout=10, allow_redirects=True)
+        return resp.status_code == 404
+    except Exception:
+        return False
+
+
 def cleanup_expired_event_channels():
     """Delete channels whose event has ended and whose tags include an
-    auto-cleanup tag. Called periodically by a daemon thread."""
+    auto-cleanup tag. Channels are deleted immediately if the upstream
+    stream 404s, otherwise after a grace period of CLEANUP_GRACE_HOURS."""
     from core.config import get_tag_config
     tag_config = get_tag_config()
     cleanup_tags = {tag for tag, cfg in tag_config.items() if cfg.get("auto_cleanup")}
@@ -831,6 +854,7 @@ def cleanup_expired_event_channels():
         from core.database import get_session
         from core.models import Channel as ChannelRow, Manifest
         now = datetime.now(timezone.utc)
+        grace_cutoff = now - timedelta(hours=CLEANUP_GRACE_HOURS)
         deleted = []
         with get_session() as session:
             rows = (
@@ -843,11 +867,21 @@ def cleanup_expired_event_channels():
                 channel_tags = set(row.tags or [])
                 if not channel_tags.intersection(cleanup_tags):
                     continue
+
+                # Past grace period — always delete
+                past_grace = row.event_end < grace_cutoff
+
+                # Within grace period — only delete if upstream is 404
+                if not past_grace:
+                    if row.manifest_id and _manifest_is_dead(row.manifest_id):
+                        logging.info("[CLEANUP] %s upstream 404, deleting early", row.id)
+                    else:
+                        continue
+
                 mid = row.manifest_id
                 cid = row.id
                 session.delete(row)
                 session.flush()
-                # Delete the manifest too if no other channels reference it
                 if mid:
                     other = session.query(ChannelRow.id).filter(ChannelRow.manifest_id == mid).first()
                     if not other:
