@@ -254,11 +254,17 @@ class ManifestResolverService:
 
     @staticmethod
     def resolve(url: str, title: str | None = None, timeout: int = 60,
-                existing_manifest_id: str | None = None) -> dict:
+                existing_manifest_id: str | None = None,
+                tags: list | None = None,
+                event_start: str | None = None,
+                event_end: str | None = None,
+                auto_create: bool = False) -> dict:
         """Capture an m3u8 manifest via the sidecar and store it in DB.
 
         If existing_manifest_id is provided, the specified row is updated in place
         (used for token refresh — keeps the same manifest ID so streams don't break).
+        If auto_create is True and resolve succeeds, a resolved channel is
+        created automatically with the given tags and event times.
         """
         # Circuit breaker — reject if this URL has failed too many times recently
         cb_err = _cb_check(url)
@@ -330,6 +336,7 @@ class ManifestResolverService:
                 context=context,
                 heartbeat=heartbeat,
                 existing_manifest_id=existing_manifest_id,
+                user_tags=tags,
             )
 
             _status["last_manifest_id"] = manifest_id
@@ -348,7 +355,41 @@ class ManifestResolverService:
                 "manifest_url": manifest_url,
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "error": None,
+                "channel_id": None,
+                "channel_name": None,
             }
+
+            # Auto-create a resolved channel if requested
+            if auto_create and not existing_manifest_id:
+                try:
+                    from web import shared_state
+                    # Skip if a channel already references this manifest
+                    existing_ch = None
+                    for ch in shared_state.channel_mgr.list_channels():
+                        if ch.get("manifest_id") == manifest_id:
+                            existing_ch = ch
+                            break
+                    if existing_ch:
+                        result["channel_id"] = existing_ch["id"]
+                        result["channel_name"] = existing_ch["name"]
+                        logger.info("[RESOLVER] Channel already exists for manifest %s: %s",
+                                    manifest_id, existing_ch["name"])
+                    else:
+                        ch = shared_state.channel_mgr.create_resolved_channel(
+                            manifest_id, title,
+                            tags=tags,
+                            event_start=event_start,
+                            event_end=event_end,
+                        )
+                        if ch:
+                            result["channel_id"] = ch["id"]
+                            result["channel_name"] = ch["name"]
+                            logger.info("[RESOLVER] Auto-created channel %s for manifest %s",
+                                        ch["name"], manifest_id)
+                            shared_state.regenerate_m3u()
+                except Exception as e:
+                    logger.warning("[RESOLVER] Auto-create channel failed for %s: %s", manifest_id, e)
+
             return result
 
         except http_requests.exceptions.RequestException as e:
@@ -410,14 +451,20 @@ class ManifestResolverService:
         return dict(_batch)
 
     @staticmethod
-    def resolve_batch(urls: list[dict], timeout: int = 60):
-        """Resolve a list of URLs sequentially."""
+    def resolve_batch(urls: list[dict], timeout: int = 60, auto_create: bool = False):
+        """Resolve a list of URLs sequentially.
+
+        Each entry in urls can include: url, title, tags, event_start, event_end.
+        If auto_create is True, a resolved channel is created for each successful
+        manifest (with tags and event times if provided).
+        """
         _batch["running"] = True
         _batch["total"] = len(urls)
         _batch["completed"] = 0
         _batch["results"] = [
             {"url": u["url"], "title": u.get("title"), "status": "pending",
-             "manifest_id": None, "manifest_url": None, "expires_at": None, "error": None}
+             "manifest_id": None, "manifest_url": None, "expires_at": None,
+             "channel_id": None, "channel_name": None, "error": None}
             for u in urls
         ]
 
@@ -426,7 +473,13 @@ class ManifestResolverService:
             _batch["results"][i]["status"] = "resolving"
 
             result = ManifestResolverService.resolve(
-                url=entry["url"], title=entry.get("title"), timeout=timeout
+                url=entry["url"],
+                title=entry.get("title"),
+                timeout=timeout,
+                tags=entry.get("tags"),
+                event_start=entry.get("event_start"),
+                event_end=entry.get("event_end"),
+                auto_create=auto_create,
             )
 
             if result["ok"]:
@@ -434,6 +487,8 @@ class ManifestResolverService:
                 _batch["results"][i]["manifest_id"] = result["manifest_id"]
                 _batch["results"][i]["manifest_url"] = result["manifest_url"]
                 _batch["results"][i]["expires_at"] = result.get("expires_at")
+                _batch["results"][i]["channel_id"] = result.get("channel_id")
+                _batch["results"][i]["channel_name"] = result.get("channel_name")
             else:
                 _batch["results"][i]["status"] = "failed"
                 _batch["results"][i]["error"] = result["error"]
@@ -491,6 +546,7 @@ def _store_manifest(
     context: dict,
     heartbeat: dict | None,
     existing_manifest_id: str | None = None,
+    user_tags: list | None = None,
 ) -> str:
     """Insert or update a manifest in Manifold's DB. Returns manifest ID.
 
@@ -593,7 +649,7 @@ def _store_manifest(
                 drm_method=drm_method,
                 is_drm=is_drm,
                 title=title,
-                tags=["live", "captured", "resolved"],
+                tags=["resolved"] + (user_tags or []),
                 active=True,
                 expires_at=expires_at,
                 last_refreshed_at=now,

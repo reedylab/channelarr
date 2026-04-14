@@ -13,11 +13,16 @@ class ResolveRequest(BaseModel):
     url: str
     title: str | None = None
     timeout: int = 60
+    tags: list[str] | None = None
+    event_start: str | None = None
+    event_end: str | None = None
+    auto_create: bool = False
 
 
 class BatchResolveRequest(BaseModel):
     urls: list[dict]
     timeout: int = 60
+    auto_create: bool = False
 
 
 @router.post("/resolve")
@@ -31,7 +36,14 @@ def resolve_manifest(req: ResolveRequest):
     thread = threading.Thread(
         target=ManifestResolverService.resolve,
         args=(req.url,),
-        kwargs={"title": req.title, "timeout": req.timeout},
+        kwargs={
+            "title": req.title,
+            "timeout": req.timeout,
+            "tags": req.tags,
+            "event_start": req.event_start,
+            "event_end": req.event_end,
+            "auto_create": req.auto_create,
+        },
         daemon=True,
     )
     thread.start()
@@ -61,7 +73,7 @@ def resolve_batch(req: BatchResolveRequest):
     thread = threading.Thread(
         target=ManifestResolverService.resolve_batch,
         args=(req.urls,),
-        kwargs={"timeout": req.timeout},
+        kwargs={"timeout": req.timeout, "auto_create": req.auto_create},
         daemon=True,
     )
     thread.start()
