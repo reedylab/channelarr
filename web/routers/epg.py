@@ -13,6 +13,72 @@ from core.xmltv import _iterate_schedule_window, _merge_bump_gaps
 router = APIRouter()
 
 
+def _event_entries_in_window(ch: dict, window_start, window_end) -> list:
+    """Generate guide entries for an event channel with three phases:
+    pre-event (starts at X), during event (live), post-event (ended)."""
+    from datetime import datetime, timedelta, timezone
+    from core.xmltv import _get_epg_tz, _format_local_time
+
+    name = ch["name"]
+    ev_start = datetime.fromisoformat(ch["event_start"])
+    ev_end = datetime.fromisoformat(ch["event_end"])
+    epg_tz = _get_epg_tz()
+    local_start = _format_local_time(ev_start, epg_tz)
+    block = timedelta(minutes=30)
+    entries = []
+
+    # Pre-event blocks
+    if ev_start > window_start:
+        pre_end = min(ev_start, window_end)
+        bm = (window_start.minute // 30) * 30
+        current = window_start.replace(minute=bm, second=0, microsecond=0)
+        while current < pre_end:
+            stop = min(current + block, pre_end)
+            entries.append({
+                "title": f"{name} — Starts at {local_start}",
+                "desc": f"{name} begins at {local_start}.",
+                "type": "event-pre",
+                "path": "",
+                "start": current.isoformat(),
+                "stop": stop.isoformat(),
+                "duration": int((stop - current).total_seconds()),
+            })
+            current = stop
+
+    # Event block
+    block_start = max(ev_start, window_start)
+    block_end = min(ev_end, window_end)
+    if block_start < block_end:
+        entries.append({
+            "title": name,
+            "desc": f"{name} — Live",
+            "type": "event-live",
+            "path": "",
+            "start": block_start.isoformat(),
+            "stop": block_end.isoformat(),
+            "duration": int((block_end - block_start).total_seconds()),
+        })
+
+    # Post-event blocks
+    if ev_end < window_end:
+        post_start = max(ev_end, window_start)
+        current = post_start
+        while current < window_end:
+            stop = current + block
+            entries.append({
+                "title": f"{name} — Event Ended",
+                "desc": f"{name} has ended.",
+                "type": "event-post",
+                "path": "",
+                "start": current.isoformat(),
+                "stop": stop.isoformat(),
+                "duration": int((stop - current).total_seconds()),
+            })
+            current = stop
+
+    return entries
+
+
 @router.get("/epg/now")
 def api_epg_now():
     channels = shared_state.channel_mgr.list_channels()
@@ -82,6 +148,8 @@ def api_epg_guide(hours: int = Query(default=6)):
                 if entry.get("thumbnail"):
                     ep["thumbnail"] = entry["thumbnail"]
                 entries.append(ep)
+        elif is_resolved and ch.get("event_start") and ch.get("event_end"):
+            entries = _event_entries_in_window(ch, window_start, horizon)
         else:
             # Resolved channels (always live) and empty scheduled channels
             # both fall back to placeholder blocks. Block boundaries align
