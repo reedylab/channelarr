@@ -474,15 +474,16 @@ function openEditor(ch) {
   $("#ch-resolved-only").style.display = isResolved ? "" : "none";
   if (isResolved) {
     $("#ch-resolved-url").value = ch.manifest_url || "";
-    const transcodeOn = !!ch.transcode_mediated;
-    $("#ch-resolved-transcode").checked = transcodeOn;
-    $("#ch-resolved-bump-section").style.display = transcodeOn ? "" : "none";
+    const mode = ch.encoder_mode || "proxy";
+    $("#ch-resolved-encoder-mode").value = mode;
+    const isTranscode = (mode === "single" || mode === "multi");
+    $("#ch-transcode-options").style.display = isTranscode ? "" : "none";
+    $("#ch-resolved-bump-section").style.display = isTranscode ? "" : "none";
     const bc = ch.bump_config || {};
     const selected = bc.folders || (bc.folder ? [bc.folder] : []);
     loadResolvedBumpFolders(selected);
     $("#ch-resolved-shownext").checked = !!bc.show_next;
     $("#ch-resolved-profile").value = ch.profile_name || "auto";
-    $("#ch-resolved-encoder-mode").value = ch.encoder_mode || "single";
     loadBrandingDropdown("ch-resolved-branding", ch.branding_logo || "");
     // Event times — convert ISO to datetime-local format (YYYY-MM-DDTHH:MM)
     $("#ch-event-start").value = ch.event_start ? ch.event_start.slice(0, 16) : "";
@@ -596,12 +597,14 @@ function getSelectedResolvedBumpFolders() {
   return Array.from($$(".ch-res-bump-folder-cb:checked")).map(cb => cb.value);
 }
 
-// Toggle the bump section when transcode-mediated is checked
+// Toggle transcode options based on stream mode dropdown
 document.addEventListener("DOMContentLoaded", () => {
-  const cb = document.getElementById("ch-resolved-transcode");
-  if (cb) {
-    cb.addEventListener("change", () => {
-      $("#ch-resolved-bump-section").style.display = cb.checked ? "" : "none";
+  const sel = document.getElementById("ch-resolved-encoder-mode");
+  if (sel) {
+    sel.addEventListener("change", () => {
+      const isTranscode = (sel.value === "single" || sel.value === "multi");
+      $("#ch-transcode-options").style.display = isTranscode ? "" : "none";
+      $("#ch-resolved-bump-section").style.display = isTranscode ? "" : "none";
     });
   }
 });
@@ -996,21 +999,22 @@ async function saveChannel() {
 
   let data;
   if (isResolved) {
-    // Resolved channels: name + transcode_mediated toggle + bump folders + overlay + profile.
-    const transcodeOn = $("#ch-resolved-transcode").checked;
+    // Resolved channels
+    const encoderMode = $("#ch-resolved-encoder-mode").value || "proxy";
+    const isTranscode = (encoderMode === "single" || encoderMode === "multi");
     const evStart = $("#ch-event-start").value;
     const evEnd = $("#ch-event-end").value;
     data = {
       name,
       tags: parseTags(),
-      transcode_mediated: transcodeOn,
+      transcode_mediated: isTranscode,
       profile_name: $("#ch-resolved-profile").value || "auto",
-      encoder_mode: $("#ch-resolved-encoder-mode").value || "single",
+      encoder_mode: encoderMode,
       branding_logo: $("#ch-resolved-branding").value || null,
       event_start: evStart ? new Date(evStart).toISOString() : null,
       event_end: evEnd ? new Date(evEnd).toISOString() : null,
     };
-    if (transcodeOn) {
+    if (isTranscode) {
       data.bump_config = {
         enabled: true,
         folders: getSelectedResolvedBumpFolders(),

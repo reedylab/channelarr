@@ -464,12 +464,18 @@
               </div>
             </div>
             <div class="muted" style="margin-top:4px;font-size:11px">Optional. Sets real EPG blocks for the event window. Channels with auto-cleanup tags are deleted after the event ends.</div>
-            <label class="toggle-label" style="margin-top:12px">
-              <input type="checkbox" id="ch-resolved-transcode" />
-              Transcode-mediated streaming (insert bumps during ad breaks)
-            </label>
-            <div class="muted" style="margin-top:4px;font-size:11px">When enabled, channelarr re-encodes the upstream HLS through FFmpeg and replaces ad breaks with bumps from the folders below. This produces a single coherent HLS stream that even strict players (Jellyfin/ExoPlayer) handle smoothly. Costs one continuous FFmpeg encoder while clients are watching.</div>
 
+            <div class="setting-field" style="margin-top:10px">
+              <label>Stream Mode</label>
+              <select id="ch-resolved-encoder-mode">
+                <option value="proxy">Proxy (no re-encode, lossless)</option>
+                <option value="single">Transcode — Single encoder (seamless)</option>
+                <option value="multi">Transcode — Multi encoder (robust)</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks.</div>
+            </div>
+
+            <div id="ch-transcode-options" style="display:none">
             <div class="setting-field" style="margin-top:10px">
               <label>Stream Profile</label>
               <select id="ch-resolved-profile">
@@ -477,17 +483,7 @@
                 <option value="adultswim">Adult Swim / Turner CDN (SCTE-35)</option>
                 <option value="anvato_lura">Anvato / Lura Live (local TV affiliates, e.g. WSPA)</option>
               </select>
-              <div class="muted" style="margin-top:4px;font-size:11px">How channelarr detects ad breaks in the upstream playlist. Auto picks based on marker fingerprints and is correct for most sources. Pick a named profile if auto-detect chooses wrong.</div>
-            </div>
-
-            <div class="setting-field" style="margin-top:10px">
-              <label>Encoder Mode</label>
-              <select id="ch-resolved-encoder-mode">
-                <option value="proxy">Proxy (no re-encode, lossless)</option>
-                <option value="single">Single encoder (seamless segments)</option>
-                <option value="multi">Multi encoder (per-segment, more robust)</option>
-              </select>
-              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU, works with all players. Single/Multi re-encode through FFmpeg for bump insertion. Single is seamless, Multi is more robust for Adult Swim-style sources.</div>
+              <div class="muted" style="margin-top:4px;font-size:11px">How channelarr detects ad breaks in the upstream playlist.</div>
             </div>
 
             <div class="setting-field" style="margin-top:10px">
@@ -509,6 +505,7 @@
                 Show "RESUMING IN" countdown + UP NEXT overlay during bumps
               </label>
               <div class="muted" style="margin-top:4px;font-size:11px">Same overlay style as scheduled channels. The countdown ticks down across all bumps in a break, hitting 0:00 right when the upstream show resumes. Channel logo (if uploaded) appears as the UP NEXT poster.</div>
+            </div>
             </div>
           </div>
         </div>
@@ -596,6 +593,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=37"></script>
+  <script src="/static/ui.js?v=38"></script>
 </body>
 </html>
