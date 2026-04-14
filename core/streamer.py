@@ -663,6 +663,40 @@ class StreamerManager:
         self._streams[channel_id] = stream
         return True
 
+    def start_proxy_channel(self, channel_id: str, manifest_id: str,
+                            manifest_url: str) -> bool:
+        """Start a proxy-mode resolved channel. Downloads segments with
+        proper auth headers and serves them locally. No re-encode."""
+        from core.resolver.proxy_stream import ProxyStream
+
+        if channel_id in self._streams:
+            existing = self._streams[channel_id]
+            try:
+                if existing.status().get("running"):
+                    return False
+            except Exception:
+                pass
+            try:
+                existing.stop()
+            except Exception:
+                pass
+            del self._streams[channel_id]
+
+        hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
+        hls_dir = os.path.join(hls_base, channel_id)
+
+        stream = ProxyStream(
+            channel_id=channel_id,
+            manifest_id=manifest_id,
+            manifest_url=manifest_url,
+            hls_dir=hls_dir,
+            hls_time=int(self._get("HLS_TIME", "6")),
+            hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+        )
+        stream.start()
+        self._streams[channel_id] = stream
+        return True
+
     def stop_channel(self, channel_id: str) -> bool:
         stream = self._streams.get(channel_id)
         if not stream:

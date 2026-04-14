@@ -483,10 +483,11 @@
             <div class="setting-field" style="margin-top:10px">
               <label>Encoder Mode</label>
               <select id="ch-resolved-encoder-mode">
+                <option value="proxy">Proxy (no re-encode, lossless)</option>
                 <option value="single">Single encoder (seamless segments)</option>
                 <option value="multi">Multi encoder (per-segment, more robust)</option>
               </select>
-              <div class="muted" style="margin-top:4px;font-size:11px">Single runs one long-lived FFmpeg that eliminates seams between segments — best for sources with short segments (e.g. WSPA 6s). Multi spawns a fresh encoder per segment and pipes to a separate HLS segmenter — more robust for sources like Adult Swim where container metadata varies.</div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU, works with all players. Single/Multi re-encode through FFmpeg for bump insertion. Single is seamless, Multi is more robust for Adult Swim-style sources.</div>
             </div>
 
             <div class="setting-field" style="margin-top:10px">

@@ -30,26 +30,40 @@ def _start_from_schedule(channel_id):
     if not ch:
         return False, "Channel not found"
 
-    # Resolved channels with transcode_mediated=True go through the resolver
-    # transcoder pipeline (B6) instead of the scheduled-channel streamer.
-    if ch.get("type") == "resolved" and ch.get("transcode_mediated"):
+    if ch.get("type") == "resolved":
         manifest_id = ch.get("manifest_id")
         manifest_url = ch.get("manifest_url")
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
-        ok = shared_state.streamer_mgr.start_resolved_channel(
-            channel_id,
-            manifest_id=manifest_id,
-            manifest_url=manifest_url,
-            bump_config=ch.get("bump_config", {}),
-            bump_manager=shared_state.bump_mgr,
-            channel_name=ch.get("name", ""),
-            logo_dir=shared_state.LOGO_DIR,
-            profile_name=ch.get("profile_name", "auto"),
-            branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
-            encoder_mode=ch.get("encoder_mode", "single"),
-        )
-        return ok, "Started" if ok else "Already running"
+        encoder_mode = ch.get("encoder_mode", "single")
+
+        # Proxy mode — download segments with auth, serve locally. No encode.
+        if encoder_mode == "proxy":
+            ok = shared_state.streamer_mgr.start_proxy_channel(
+                channel_id,
+                manifest_id=manifest_id,
+                manifest_url=manifest_url,
+            )
+            return ok, "Started" if ok else "Already running"
+
+        # Transcode mode — full re-encode with bump insertion.
+        if ch.get("transcode_mediated"):
+            ok = shared_state.streamer_mgr.start_resolved_channel(
+                channel_id,
+                manifest_id=manifest_id,
+                manifest_url=manifest_url,
+                bump_config=ch.get("bump_config", {}),
+                bump_manager=shared_state.bump_mgr,
+                channel_name=ch.get("name", ""),
+                logo_dir=shared_state.LOGO_DIR,
+                profile_name=ch.get("profile_name", "auto"),
+                branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
+                encoder_mode=encoder_mode,
+            )
+            return ok, "Started" if ok else "Already running"
+
+        # Direct passthrough — raw CDN URL (handled by resolved_stream.py)
+        return False, "Passthrough channels use /live-resolved/ endpoint"
 
     schedule = ch.get("materialized_schedule", [])
     if not schedule:
