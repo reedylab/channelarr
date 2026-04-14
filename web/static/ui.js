@@ -2027,9 +2027,9 @@ function renderResolverQueue(batch) {
 
     return `<tr>
       <td><span class="res-status ${statusClass}" title="${statusTitle}"></span></td>
-      <td>${title}${expiryHint ? "<br>" + expiryHint : ""}${channelBadge ? "<br>" + channelBadge : ""}</td>
+      <td>${title}${expiryHint ? " " + expiryHint : ""}${channelBadge ? " " + channelBadge : ""}</td>
       <td class="res-url" title="${url}">${truncUrl}</td>
-      <td>${actions}</td>
+      <td class="res-actions" style="text-align:right">${actions}</td>
     </tr>`;
   }).join("");
 
