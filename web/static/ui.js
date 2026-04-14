@@ -2175,24 +2175,35 @@ document.addEventListener("DOMContentLoaded", () => {
       let urls = [];
       const title = $("#resolver-title").value.trim();
       const timeout = parseInt($("#resolver-timeout").value);
+      const rTags = ($("#resolver-tags").value || "").split(",").map(s => s.trim()).filter(Boolean);
+      const rEvStart = $("#resolver-event-start").value;
+      const rEvEnd = $("#resolver-event-end").value;
+      const autoCreate = $("#resolver-auto-create").checked;
+      const entryMeta = {};
+      if (rTags.length) entryMeta.tags = rTags;
+      if (rEvStart) entryMeta.event_start = new Date(rEvStart).toISOString();
+      if (rEvEnd) entryMeta.event_end = new Date(rEvEnd).toISOString();
       try {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) urls = parsed.map(e => typeof e === "string" ? {url: e} : e);
+        if (Array.isArray(parsed)) urls = parsed.map(e => typeof e === "string" ? {url: e, ...entryMeta} : {...entryMeta, ...e});
       } catch (e) {
-        urls = raw.split("\n").map(l => l.trim()).filter(l => l && l.startsWith("http")).map(u => ({url: u, title: title || null}));
+        urls = raw.split("\n").map(l => l.trim()).filter(l => l && l.startsWith("http")).map(u => ({url: u, title: title || null, ...entryMeta}));
       }
       if (urls.length === 0) { toast("error", "No valid URLs found"); return; }
       try {
         const r = await fetch(`${API}/resolve/batch`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ urls, timeout }),
+          body: JSON.stringify({ urls, timeout, auto_create: autoCreate }),
         });
         const j = await r.json();
         if (j.ok) {
           toast("info", `Resolving ${urls.length} URL${urls.length > 1 ? "s" : ""}...`);
           $("#resolver-urls").value = "";
           $("#resolver-title").value = "";
+          $("#resolver-tags").value = "";
+          $("#resolver-event-start").value = "";
+          $("#resolver-event-end").value = "";
           startResolverPolling();
           setTimeout(async () => {
             const res = await fetch(`${API}/resolve/batch/status`);
@@ -2211,6 +2222,9 @@ document.addEventListener("DOMContentLoaded", () => {
       $("#resolver-progress").classList.add("hidden");
       $("#resolver-urls").value = "";
       $("#resolver-title").value = "";
+      $("#resolver-tags").value = "";
+      $("#resolver-event-start").value = "";
+      $("#resolver-event-end").value = "";
       closeResolverPlayer();
     });
   }

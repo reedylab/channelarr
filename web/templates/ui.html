@@ -165,13 +165,17 @@
             <div class="resolver-input">
               <textarea id="resolver-urls" class="resolver-textarea" rows="3" placeholder="Paste URLs to resolve (one per line)&#10;&#10;Or JSON: [{&quot;url&quot;: &quot;...&quot;, &quot;title&quot;: &quot;...&quot;}, ...]"></textarea>
               <div class="resolver-controls">
-                <input type="text" id="resolver-title" class="filter-search" placeholder="Title (optional, single URL)" style="width:200px">
+                <input type="text" id="resolver-title" class="filter-search" placeholder="Title (optional, single URL)" style="width:180px">
+                <input type="text" id="resolver-tags" class="filter-search" placeholder="Tags (e.g. Sports, Events)" style="width:180px">
+                <input type="datetime-local" id="resolver-event-start" class="filter-search" title="Event start" style="width:170px">
+                <input type="datetime-local" id="resolver-event-end" class="filter-search" title="Event end" style="width:170px">
                 <select id="resolver-timeout" class="filter-status">
                   <option value="30">30s timeout</option>
                   <option value="60">60s timeout</option>
                   <option value="90" selected>90s timeout</option>
                   <option value="120">120s timeout</option>
                 </select>
+                <label class="toggle-label" style="font-size:12px;white-space:nowrap"><input type="checkbox" id="resolver-auto-create"> Auto-create channels</label>
                 <button id="resolver-go" class="btn btn-primary">Resolve All</button>
               </div>
             </div>
@@ -591,6 +595,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=35"></script>
+  <script src="/static/ui.js?v=36"></script>
 </body>
 </html>
