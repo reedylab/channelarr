@@ -69,7 +69,7 @@ class Channel(Base):
     # Encoder pipeline mode for transcode-mediated resolved channels.
     # "single" = one long-running encoder (seamless, best for short segments)
     # "multi" = per-item encoder + HLS segmenter (robust, best for Adult Swim)
-    encoder_mode = Column(String, nullable=False, default="single")
+    encoder_mode = Column(String, nullable=False, default="proxy")
 
     branding_logo = Column(String, nullable=True)
 

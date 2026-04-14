@@ -35,7 +35,7 @@ def _start_from_schedule(channel_id):
         manifest_url = ch.get("manifest_url")
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
-        encoder_mode = ch.get("encoder_mode", "single")
+        encoder_mode = ch.get("encoder_mode", "proxy")
 
         # Proxy mode — download segments with auth, serve locally. No encode.
         if encoder_mode == "proxy":
