@@ -118,6 +118,8 @@ def run_scraper(name: str, config: dict | None = None):
                     entry["event_start"] = e["event_start"]
                 if e.get("event_end"):
                     entry["event_end"] = e["event_end"]
+                if e.get("logo_urls"):
+                    entry["logo_urls"] = e["logo_urls"]
                 urls.append(entry)
 
             ManifestResolverService.resolve_batch(urls, timeout=timeout, auto_create=True)

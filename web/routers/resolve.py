@@ -17,6 +17,7 @@ class ResolveRequest(BaseModel):
     event_start: str | None = None
     event_end: str | None = None
     auto_create: bool = False
+    logo_urls: list[str] | None = None
 
 
 class BatchResolveRequest(BaseModel):
@@ -43,6 +44,7 @@ def resolve_manifest(req: ResolveRequest):
             "event_start": req.event_start,
             "event_end": req.event_end,
             "auto_create": req.auto_create,
+            "logo_urls": req.logo_urls,
         },
         daemon=True,
     )

@@ -258,7 +258,8 @@ class ManifestResolverService:
                 tags: list | None = None,
                 event_start: str | None = None,
                 event_end: str | None = None,
-                auto_create: bool = False) -> dict:
+                auto_create: bool = False,
+                logo_urls: list | None = None) -> dict:
         """Capture an m3u8 manifest via the sidecar and store it in DB.
 
         If existing_manifest_id is provided, the specified row is updated in place
@@ -386,6 +387,14 @@ class ManifestResolverService:
                             result["channel_name"] = ch["name"]
                             logger.info("[RESOLVER] Auto-created channel %s for manifest %s",
                                         ch["name"], manifest_id)
+                            # Generate channel logo from scraper-provided URLs
+                            if logo_urls:
+                                try:
+                                    from core.logo_gen import generate_channel_logo
+                                    generate_channel_logo(ch["id"], logo_urls)
+                                except Exception as e:
+                                    logger.warning("[RESOLVER] Logo gen failed for %s: %s",
+                                                   ch["id"], e)
                             shared_state.regenerate_m3u()
                 except Exception as e:
                     logger.warning("[RESOLVER] Auto-create channel failed for %s: %s", manifest_id, e)
@@ -480,6 +489,7 @@ class ManifestResolverService:
                 event_start=entry.get("event_start"),
                 event_end=entry.get("event_end"),
                 auto_create=auto_create,
+                logo_urls=entry.get("logo_urls"),
             )
 
             if result["ok"]:
