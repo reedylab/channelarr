@@ -2443,13 +2443,17 @@ async function loadVpnStatus() {
     badge.classList.remove("vpn-connected", "vpn-disconnected", "vpn-unconfigured");
     if (d.status === "running") {
       badge.classList.add("vpn-connected");
-      badge.textContent = d.city ? `VPN: ${d.city}` : `VPN: ${d.ip || "connected"}`;
+      const loc = [d.city, d.country].filter(Boolean).join(", ");
+      badge.textContent = `VPN: ${d.ip}${loc ? " (" + loc + ")" : ""}`;
+      badge.title = `VPN Connected — ${d.ip} ${loc}`;
     } else if (d.status === "not configured") {
       badge.classList.add("vpn-unconfigured");
-      badge.textContent = "VPN: --";
+      badge.textContent = "VPN: offline";
+      badge.title = "Gluetun unreachable";
     } else {
       badge.classList.add("vpn-disconnected");
       badge.textContent = `VPN: ${d.status}`;
+      badge.title = `VPN ${d.status}`;
     }
   } catch(e) {
     const badge = $("#vpn-badge");
