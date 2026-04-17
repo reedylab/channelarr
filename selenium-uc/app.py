@@ -203,7 +203,8 @@ def _release_browser():
 
     Cookies and localStorage are preserved (the user-data-dir is on disk).
     """
-    global _browser, _capture_count
+    global _browser, _capture_count, _health_failures
+    _health_failures = 0  # capture completed, lock about to release — not stuck
     if _browser is None:
         return
     try:
@@ -411,7 +412,9 @@ def _decode_body(result):
 
 
 _health_failures = 0
-_MAX_HEALTH_FAILURES = 6  # 6 failures × 30s interval = 3 minutes stuck → self-kill
+_MAX_HEALTH_FAILURES = 12  # 12 failures × 30s = 6 min stuck → self-kill
+# Normal 90s captures hold the lock for ~3 health checks. Only a true
+# hang (browser.get stuck, Chrome zombie) should exceed 6 minutes.
 
 @app.get("/health")
 def health():
