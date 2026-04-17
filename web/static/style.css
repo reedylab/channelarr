@@ -661,6 +661,12 @@ button,input,select,textarea{font-family:inherit}
 .vpn-unconfigured{background:rgba(169,175,189,.1);color:var(--text-muted);border-color:var(--border)}
 
 /* VPN stat card */
+.filter-status{
+  background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer;
+}
+.filter-status:focus{outline:none;border-color:var(--accent)}
+.filter-status option{background:var(--bg-card);color:var(--text)}
 .vpn-stat-card{display:flex;flex-direction:column}
 .vpn-stat-card .stat-chart{height:170px}
 .vpn-stat-footer{display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:12px;gap:8px}
