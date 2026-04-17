@@ -555,20 +555,93 @@ def _check_paywall(browser):
                 return text or sel
         except Exception:
             continue
-    # Also check page text for premium/not-yet-live keywords
+    # Check visible text AND innerHTML for premium/not-yet-live keywords
     try:
-        body = browser.find_element(By.TAG_NAME, "body").text or ""
-        lower = body.lower()
+        # Get both visible text and raw HTML (some overlays use hidden text)
+        body_text = browser.find_element(By.TAG_NAME, "body").text or ""
+        body_html = ""
+        try:
+            body_html = browser.execute_script("return document.body ? document.body.innerHTML : ''") or ""
+        except Exception:
+            pass
+        combined = (body_text + " " + body_html).lower()
+        # Log what we see for debugging
+        if body_text.strip():
+            logger.info("Paywall check body text: %s", body_text.strip()[:300])
+        elif body_html.strip():
+            logger.info("Paywall check innerHTML (first 300): %s", body_html.strip()[:300])
+        else:
+            logger.info("Paywall check: iframe body is empty")
         for phrase in ["get premium", "go premium", "premium only",
                        "subscribe to watch", "upgrade to watch",
                        "premium members only", "unlock this stream",
                        "live stream starting soon", "stream starting soon",
                        "event has not started", "stream will begin shortly",
-                       "coming soon", "broadcast will begin"]:
-            if phrase in lower:
+                       "broadcast will begin",
+                       "upcoming"]:
+            if phrase in combined:
                 return phrase
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Paywall check error: %s", e)
+    return None
+
+
+def _scan_all_frames_for_skip(browser):
+    """Check the main page and all iframes for skip-worthy content.
+
+    Looks at the outer page and each iframe for text indicating the stream
+    is premium-locked or not yet live. Returns the matched phrase or None.
+    """
+    skip_phrases = [
+        "get premium", "go premium", "premium only",
+        "subscribe to watch", "upgrade to watch",
+        "premium members only", "unlock this stream",
+        "live stream starting soon", "stream starting soon",
+        "event has not started", "stream will begin shortly",
+        "broadcast will begin", "upcoming",
+    ]
+
+    def _check_current_frame():
+        try:
+            text = browser.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            ) or ""
+            lower = text.lower()
+            for phrase in skip_phrases:
+                if phrase in lower:
+                    return phrase
+        except Exception:
+            pass
+        return None
+
+    # Check main frame first
+    try:
+        browser.switch_to.default_content()
+        time.sleep(1)
+        result = _check_current_frame()
+        if result:
+            return result
+
+        # Check each iframe
+        iframes = browser.find_elements(By.TAG_NAME, "iframe")
+        for idx, _ in enumerate(iframes):
+            try:
+                browser.switch_to.default_content()
+                browser.switch_to.frame(idx)
+                result = _check_current_frame()
+                if result:
+                    browser.switch_to.default_content()
+                    return result
+            except Exception:
+                continue
+
+        browser.switch_to.default_content()
+    except Exception as e:
+        logger.debug("Frame scan error: %s", e)
+        try:
+            browser.switch_to.default_content()
+        except Exception:
+            pass
     return None
 
 
@@ -633,26 +706,21 @@ def capture(req: CaptureRequest):
                 # continue to check for manifests that arrived before timeout
                 logger.warning("Page load timeout/error for %s: %s", req.url, e)
 
-            # Check for premium/paywall/not-live on the main page BEFORE iframe switch
-            paywall = _check_paywall(browser)
-            if paywall:
-                logger.info("Paywall detected (main frame) for %s: %s", req.url, paywall)
-                return {"ok": False, "error": f"Premium content: {paywall}"}
+            # Scan all iframes for skip conditions before committing to manifest wait
+            skip_reason = _scan_all_frames_for_skip(browser)
+            if skip_reason:
+                logger.info("Skip detected for %s: %s", req.url, skip_reason)
+                return {"ok": False, "error": f"Skipped: {skip_reason}"}
 
             if req.switch_iframe:
                 try:
+                    browser.switch_to.default_content()
                     WebDriverWait(browser, 10).until(
                         EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe"))
                     )
                     logger.info("Switched to iframe")
                 except Exception:
                     logger.debug("No iframe, continuing in main frame")
-
-            # Check again inside the iframe
-            paywall = _check_paywall(browser)
-            if paywall:
-                logger.info("Paywall detected (iframe) for %s: %s", req.url, paywall)
-                return {"ok": False, "error": f"Premium content: {paywall}"}
 
             # Try clicking play button — pregame streams often need a click
             # before the m3u8 loads. Try common selectors, then fall back to
