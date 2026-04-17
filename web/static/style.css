@@ -697,6 +697,15 @@ button,input,select,textarea{font-family:inherit}
 .task-actions{display:flex;gap:6px;align-items:center}
 .task-meta{display:flex;gap:16px;align-items:center;font-size:13px;color:var(--text-muted)}
 .task-next{font-size:12px;color:var(--text-muted)}
+.task-select{
+  background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer;
+  appearance:none;-webkit-appearance:none;-moz-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%237d8590' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 6px center;padding-right:22px;
+}
+.task-select:focus{outline:none;border-color:var(--accent)}
+.task-select option{background:var(--bg-card);color:var(--text)}
 
 /* ---- Scrapers ---- */
 .scraper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}

@@ -19,8 +19,37 @@ def api_system_stats():
 
 @router.get("/tasks/status")
 def api_tasks_status():
-    """Return all background tasks and scheduler jobs."""
-    return {"tasks": shared_state.get_tasks()}
+    """Return all scheduler jobs for the Tasks UI."""
+    from core.scheduler import get_jobs_info
+    return {"tasks": get_jobs_info()}
+
+
+@router.put("/tasks/{job_id}")
+def api_tasks_update(job_id: str, body: dict):
+    """Update a task's interval."""
+    from core.scheduler import update_job_interval
+    seconds = body.get("interval_seconds")
+    if not seconds or not isinstance(seconds, (int, float)):
+        return JSONResponse(status_code=400, content={"error": "interval_seconds required"})
+    ok = update_job_interval(job_id, int(seconds))
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": f"Job {job_id} not found"})
+    return {"ok": True}
+
+
+@router.post("/tasks/{job_id}/run")
+def api_tasks_run(job_id: str):
+    """Trigger a task to run immediately."""
+    import threading
+    from core.scheduler import run_job_now
+    # Run in background thread so the API returns immediately
+    def _run():
+        try:
+            run_job_now(job_id)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True}
 
 
 # ── VPN ──────────────────────────────────────────────────────────────────

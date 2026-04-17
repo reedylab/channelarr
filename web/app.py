@@ -52,45 +52,6 @@ def _materialize_missing(channel_mgr, bump_mgr, media_lib):
     logging.info("[APP] Schedule materialization complete")
 
 
-def _start_vpn_threads():
-    """Start VPN latency sampler and auto-rotate checker as daemon threads.
-
-    Both threads run every 60s. The sampler runs in all modes (vpn and local)
-    so the chart always has data. The auto-rotate checker only acts when
-    gluetun is configured AND the vpn_auto_rotate_minutes setting is > 0.
-    """
-    from core.vpn_monitor import sample_latency, maybe_auto_rotate
-
-    # Take one immediate sample so the chart isn't empty for the first 60s
-    try:
-        sample_latency()
-    except Exception:
-        pass
-
-    def _vpn_sample_loop():
-        while True:
-            time.sleep(60)
-            try:
-                sample_latency()
-            except Exception as e:
-                logging.error("[VPN-MONITOR] sample failed: %s", e)
-
-    def _vpn_rotate_loop():
-        while True:
-            time.sleep(60)
-            try:
-                maybe_auto_rotate()
-            except Exception as e:
-                logging.error("[VPN-MONITOR] rotate check failed: %s", e)
-
-    import threading
-    threading.Thread(target=_vpn_sample_loop, daemon=True).start()
-
-    if get_setting("GLUETUN_CONTROL_URL", ""):
-        threading.Thread(target=_vpn_rotate_loop, daemon=True).start()
-        logging.info("[VPN-MONITOR] Started VPN sample + auto-rotate threads")
-    else:
-        logging.info("[VPN-MONITOR] Started network latency sampler (no gluetun configured)")
 
 
 @asynccontextmanager
@@ -164,7 +125,6 @@ async def lifespan(app: FastAPI):
         # Start demand-driven refresh worker (only if DB is reachable)
         from core.resolver.manifest_resolver import start_refresh_worker
         start_refresh_worker()
-        shared_state.register_task("manifest_refresh", "Manifest Refresh", "Refreshes expiring resolved manifests", "on-demand")
         # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the
         # JSON safety net, clean orphaned resolved channels.
         from core.channels import (
@@ -205,30 +165,37 @@ async def lifespan(app: FastAPI):
     _clean_stale_hls()
     _materialize_missing(channel_mgr, bump_mgr, media_lib)
     shared_state.regenerate_m3u()
-    shared_state.start_stats_collector()
-    shared_state.register_task("stats_collector", "Stats Collector", "Samples CPU/RAM/disk metrics", "30s")
 
-    streamer_mgr.start_idle_cleanup(interval=60, timeout=300)
-    shared_state.register_task("stream_cleanup", "Stream Idle Cleanup", "Stops idle HLS streams after 5m", "60s")
+    # ── Register all background tasks with the central scheduler ──
+    from core.scheduler import add_job
 
-    # VPN latency sampling + auto-rotate (only when gluetun is wired in)
-    _start_vpn_threads()
-    shared_state.register_task("vpn_sampler", "VPN Latency Sampler", "Measures network latency", "60s")
+    # Stats collector
+    shared_state.start_stats_collector()  # still uses its own thread for CPU sampling
+    # Note: stats_collector stays as a thread because psutil.cpu_percent(interval=1)
+    # blocks for 1 second — not suitable for APScheduler's thread pool.
+
+    # Stream idle cleanup
+    add_job("stream_cleanup", lambda: streamer_mgr.cleanup_idle(300), seconds=60)
+
+    # VPN latency sampling + auto-rotate
+    from core.vpn_monitor import sample_latency, maybe_auto_rotate
+    try:
+        sample_latency()  # immediate first sample
+    except Exception:
+        pass
+    add_job("vpn_sampler", sample_latency, seconds=60)
     if get_setting("GLUETUN_CONTROL_URL", ""):
-        shared_state.register_task("vpn_auto_rotate", "VPN Auto-Rotate", "Rotates VPN when latency exceeds threshold", "60s")
+        add_job("vpn_auto_rotate", maybe_auto_rotate, seconds=60)
+    logging.info("[VPN-MONITOR] Started VPN scheduler jobs")
 
-    # Event channel auto-cleanup (checks every 60s for expired event channels)
-    def _event_cleanup_loop():
-        while True:
-            time.sleep(60)
-            try:
-                from core.channels import cleanup_expired_event_channels
-                cleanup_expired_event_channels()
-            except Exception as e:
-                logging.error("[CLEANUP] event cleanup failed: %s", e)
-    threading.Thread(target=_event_cleanup_loop, daemon=True).start()
-    logging.info("[CLEANUP] Started event channel cleanup thread (60s interval)")
-    shared_state.register_task("event_cleanup", "Event Cleanup", "Removes expired event channels", "60s")
+    # Event channel cleanup
+    from core.channels import cleanup_expired_event_channels
+    add_job("event_cleanup", cleanup_expired_event_channels, seconds=60)
+    logging.info("[CLEANUP] Scheduled event channel cleanup (60s interval)")
+
+    # YouTube pre-cache worker (stays as thread — cookie warmup + failure tracking)
+    from core.youtube import start_yt_cache_worker
+    start_yt_cache_worker(channel_mgr)
 
     # Scraper plugin scheduler
     try:
@@ -236,10 +203,6 @@ async def lifespan(app: FastAPI):
         start_scraper_scheduler()
     except Exception as e:
         logging.warning("[SCRAPER] Scheduler startup failed: %s", e)
-
-    from core.youtube import start_yt_cache_worker
-    start_yt_cache_worker(channel_mgr)
-    shared_state.register_task("yt_cache_worker", "YouTube Pre-Cache", "Pre-downloads upcoming YouTube videos", "60s")
 
     logging.info("[APP] Channelarr ready")
 

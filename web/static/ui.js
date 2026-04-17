@@ -1545,6 +1545,43 @@ $("#save-settings").addEventListener("click", async () => {
 });
 
 // ─── Tasks ───
+const TASK_INTERVAL_OPTIONS = {
+  stream_cleanup: [
+    {label: "30 seconds", seconds: 30},
+    {label: "1 minute", seconds: 60},
+    {label: "2 minutes", seconds: 120},
+    {label: "5 minutes", seconds: 300},
+  ],
+  event_cleanup: [
+    {label: "30 seconds", seconds: 30},
+    {label: "1 minute", seconds: 60},
+    {label: "5 minutes", seconds: 300},
+    {label: "15 minutes", seconds: 900},
+  ],
+  vpn_sampler: [
+    {label: "30 seconds", seconds: 30},
+    {label: "1 minute", seconds: 60},
+    {label: "2 minutes", seconds: 120},
+    {label: "5 minutes", seconds: 300},
+  ],
+  vpn_auto_rotate: [
+    {label: "1 minute", seconds: 60},
+    {label: "5 minutes", seconds: 300},
+    {label: "15 minutes", seconds: 900},
+    {label: "30 minutes", seconds: 1800},
+    {label: "1 hour", seconds: 3600},
+    {label: "2 hours", seconds: 7200},
+    {label: "4 hours", seconds: 14400},
+  ],
+};
+
+function _fmtInterval(secs) {
+  if (!secs) return "unknown";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} min`;
+  return `${Math.floor(secs / 3600)}h`;
+}
+
 async function loadTasks() {
   const container = $("#tasks-container");
   if (!container) return;
@@ -1570,21 +1607,76 @@ function renderTasks(tasks) {
   }
 
   container.innerHTML = tasks.map(t => {
-    const intervalLabel = t.interval ? `Every: ${esc(t.interval)}` : "";
+    const options = TASK_INTERVAL_OPTIONS[t.id] || [];
+    let selectHtml = "";
+    if (options.length) {
+      selectHtml = `<select class="task-select" data-task-interval="${esc(t.id)}">` +
+        options.map(o =>
+          `<option value="${o.seconds}" ${t.interval_seconds && Math.abs(t.interval_seconds - o.seconds) < 5 ? "selected" : ""}>${o.label}</option>`
+        ).join("") + `</select>`;
+    } else if (t.interval_seconds) {
+      selectHtml = `<span>${_fmtInterval(t.interval_seconds)}</span>`;
+    }
     const nextRun = t.next_run_time ? _timeUntil(t.next_run_time) : "";
 
     return `<div class="task-card" data-task-id="${esc(t.id)}">
       <div class="task-header">
         <span class="task-name">${esc(t.name)}</span>
-        <div class="task-actions"></div>
+        <div class="task-actions">
+          <button class="btn-sm" data-task-run="${esc(t.id)}">Run Now</button>
+        </div>
       </div>
       <div class="task-meta">
-        ${intervalLabel ? `<span>${intervalLabel}</span>` : ""}
+        ${selectHtml ? `<span>Every: ${selectHtml}</span>` : ""}
         ${nextRun ? `<span class="task-next">Next: ${nextRun}</span>` : ""}
-        ${!intervalLabel && !nextRun ? `<span>${esc(t.description)}</span>` : ""}
       </div>
     </div>`;
   }).join("");
+
+  // Bind interval change handlers
+  container.querySelectorAll("[data-task-interval]").forEach(sel => {
+    sel.addEventListener("change", async () => {
+      const jobId = sel.dataset.taskInterval;
+      const seconds = parseInt(sel.value);
+      try {
+        const r = await fetch(`${API}/tasks/${encodeURIComponent(jobId)}`, {
+          method: "PUT",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({interval_seconds: seconds}),
+        });
+        if (r.ok) {
+          toast("success", "Interval updated");
+          setTimeout(loadTasks, 500);
+        } else {
+          toast("error", "Failed to update interval");
+        }
+      } catch (e) {
+        toast("error", "Failed to update interval");
+      }
+    });
+  });
+
+  // Bind run now handlers
+  container.querySelectorAll("[data-task-run]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const jobId = btn.dataset.taskRun;
+      btn.disabled = true;
+      btn.textContent = "Running...";
+      try {
+        const r = await fetch(`${API}/tasks/${encodeURIComponent(jobId)}/run`, {method: "POST"});
+        if (r.ok) {
+          toast("success", "Task triggered");
+        } else {
+          toast("error", "Failed to trigger task");
+        }
+      } catch (e) {
+        toast("error", "Failed to trigger task");
+      }
+      btn.disabled = false;
+      btn.textContent = "Run Now";
+      setTimeout(loadTasks, 1000);
+    });
+  });
 }
 
 // ─── Branding Logos ───

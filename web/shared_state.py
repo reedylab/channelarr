@@ -9,7 +9,6 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
 
 import psutil
 
@@ -124,21 +123,6 @@ SETTINGS_SCHEMA = {
             },
         },
     },
-    "vpn": {
-        "label": "VPN",
-        "fields": {
-            "vpn_auto_rotate_minutes": {
-                "label": "Auto-Rotate Interval", "type": "select",
-                "options": [
-                    {"value": "0", "label": "Disabled"},
-                    {"value": "30", "label": "Every 30 min"},
-                    {"value": "60", "label": "Every 60 min"},
-                    {"value": "120", "label": "Every 2 hours"},
-                    {"value": "240", "label": "Every 4 hours"},
-                ],
-            },
-        },
-    },
 }
 
 # ── Stats collector ──
@@ -203,49 +187,6 @@ def get_stats_snapshot():
         },
     }
 
-
-# ── Background task registry ──
-_tasks: dict[str, dict] = {}
-
-
-def register_task(task_id: str, name: str, description: str, interval: str = ""):
-    """Register a background thread so the Tasks UI can show it."""
-    _tasks[task_id] = {
-        "id": task_id,
-        "name": name,
-        "description": description,
-        "type": "thread",
-        "status": "running",
-        "interval": interval,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def get_tasks() -> list[dict]:
-    """Return all registered tasks plus scraper scheduler jobs."""
-    tasks = list(_tasks.values())
-
-    # Merge scraper scheduler jobs
-    try:
-        from core.scraper_runner import get_status
-        scraper_data = get_status()
-        for name, s in scraper_data.get("scrapers", {}).items():
-            if not s.get("enabled"):
-                continue
-            tasks.append({
-                "id": f"scraper_{name}",
-                "name": f"Scraper: {name}",
-                "description": f"Scheduled scrape every {s.get('interval_hours', '?')}h",
-                "type": "scheduler",
-                "status": "running" if s.get("running") else "scheduled",
-                "interval": f"{s.get('interval_hours', '?')}h",
-                "next_run_time": s.get("next_run_time"),
-                "started_at": None,
-            })
-    except Exception:
-        pass
-
-    return tasks
 
 
 # ── M3U + XMLTV regeneration ──
