@@ -2300,15 +2300,24 @@ function startResolverPolling() {
   clearInterval(resolverTimer);
   resolverTimer = setInterval(async () => {
     try {
-      const r = await fetch(`${API}/resolve/batch/status`);
-      const b = await r.json();
-      renderResolverQueue(b);
+      const [batchRes, persistRes] = await Promise.all([
+        fetch(`${API}/resolve/batch/status`),
+        fetch(`${API}/resolve/channels`),
+      ]);
+      const b = await batchRes.json();
+      const pj = await persistRes.json();
+      const persisted = pj.results || [];
+
+      // Merge batch results with persisted manifests
+      const batchUrls = new Set((b.results || []).map(x => x.url));
+      const merged = [...(b.results || []), ...persisted.filter(p => !batchUrls.has(p.url))];
+      renderResolverQueue({ ...b, results: merged });
+
       if (!b.running) {
         clearInterval(resolverTimer);
         resolverTimer = null;
-        const doneCount = b.results.filter(x => x.status === "done").length;
+        const doneCount = (b.results || []).filter(x => x.status === "done").length;
         toast("success", `Batch complete: ${doneCount} resolved`);
-        // Reload full persisted list so previously-resolved channels reappear
         setTimeout(() => loadResolver(), 500);
       }
     } catch (e) {
@@ -2400,10 +2409,7 @@ document.addEventListener("DOMContentLoaded", () => {
           $("#resolver-event-start").value = "";
           $("#resolver-event-end").value = "";
           startResolverPolling();
-          setTimeout(async () => {
-            const res = await fetch(`${API}/resolve/batch/status`);
-            renderResolverQueue(await res.json());
-          }, 500);
+          setTimeout(() => loadResolver(), 500);
         } else {
           toast("error", j.error || "Failed to start batch");
         }

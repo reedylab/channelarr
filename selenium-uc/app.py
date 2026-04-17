@@ -555,13 +555,16 @@ def _check_paywall(browser):
                 return text or sel
         except Exception:
             continue
-    # Also check page text for premium keywords
+    # Also check page text for premium/not-yet-live keywords
     try:
         body = browser.find_element(By.TAG_NAME, "body").text or ""
         lower = body.lower()
         for phrase in ["get premium", "go premium", "premium only",
                        "subscribe to watch", "upgrade to watch",
-                       "premium members only", "unlock this stream"]:
+                       "premium members only", "unlock this stream",
+                       "live stream starting soon", "stream starting soon",
+                       "event has not started", "stream will begin shortly",
+                       "coming soon", "broadcast will begin"]:
             if phrase in lower:
                 return phrase
     except Exception:
