@@ -633,6 +633,12 @@ def capture(req: CaptureRequest):
                 # continue to check for manifests that arrived before timeout
                 logger.warning("Page load timeout/error for %s: %s", req.url, e)
 
+            # Check for premium/paywall/not-live on the main page BEFORE iframe switch
+            paywall = _check_paywall(browser)
+            if paywall:
+                logger.info("Paywall detected (main frame) for %s: %s", req.url, paywall)
+                return {"ok": False, "error": f"Premium content: {paywall}"}
+
             if req.switch_iframe:
                 try:
                     WebDriverWait(browser, 10).until(
@@ -642,11 +648,10 @@ def capture(req: CaptureRequest):
                 except Exception:
                     logger.debug("No iframe, continuing in main frame")
 
-            # Check for premium/paywall gate — skip immediately instead of
-            # waiting 90s for a manifest that will never come
+            # Check again inside the iframe
             paywall = _check_paywall(browser)
             if paywall:
-                logger.info("Premium/paywall detected for %s: %s", req.url, paywall)
+                logger.info("Paywall detected (iframe) for %s: %s", req.url, paywall)
                 return {"ok": False, "error": f"Premium content: {paywall}"}
 
             # Try clicking play button — pregame streams often need a click
