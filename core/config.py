@@ -36,6 +36,8 @@ DEFAULTS = {
     "EPG_TIMEZONE": "America/New_York",
     # Scraper plugin config (JSON string)
     "SCRAPER_CONFIG": '{}',
+    # Task interval overrides (JSON string, persisted by scheduler UI)
+    "TASK_INTERVALS": '{}',
     # Gluetun VPN control (optional — set GLUETUN_CONTROL_URL to enable VPN features)
     "GLUETUN_CONTROL_URL": "",
     "GLUETUN_CONTROL_USER": "",

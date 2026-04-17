@@ -34,14 +34,20 @@ def get_scheduler() -> BackgroundScheduler:
 
 
 def add_job(job_id: str, func, seconds: int, **kwargs):
-    """Add an interval job to the scheduler."""
+    """Add an interval job to the scheduler.
+
+    Uses a persisted interval if one was saved previously, otherwise
+    uses the provided default.
+    """
+    actual = get_saved_interval(job_id, seconds)
     sched = get_scheduler()
     sched.add_job(
-        func, "interval", seconds=seconds,
+        func, "interval", seconds=actual,
         id=job_id, name=TASK_NAMES.get(job_id, job_id),
         replace_existing=True, **kwargs,
     )
-    logger.info("[SCHEDULER] Added job %s (every %ds)", job_id, seconds)
+    logger.info("[SCHEDULER] Added job %s (every %ds%s)", job_id, actual,
+                "" if actual == seconds else f", saved override from default {seconds}s")
 
 
 def get_jobs_info() -> list[dict]:
@@ -64,7 +70,7 @@ def get_jobs_info() -> list[dict]:
 
 
 def update_job_interval(job_id: str, seconds: int) -> bool:
-    """Update a job's interval."""
+    """Update a job's interval and persist to settings."""
     if not _scheduler:
         return False
     job = _scheduler.get_job(job_id)
@@ -72,7 +78,34 @@ def update_job_interval(job_id: str, seconds: int) -> bool:
         return False
     _scheduler.reschedule_job(job_id, trigger="interval", seconds=seconds)
     logger.info("[SCHEDULER] Rescheduled %s to every %ds", job_id, seconds)
+    # Persist so it survives restarts
+    _save_interval(job_id, seconds)
     return True
+
+
+def _save_interval(job_id: str, seconds: int):
+    """Persist a task interval to settings JSON."""
+    import json
+    from core.config import get_setting, save_settings
+    raw = get_setting("TASK_INTERVALS", "{}")
+    try:
+        intervals = json.loads(raw)
+    except (ValueError, TypeError):
+        intervals = {}
+    intervals[job_id] = seconds
+    save_settings({"TASK_INTERVALS": json.dumps(intervals)})
+
+
+def get_saved_interval(job_id: str, default: int) -> int:
+    """Read a persisted task interval, falling back to default."""
+    import json
+    from core.config import get_setting
+    raw = get_setting("TASK_INTERVALS", "{}")
+    try:
+        intervals = json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+    return intervals.get(job_id, default)
 
 
 def run_job_now(job_id: str) -> bool:
