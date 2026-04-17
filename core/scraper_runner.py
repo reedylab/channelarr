@@ -18,14 +18,12 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.base import JobLookupError
 
 logger = logging.getLogger(__name__)
 
 SCRAPERS_DIR = os.getenv("SCRAPERS_DIR", "/app/scrapers")
 
-_scheduler = None
 _last_runs: dict[str, dict] = {}  # name -> {time, events, error}
 _running: set[str] = set()
 _run_lock = threading.Lock()
@@ -149,13 +147,18 @@ def get_status() -> dict:
             if f.endswith(".py") and not f.startswith("_"):
                 available.append(f[:-3])
 
-    # Build next_run_time lookup from scheduler
+    # Build next_run_time lookup from central scheduler
     next_runs = {}
-    if _scheduler and _scheduler.running:
-        for job in _scheduler.get_jobs():
-            name = job.id.replace("scraper_", "", 1)
-            if job.next_run_time:
-                next_runs[name] = job.next_run_time.isoformat()
+    try:
+        from core.scheduler import get_scheduler
+        sched = get_scheduler()
+        for job in sched.get_jobs():
+            if job.id.startswith("scraper_"):
+                name = job.id.replace("scraper_", "", 1)
+                if job.next_run_time:
+                    next_runs[name] = job.next_run_time.isoformat()
+    except Exception:
+        pass
 
     scrapers = {}
     for name in set(list(config.get("scrapers", {}).keys()) + available):
@@ -175,12 +178,8 @@ def get_status() -> dict:
 
 
 def reschedule_scraper(name: str, cfg: dict):
-    """Add or update an APScheduler job for a scraper at runtime."""
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = BackgroundScheduler(daemon=True)
-        _scheduler.start()
-        logger.info("[SCRAPER] Lazily started scheduler for runtime reschedule")
+    """Add or update a scraper job on the central scheduler."""
+    from core.scheduler import get_scheduler
 
     script_path = os.path.join(SCRAPERS_DIR, f"{name}.py")
     if not os.path.isfile(script_path):
@@ -188,7 +187,8 @@ def reschedule_scraper(name: str, cfg: dict):
         return
 
     hours = cfg.get("interval_hours", 6)
-    _scheduler.add_job(
+    sched = get_scheduler()
+    sched.add_job(
         run_scraper, "interval", hours=hours,
         args=[name, cfg],
         id=f"scraper_{name}", name=f"Scraper: {name}",
@@ -198,28 +198,25 @@ def reschedule_scraper(name: str, cfg: dict):
 
 
 def disable_scraper(name: str):
-    """Remove a scraper's APScheduler job."""
-    if _scheduler is None:
-        return
+    """Remove a scraper job from the central scheduler."""
     try:
-        _scheduler.remove_job(f"scraper_{name}")
+        from core.scheduler import get_scheduler
+        get_scheduler().remove_job(f"scraper_{name}")
         logger.info("[SCRAPER] Disabled scheduler job for %s", name)
-    except JobLookupError:
+    except (JobLookupError, Exception):
         pass
 
 
 def start_scraper_scheduler():
-    """Initialize and start the APScheduler with configured scraper jobs."""
-    global _scheduler
+    """Register configured scraper jobs on the central scheduler."""
     from core.config import get_scraper_config
 
     config = get_scraper_config()
     scrapers = config.get("scrapers", {})
     if not scrapers:
-        logger.info("[SCRAPER] No scrapers configured, scheduler not started")
+        logger.info("[SCRAPER] No scrapers configured")
         return
 
-    _scheduler = BackgroundScheduler(daemon=True)
     count = 0
     for name, cfg in scrapers.items():
         if not cfg.get("enabled"):
@@ -228,18 +225,10 @@ def start_scraper_scheduler():
         if not os.path.isfile(script_path):
             logger.warning("[SCRAPER] Script %s.py not found in %s, skipping", name, SCRAPERS_DIR)
             continue
-        hours = cfg.get("interval_hours", 6)
-        _scheduler.add_job(
-            run_scraper, "interval", hours=hours,
-            args=[name, cfg],
-            id=f"scraper_{name}", name=f"Scraper: {name}",
-            replace_existing=True,
-        )
+        reschedule_scraper(name, cfg)
         count += 1
-        logger.info("[SCRAPER] Scheduled %s (every %dh)", name, hours)
 
     if count:
-        _scheduler.start()
-        logger.info("[SCRAPER] Scheduler started with %d scraper(s)", count)
+        logger.info("[SCRAPER] Registered %d scraper(s) on central scheduler", count)
     else:
         logger.info("[SCRAPER] No enabled scrapers with scripts found")
