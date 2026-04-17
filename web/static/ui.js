@@ -53,6 +53,11 @@ function switchView(view) {
     clearInterval(resolverTimer);
     resolverTimer = null;
   }
+  if (view === "scrapers") loadScrapers();
+  if (view !== "scrapers") {
+    clearInterval(scraperTimer);
+    scraperTimer = null;
+  }
 }
 
 // ─── Toast ───
@@ -2458,5 +2463,212 @@ setInterval(() => {
   if ($("#view-channels").classList.contains("visible")) loadChannels();
   if ($("#view-guide").classList.contains("visible")) loadGuide();
 }, 10000);
+
+// ─── Scrapers ───
+let scraperTimer = null;
+let scraperSourceOpen = {};  // name -> bool
+
+function _timeAgo(iso) {
+  if (!iso) return "--";
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 0) return _timeUntil(iso);
+  if (diff < 60) return `${Math.round(diff)}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function _timeUntil(iso) {
+  if (!iso) return "--";
+  const diff = (new Date(iso).getTime() - Date.now()) / 1000;
+  if (diff < 0) return _timeAgo(iso);
+  if (diff < 60) return `in ${Math.round(diff)}s`;
+  if (diff < 3600) return `in ${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`;
+  return `in ${Math.floor(diff / 86400)}d`;
+}
+
+async function loadScrapers() {
+  try {
+    const r = await fetch(`${API}/scrapers/status`);
+    const data = await r.json();
+    renderScraperCards(data);
+    const anyRunning = Object.values(data.scrapers || {}).some(s => s.running);
+    if (anyRunning && !scraperTimer) {
+      scraperTimer = setInterval(loadScrapers, 3000);
+    } else if (!anyRunning && scraperTimer) {
+      clearInterval(scraperTimer);
+      scraperTimer = null;
+    }
+  } catch (e) {
+    toast("error", "Failed to load scrapers");
+  }
+}
+
+function renderScraperCards(data) {
+  const grid = $("#scraper-grid");
+  const entries = Object.entries(data.scrapers || {});
+  const badge = $("#scraper-count");
+  if (badge) badge.textContent = `${entries.length} plugin${entries.length !== 1 ? "s" : ""}`;
+
+  if (!entries.length) {
+    grid.innerHTML = '<div class="empty-state">No scraper plugins found.<br><small class="text-muted">Drop .py scripts into the scrapers/ directory to get started.</small></div>';
+    return;
+  }
+
+  grid.innerHTML = entries.map(([name, s]) => {
+    const dotClass = s.running ? "scraper-dot-running"
+      : (s.last_run && s.last_run.error) ? "scraper-dot-error"
+      : s.last_run ? "scraper-dot-ok"
+      : "scraper-dot-idle";
+    const checked = s.enabled ? "checked" : "";
+    const disabledClass = s.enabled ? "" : " disabled";
+    const tags = (s.default_tags || []).join(", ");
+    const lastTime = s.last_run ? _timeAgo(s.last_run.time) : "never";
+    const lastEvents = s.last_run ? s.last_run.events : "--";
+    const lastErr = s.last_run && s.last_run.error
+      ? `<span class="stat-err" title="${esc(s.last_run.error)}">${esc(s.last_run.error).substring(0, 40)}</span>`
+      : "none";
+    const nextRun = s.next_run_time ? _timeUntil(s.next_run_time) : (s.enabled ? "pending" : "--");
+    const hasScript = s.has_script;
+    const sourceOpen = scraperSourceOpen[name];
+
+    return `<div class="scraper-card${disabledClass}" data-scraper="${esc(name)}">
+      <div class="scraper-card-header">
+        <div class="scraper-card-name">
+          <span class="scraper-dot ${dotClass}"></span>
+          ${esc(name)}
+          ${!hasScript ? '<span class="badge" style="font-size:10px;color:var(--warn)">no script</span>' : ''}
+        </div>
+        <label class="scraper-toggle">
+          <input type="checkbox" ${checked} onchange="channelarr.scraperToggle('${esc(name)}', this)">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="scraper-config">
+        <div class="scraper-config-row">
+          <label>Interval</label>
+          <input type="number" min="0.5" step="0.5" value="${s.interval_hours}" data-field="interval_hours" style="width:70px">
+          <span style="color:var(--text-muted)">hours</span>
+          <label style="width:auto;margin-left:12px">Timeout</label>
+          <input type="number" min="10" step="10" value="${s.timeout}" data-field="timeout" style="width:60px">
+          <span style="color:var(--text-muted)">s</span>
+        </div>
+        <div class="scraper-config-row">
+          <label>Tags</label>
+          <input type="text" value="${esc(tags)}" data-field="default_tags" placeholder="comma-separated">
+        </div>
+      </div>
+      <div class="scraper-stats">
+        <span>Last run: <span class="stat-val">${lastTime}</span></span>
+        <span>Events: <span class="stat-val">${lastEvents}</span></span>
+        <span>Errors: ${lastErr}</span>
+        <span>Next: <span class="stat-val">${nextRun}</span></span>
+      </div>
+      <div class="scraper-card-actions">
+        <div style="display:flex;gap:6px">
+          <button class="btn-sm" onclick="channelarr.scraperRun('${esc(name)}')" ${!hasScript ? "disabled" : ""}>Run Now</button>
+          ${hasScript ? `<button class="btn-sm" onclick="channelarr.scraperViewSource('${esc(name)}', this)">${sourceOpen ? "Hide Source" : "View Source"}</button>` : ""}
+        </div>
+        <button class="btn-sm" onclick="channelarr.scraperSave('${esc(name)}')">Save Config</button>
+      </div>
+      <div class="scraper-source-wrap" id="scraper-source-${esc(name)}" style="display:${sourceOpen ? "block" : "none"}"></div>
+    </div>`;
+  }).join("");
+}
+
+channelarr.scraperToggle = async function(name, checkbox) {
+  const card = checkbox.closest(".scraper-card");
+  const cfg = _readScraperConfig(card, checkbox.checked);
+  try {
+    const r = await fetch(`${API}/scrapers/${encodeURIComponent(name)}/config`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(cfg),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      toast("success", `${name} ${cfg.enabled ? "enabled" : "disabled"}`);
+      loadScrapers();
+    } else {
+      toast("error", d.detail || d.error || "Toggle failed");
+      checkbox.checked = !checkbox.checked;
+    }
+  } catch (e) {
+    toast("error", "Toggle failed");
+    checkbox.checked = !checkbox.checked;
+  }
+};
+
+channelarr.scraperSave = async function(name) {
+  const card = $(`[data-scraper="${name}"]`);
+  if (!card) return;
+  const toggle = card.querySelector(".scraper-toggle input");
+  const cfg = _readScraperConfig(card, toggle ? toggle.checked : false);
+  try {
+    const r = await fetch(`${API}/scrapers/${encodeURIComponent(name)}/config`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(cfg),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      toast("success", `Config saved for ${name}`);
+      loadScrapers();
+    } else {
+      toast("error", d.detail || d.error || "Save failed");
+    }
+  } catch (e) {
+    toast("error", "Save failed");
+  }
+};
+
+channelarr.scraperRun = async function(name) {
+  try {
+    const r = await fetch(`${API}/scrapers/${encodeURIComponent(name)}/run`, {method: "POST"});
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      toast("success", d.message || `Running ${name}`);
+      setTimeout(loadScrapers, 500);
+    } else {
+      toast("error", d.detail || d.error || "Run failed");
+    }
+  } catch (e) {
+    toast("error", "Run failed");
+  }
+};
+
+channelarr.scraperViewSource = async function(name, btn) {
+  const wrap = $(`#scraper-source-${name}`);
+  if (!wrap) return;
+  if (scraperSourceOpen[name]) {
+    scraperSourceOpen[name] = false;
+    wrap.style.display = "none";
+    if (btn) btn.textContent = "View Source";
+    return;
+  }
+  try {
+    const r = await fetch(`${API}/scrapers/${encodeURIComponent(name)}/source`);
+    if (!r.ok) { toast("error", "Failed to load source"); return; }
+    const text = await r.text();
+    const lines = text.split("\n").map(l =>
+      `<span class="line">${esc(l)}</span>`
+    ).join("");
+    wrap.innerHTML = `<pre class="scraper-source">${lines}</pre>`;
+    wrap.style.display = "block";
+    scraperSourceOpen[name] = true;
+    if (btn) btn.textContent = "Hide Source";
+  } catch (e) {
+    toast("error", "Failed to load source");
+  }
+};
+
+function _readScraperConfig(card, enabled) {
+  const interval = parseFloat(card.querySelector('[data-field="interval_hours"]').value) || 6;
+  const timeout = parseInt(card.querySelector('[data-field="timeout"]').value) || 90;
+  const tagsRaw = card.querySelector('[data-field="default_tags"]').value;
+  const tags = tagsRaw.split(",").map(t => t.trim()).filter(Boolean);
+  return {enabled, interval_hours: interval, default_tags: tags, timeout};
+}
 
 })();

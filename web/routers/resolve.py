@@ -210,26 +210,3 @@ def refresh_single(manifest_id: str):
     )
     thread.start()
     return {"ok": True, "message": f"Refreshing {manifest_id}"}
-
-
-@router.get("/scraper/status")
-def scraper_status():
-    """Return configured scrapers, available scripts, and last run info."""
-    from core.scraper_runner import get_status
-    return get_status()
-
-
-@router.post("/scraper/run/{script_name}")
-def scraper_run(script_name: str):
-    """Manually trigger a scraper. Runs in background thread."""
-    from core.scraper_runner import run_scraper
-    from core.config import get_scraper_config
-    config = get_scraper_config()
-    cfg = config.get("scrapers", {}).get(script_name, {})
-    thread = threading.Thread(
-        target=run_scraper,
-        args=(script_name, cfg),
-        daemon=True,
-    )
-    thread.start()
-    return {"ok": True, "message": f"Running scraper: {script_name}"}

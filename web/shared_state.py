@@ -123,16 +123,6 @@ SETTINGS_SCHEMA = {
             },
         },
     },
-    "scrapers": {
-        "label": "Scrapers",
-        "fields": {
-            "SCRAPER_CONFIG": {
-                "label": "Scraper Configuration (JSON)",
-                "type": "textarea",
-                "placeholder": '{"scrapers": {"streameast": {"enabled": true, "interval_hours": 6, "default_tags": ["Sports", "Events"], "timeout": 90}}}',
-            },
-        },
-    },
     "vpn": {
         "label": "VPN",
         "fields": {

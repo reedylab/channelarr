@@ -55,6 +55,9 @@
         <button class="nav-item" data-view="resolver" title="Resolver">
           <span class="nav-ic">&#9906;</span> <span>Resolver</span>
         </button>
+        <button class="nav-item" data-view="scrapers" title="Scrapers">
+          <span class="nav-ic">&#9830;</span> <span>Scrapers</span>
+        </button>
         <button class="nav-item" data-view="logs" title="Logs">
           <span class="nav-ic">&#9776;</span> <span>Logs</span>
         </button>
@@ -210,6 +213,23 @@
               <div class="resolver-player-wrap">
                 <video id="resolver-video" controls autoplay></video>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCRAPERS -->
+      <section id="view-scrapers" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Scraper Plugins</h3>
+            <div class="panel-actions">
+              <span id="scraper-count" class="badge">0 plugins</span>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div id="scraper-grid" class="scraper-grid">
+              <div class="empty-state">No scraper plugins found.<br><small class="text-muted">Drop .py scripts into the scrapers/ directory to get started.</small></div>
             </div>
           </div>
         </div>

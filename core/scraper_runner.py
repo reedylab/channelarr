@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.base import JobLookupError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ SCRAPERS_DIR = os.getenv("SCRAPERS_DIR", "/app/scrapers")
 
 _scheduler = None
 _last_runs: dict[str, dict] = {}  # name -> {time, events, error}
+_running: set[str] = set()
 _run_lock = threading.Lock()
 
 
@@ -79,6 +81,7 @@ def run_scraper(name: str, config: dict | None = None):
     timeout = config.get("timeout", 90)
 
     with _run_lock:
+        _running.add(name)
         logger.info("[SCRAPER] Running scraper: %s", name)
         run_record = {"time": datetime.now(timezone.utc).isoformat(), "events": 0, "error": None}
 
@@ -128,11 +131,14 @@ def run_scraper(name: str, config: dict | None = None):
             logger.exception("[SCRAPER] %s failed: %s", name, e)
             run_record["error"] = str(e)
 
+        finally:
+            _running.discard(name)
+
         _last_runs[name] = run_record
 
 
 def get_status() -> dict:
-    """Return scraper config, last run info, and available scripts."""
+    """Return scraper config, last run info, running state, and scheduler info."""
     from core.config import get_scraper_config
     config = get_scraper_config()
 
@@ -143,17 +149,63 @@ def get_status() -> dict:
             if f.endswith(".py") and not f.startswith("_"):
                 available.append(f[:-3])
 
+    # Build next_run_time lookup from scheduler
+    next_runs = {}
+    if _scheduler and _scheduler.running:
+        for job in _scheduler.get_jobs():
+            name = job.id.replace("scraper_", "", 1)
+            if job.next_run_time:
+                next_runs[name] = job.next_run_time.isoformat()
+
     scrapers = {}
     for name in set(list(config.get("scrapers", {}).keys()) + available):
         cfg = config.get("scrapers", {}).get(name, {})
         scrapers[name] = {
             "enabled": cfg.get("enabled", False),
             "interval_hours": cfg.get("interval_hours", 6),
+            "default_tags": cfg.get("default_tags", []),
+            "timeout": cfg.get("timeout", 90),
             "has_script": name in available,
+            "running": name in _running,
             "last_run": _last_runs.get(name),
+            "next_run_time": next_runs.get(name),
         }
 
     return {"scrapers": scrapers}
+
+
+def reschedule_scraper(name: str, cfg: dict):
+    """Add or update an APScheduler job for a scraper at runtime."""
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler(daemon=True)
+        _scheduler.start()
+        logger.info("[SCRAPER] Lazily started scheduler for runtime reschedule")
+
+    script_path = os.path.join(SCRAPERS_DIR, f"{name}.py")
+    if not os.path.isfile(script_path):
+        logger.warning("[SCRAPER] Cannot schedule %s: script not found", name)
+        return
+
+    hours = cfg.get("interval_hours", 6)
+    _scheduler.add_job(
+        run_scraper, "interval", hours=hours,
+        args=[name, cfg],
+        id=f"scraper_{name}", name=f"Scraper: {name}",
+        replace_existing=True,
+    )
+    logger.info("[SCRAPER] Rescheduled %s (every %sh)", name, hours)
+
+
+def disable_scraper(name: str):
+    """Remove a scraper's APScheduler job."""
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.remove_job(f"scraper_{name}")
+        logger.info("[SCRAPER] Disabled scheduler job for %s", name)
+    except JobLookupError:
+        pass
 
 
 def start_scraper_scheduler():
