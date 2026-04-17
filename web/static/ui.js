@@ -1572,6 +1572,9 @@ const TASK_INTERVAL_OPTIONS = {
     {label: "1 hour", seconds: 3600},
     {label: "2 hours", seconds: 7200},
     {label: "4 hours", seconds: 14400},
+    {label: "8 hours", seconds: 28800},
+    {label: "12 hours", seconds: 43200},
+    {label: "24 hours", seconds: 86400},
   ],
 };
 
