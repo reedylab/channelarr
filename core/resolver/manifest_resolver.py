@@ -294,6 +294,7 @@ class ManifestResolverService:
         _status["last_url"] = url
         _status["last_error"] = None
         result = None
+        _sidecar_failed = False
 
         try:
             capture = _call_sidecar(url, timeout)
@@ -405,21 +406,24 @@ class ManifestResolverService:
             err = f"Sidecar communication failed: {e}"
             logger.exception("Sidecar call failed for %s", url)
             _status["last_error"] = err
+            _sidecar_failed = True
             result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": err}
             return result
 
         except Exception as e:
             logger.exception("Resolve failed for %s", url)
             _status["last_error"] = str(e)
+            _sidecar_failed = True
             result = {"ok": False, "manifest_id": None, "manifest_url": None, "error": str(e)}
             return result
 
         finally:
             _status["running"] = False
-            # Circuit breaker bookkeeping
+            # Circuit breaker — only trip on sidecar communication failures,
+            # NOT on "no manifest found" (normal for pregame/upcoming streams)
             if result and result.get("ok"):
                 _cb_record_success(url)
-            elif result:
+            elif _sidecar_failed:
                 _cb_record_failure(url)
             # Signal in-flight waiters
             with _inflight_lock:
