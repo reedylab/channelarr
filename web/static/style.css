@@ -407,8 +407,8 @@ button,input,select,textarea{font-family:inherit}
 
 /* System Stats */
 .stats-layout{display:grid;grid-template-columns:2fr 3fr;gap:16px;margin-bottom:18px}
-.stats-left{display:flex;flex-direction:column;gap:16px}
-.stats-right{display:flex;flex-direction:column;gap:16px}
+.stats-left{display:flex;flex-direction:column;gap:16px;min-width:0}
+.stats-right{display:flex;flex-direction:column;gap:16px;min-width:0}
 .stats-right .stat-card{flex:1}
 .stat-card-compact{padding:14px}
 .stat-card-compact .stat-card-header{margin-bottom:8px}
