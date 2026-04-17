@@ -690,21 +690,13 @@ button,input,select,textarea{font-family:inherit}
 .nav-subitem:hover{color:var(--text);background:rgba(255,255,255,0.03)}
 .nav-subitem.active{color:var(--accent);font-weight:500}
 
-/* ---- Task Cards ---- */
-.task-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;padding:16px 0}
-.task-card{
-  background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
-  padding:14px 16px;display:flex;flex-direction:column;gap:6px;
-}
-.task-card-header{display:flex;align-items:center;gap:8px}
-.task-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.task-dot-running{background:var(--ok)}
-.task-dot-scheduled{background:var(--accent)}
-.task-dot-stopped{background:var(--text-muted)}
-.task-card-name{font-weight:600;font-size:13px}
-.task-card-desc{font-size:12px;color:var(--text-muted)}
-.task-card-meta{display:flex;gap:12px;font-size:11px;color:var(--text-muted)}
-.task-card-meta .val{color:var(--text);font-weight:500}
+/* ---- Task Cards (matches manifold) ---- */
+.task-card{background:var(--bg-hover);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}
+.task-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.task-name{font-weight:600;font-size:15px}
+.task-actions{display:flex;gap:6px;align-items:center}
+.task-meta{display:flex;gap:16px;align-items:center;font-size:13px;color:var(--text-muted)}
+.task-next{font-size:12px;color:var(--text-muted)}
 
 /* ---- Scrapers ---- */
 .scraper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}

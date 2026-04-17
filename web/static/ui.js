@@ -1546,6 +1546,8 @@ $("#save-settings").addEventListener("click", async () => {
 
 // ─── Tasks ───
 async function loadTasks() {
+  const container = $("#tasks-container");
+  if (!container) return;
   try {
     const r = await fetch(`${API}/tasks/status`);
     const data = await r.json();
@@ -1554,38 +1556,32 @@ async function loadTasks() {
       tasksTimer = setInterval(loadTasks, 10000);
     }
   } catch (e) {
-    const grid = $("#tasks-grid");
-    if (grid) grid.innerHTML = '<div class="empty-state">Failed to load tasks</div>';
+    container.innerHTML = '<div class="empty-state">Failed to load tasks</div>';
   }
 }
 
 function renderTasks(tasks) {
-  const grid = $("#tasks-grid");
-  if (!grid) return;
+  const container = $("#tasks-container");
+  if (!container) return;
 
   if (!tasks.length) {
-    grid.innerHTML = '<div class="empty-state">No background tasks registered.</div>';
+    container.innerHTML = '<div class="empty-state">No background tasks registered.</div>';
     return;
   }
 
-  grid.innerHTML = tasks.map(t => {
-    const dotClass = t.status === "running" ? "task-dot-running"
-      : t.status === "scheduled" ? "task-dot-scheduled"
-      : "task-dot-stopped";
-    const nextRun = t.next_run_time ? `Next: <span class="val">${_timeUntil(t.next_run_time)}</span>` : "";
-    const interval = t.interval ? `Interval: <span class="val">${esc(t.interval)}</span>` : "";
-    const status = `Status: <span class="val">${esc(t.status)}</span>`;
+  container.innerHTML = tasks.map(t => {
+    const intervalLabel = t.interval ? `Every: ${esc(t.interval)}` : "";
+    const nextRun = t.next_run_time ? _timeUntil(t.next_run_time) : "";
 
-    return `<div class="task-card">
-      <div class="task-card-header">
-        <span class="task-dot ${dotClass}"></span>
-        <span class="task-card-name">${esc(t.name)}</span>
+    return `<div class="task-card" data-task-id="${esc(t.id)}">
+      <div class="task-header">
+        <span class="task-name">${esc(t.name)}</span>
+        <div class="task-actions"></div>
       </div>
-      <div class="task-card-desc">${esc(t.description)}</div>
-      <div class="task-card-meta">
-        <span>${status}</span>
-        ${interval ? `<span>${interval}</span>` : ""}
-        ${nextRun ? `<span>${nextRun}</span>` : ""}
+      <div class="task-meta">
+        ${intervalLabel ? `<span>${intervalLabel}</span>` : ""}
+        ${nextRun ? `<span class="task-next">Next: ${nextRun}</span>` : ""}
+        ${!intervalLabel && !nextRun ? `<span>${esc(t.description)}</span>` : ""}
       </div>
     </div>`;
   }).join("");
