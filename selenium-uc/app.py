@@ -529,6 +529,45 @@ def cookies_youtube():
             _release_browser()
 
 
+def _try_click_play(browser):
+    """Attempt to click play button overlays to start a stream.
+
+    Many streaming sites require a user click before the HLS manifest
+    loads — especially for pregame/upcoming events. Tries common play
+    button selectors, then falls back to clicking the video element.
+    """
+    play_selectors = [
+        # Common play button patterns
+        ".play-button", ".vjs-big-play-button", ".jw-icon-display",
+        "[class*='play']", "button[aria-label*='play' i]",
+        ".btn-play", "#play-btn", ".plyr__control--overlaid",
+        # Generic video click
+        "video",
+        # Player container (last resort)
+        ".video-player", ".player", "#player", ".jw-wrapper",
+    ]
+    for sel in play_selectors:
+        try:
+            el = browser.find_element(By.CSS_SELECTOR, sel)
+            if el.is_displayed():
+                el.click()
+                logger.info("Clicked play element: %s", sel)
+                time.sleep(2)  # let the player initialize
+                return
+        except Exception:
+            continue
+    # Final fallback: JS click on any video element
+    try:
+        browser.execute_script("""
+            var v = document.querySelector('video');
+            if (v) { v.click(); v.play && v.play().catch(function(){}); }
+        """)
+        logger.info("JS fallback: clicked/played video element")
+        time.sleep(2)
+    except Exception:
+        pass
+
+
 @app.post("/capture")
 def capture(req: CaptureRequest):
     """Navigate to a URL and capture an m3u8 manifest using the persistent session."""
@@ -559,6 +598,11 @@ def capture(req: CaptureRequest):
                     logger.info("Switched to iframe")
                 except Exception:
                     logger.debug("No iframe, continuing in main frame")
+
+            # Try clicking play button — pregame streams often need a click
+            # before the m3u8 loads. Try common selectors, then fall back to
+            # clicking the video element or player container.
+            _try_click_play(browser)
 
             result = _wait_for_manifest(browser, timeout=req.timeout)
             if not result:
