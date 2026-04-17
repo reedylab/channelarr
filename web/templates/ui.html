@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=26" />
+  <link rel="stylesheet" href="/static/style.css?v=27" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -64,9 +64,14 @@
         <button class="nav-item" data-view="system" title="System">
           <span class="nav-ic">&#9673;</span> <span>System</span>
         </button>
-        <button class="nav-item" data-view="settings" title="Settings">
-          <span class="nav-ic">&#9881;</span> <span>Settings</span>
+        <button class="nav-item nav-item-parent" data-view="settings" title="Settings">
+          <span class="nav-ic">&#9881;</span> <span>Settings</span> <span class="nav-arrow">&#9662;</span>
         </button>
+        <div id="settings-subnav" class="nav-subnav">
+          <button class="nav-subitem active" data-sub="general">General</button>
+          <button class="nav-subitem" data-sub="tasks">Tasks</button>
+          <button class="nav-subitem" data-sub="branding">Branding</button>
+        </div>
       </nav>
       <div class="sidebar-info">
         <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
@@ -341,15 +346,25 @@
                 <button id="save-settings" type="button" class="btn btn-primary">Save</button>
               </div>
             </div>
-            <div id="settings-container" class="settings-content"></div>
-            <div class="settings-section" style="margin-top:24px;">
-              <h3>Branding Logos</h3>
-              <p style="color:#888;font-size:13px;margin-bottom:12px;">Upload logos to overlay on channel streams. Assign per-channel in the channel editor.</p>
-              <div id="branding-grid" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;"></div>
-              <label class="btn btn-secondary" style="cursor:pointer;">
-                Upload Logo
-                <input type="file" id="branding-upload" accept="image/png,image/jpeg" style="display:none;">
-              </label>
+            <!-- General (settings form) -->
+            <div id="settings-sub-general" class="settings-sub">
+              <div id="settings-container" class="settings-content"></div>
+            </div>
+            <!-- Tasks -->
+            <div id="settings-sub-tasks" class="settings-sub" style="display:none">
+              <div id="tasks-grid" class="task-grid"></div>
+            </div>
+            <!-- Branding -->
+            <div id="settings-sub-branding" class="settings-sub" style="display:none">
+              <div class="settings-section">
+                <h3>Branding Logos</h3>
+                <p style="color:#888;font-size:13px;margin-bottom:12px;">Upload logos to overlay on channel streams. Assign per-channel in the channel editor.</p>
+                <div id="branding-grid" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;"></div>
+                <label class="btn btn-secondary" style="cursor:pointer;">
+                  Upload Logo
+                  <input type="file" id="branding-upload" accept="image/png,image/jpeg" style="display:none;">
+                </label>
+              </div>
             </div>
           </div>
         </div>
@@ -613,6 +628,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=39"></script>
+  <script src="/static/ui.js?v=40"></script>
 </body>
 </html>

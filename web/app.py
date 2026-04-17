@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI):
         # Start demand-driven refresh worker (only if DB is reachable)
         from core.resolver.manifest_resolver import start_refresh_worker
         start_refresh_worker()
+        shared_state.register_task("manifest_refresh", "Manifest Refresh", "Refreshes expiring resolved manifests", "on-demand")
         # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the
         # JSON safety net, clean orphaned resolved channels.
         from core.channels import (
@@ -205,10 +206,16 @@ async def lifespan(app: FastAPI):
     _materialize_missing(channel_mgr, bump_mgr, media_lib)
     shared_state.regenerate_m3u()
     shared_state.start_stats_collector()
+    shared_state.register_task("stats_collector", "Stats Collector", "Samples CPU/RAM/disk metrics", "30s")
+
     streamer_mgr.start_idle_cleanup(interval=60, timeout=300)
+    shared_state.register_task("stream_cleanup", "Stream Idle Cleanup", "Stops idle HLS streams after 5m", "60s")
 
     # VPN latency sampling + auto-rotate (only when gluetun is wired in)
     _start_vpn_threads()
+    shared_state.register_task("vpn_sampler", "VPN Latency Sampler", "Measures network latency", "60s")
+    if get_setting("GLUETUN_CONTROL_URL", ""):
+        shared_state.register_task("vpn_auto_rotate", "VPN Auto-Rotate", "Rotates VPN when latency exceeds threshold", "60s")
 
     # Event channel auto-cleanup (checks every 60s for expired event channels)
     def _event_cleanup_loop():
@@ -221,6 +228,7 @@ async def lifespan(app: FastAPI):
                 logging.error("[CLEANUP] event cleanup failed: %s", e)
     threading.Thread(target=_event_cleanup_loop, daemon=True).start()
     logging.info("[CLEANUP] Started event channel cleanup thread (60s interval)")
+    shared_state.register_task("event_cleanup", "Event Cleanup", "Removes expired event channels", "60s")
 
     # Scraper plugin scheduler
     try:
@@ -231,6 +239,7 @@ async def lifespan(app: FastAPI):
 
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)
+    shared_state.register_task("yt_cache_worker", "YouTube Pre-Cache", "Pre-downloads upcoming YouTube videos", "60s")
 
     logging.info("[APP] Channelarr ready")
 

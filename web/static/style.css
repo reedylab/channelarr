@@ -677,6 +677,35 @@ button,input,select,textarea{font-family:inherit}
 .vpn-history-tbl .rank-current{color:var(--accent)}
 .vpn-history-tbl .rank-gold{color:var(--ok)}
 
+/* ---- Settings Sub-Nav ---- */
+.nav-item-parent{justify-content:flex-start}
+.nav-arrow{margin-left:auto;font-size:10px;transition:transform 0.2s;color:var(--text-muted)}
+.nav-item-parent.expanded .nav-arrow{transform:rotate(180deg)}
+.nav-subnav{display:none;flex-direction:column;padding:0 10px 6px 10px}
+.nav-subnav.expanded{display:flex}
+.nav-subitem{
+  padding:9px 14px 9px 34px;background:none;border:none;text-align:left;
+  color:var(--text-muted);font-size:14px;cursor:pointer;border-radius:8px;transition:all 0.15s;
+}
+.nav-subitem:hover{color:var(--text);background:rgba(255,255,255,0.03)}
+.nav-subitem.active{color:var(--accent);font-weight:500}
+
+/* ---- Task Cards ---- */
+.task-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;padding:16px 0}
+.task-card{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;display:flex;flex-direction:column;gap:6px;
+}
+.task-card-header{display:flex;align-items:center;gap:8px}
+.task-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.task-dot-running{background:var(--ok)}
+.task-dot-scheduled{background:var(--accent)}
+.task-dot-stopped{background:var(--text-muted)}
+.task-card-name{font-weight:600;font-size:13px}
+.task-card-desc{font-size:12px;color:var(--text-muted)}
+.task-card-meta{display:flex;gap:12px;font-size:11px;color:var(--text-muted)}
+.task-card-meta .val{color:var(--text);font-weight:500}
+
 /* ---- Scrapers ---- */
 .scraper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
 .scraper-card{

@@ -27,11 +27,49 @@ let tailPos = 0, tailInode = null;
 const logOut = $("#log-output");
 
 // ─── Navigation ───
+let currentSettingsSub = "general";
+let tasksTimer = null;
+
 $$(".nav-item").forEach(btn => {
   btn.addEventListener("click", () => {
+    if (btn.classList.contains("nav-item-parent")) {
+      btn.classList.toggle("expanded");
+      const sub = $("#settings-subnav");
+      if (sub) sub.classList.toggle("expanded");
+    }
     switchView(btn.dataset.view);
   });
 });
+
+$$(".nav-subitem").forEach(btn => {
+  btn.addEventListener("click", () => {
+    currentSettingsSub = btn.dataset.sub;
+    $$(".nav-subitem").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    switchSettingsSub(currentSettingsSub);
+  });
+});
+
+function switchSettingsSub(sub) {
+  $$(".settings-sub").forEach(el => el.style.display = "none");
+  const target = $(`#settings-sub-${sub}`);
+  if (target) target.style.display = "";
+
+  // Show/hide save button based on sub-tab
+  const saveBtn = $("#save-settings");
+  if (saveBtn) saveBtn.style.display = sub === "general" ? "" : "none";
+
+  const title = $("#settings-section-title");
+  if (title) {
+    const titles = {general: "Settings", tasks: "Background Tasks", branding: "Branding Logos"};
+    title.textContent = titles[sub] || "Settings";
+  }
+
+  if (sub === "general") loadSettings();
+  if (sub === "tasks") loadTasks();
+  if (sub === "branding") loadBrandingGrid();
+  if (sub !== "tasks") { clearInterval(tasksTimer); tasksTimer = null; }
+}
 
 function switchView(view) {
   $$(".nav-item").forEach(n => {
@@ -49,6 +87,17 @@ function switchView(view) {
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
   if (view === "resolver") loadResolver();
+  if (view === "settings") {
+    // Auto-expand subnav and load active sub-tab
+    const parentBtn = document.querySelector('[data-view="settings"]');
+    const sub = $("#settings-subnav");
+    if (parentBtn && !parentBtn.classList.contains("expanded")) {
+      parentBtn.classList.add("expanded");
+      if (sub) sub.classList.add("expanded");
+    }
+    switchSettingsSub(currentSettingsSub);
+  }
+  if (view !== "settings") { clearInterval(tasksTimer); tasksTimer = null; }
   if (view !== "resolver") {
     clearInterval(resolverTimer);
     resolverTimer = null;
@@ -1412,12 +1461,10 @@ async function loadSettings() {
     settingsOriginal = {...data.values};
     settingsModified = {...data.values};
     renderAllSettings();
-    loadBrandingGrid();
   } catch(e) {}
 }
 
 function renderAllSettings() {
-  $("#settings-section-title").textContent = "Settings";
   const container = $("#settings-container");
   container.innerHTML = "";
   const grid = document.createElement("div");
@@ -1496,6 +1543,53 @@ $("#save-settings").addEventListener("click", async () => {
   }
   setTimeout(() => { status.textContent = ""; status.className = "settings-status"; }, 3000);
 });
+
+// ─── Tasks ───
+async function loadTasks() {
+  try {
+    const r = await fetch(`${API}/tasks/status`);
+    const data = await r.json();
+    renderTasks(data.tasks || []);
+    if (!tasksTimer) {
+      tasksTimer = setInterval(loadTasks, 10000);
+    }
+  } catch (e) {
+    const grid = $("#tasks-grid");
+    if (grid) grid.innerHTML = '<div class="empty-state">Failed to load tasks</div>';
+  }
+}
+
+function renderTasks(tasks) {
+  const grid = $("#tasks-grid");
+  if (!grid) return;
+
+  if (!tasks.length) {
+    grid.innerHTML = '<div class="empty-state">No background tasks registered.</div>';
+    return;
+  }
+
+  grid.innerHTML = tasks.map(t => {
+    const dotClass = t.status === "running" ? "task-dot-running"
+      : t.status === "scheduled" ? "task-dot-scheduled"
+      : "task-dot-stopped";
+    const nextRun = t.next_run_time ? `Next: <span class="val">${_timeUntil(t.next_run_time)}</span>` : "";
+    const interval = t.interval ? `Interval: <span class="val">${esc(t.interval)}</span>` : "";
+    const status = `Status: <span class="val">${esc(t.status)}</span>`;
+
+    return `<div class="task-card">
+      <div class="task-card-header">
+        <span class="task-dot ${dotClass}"></span>
+        <span class="task-card-name">${esc(t.name)}</span>
+      </div>
+      <div class="task-card-desc">${esc(t.description)}</div>
+      <div class="task-card-meta">
+        <span>${status}</span>
+        ${interval ? `<span>${interval}</span>` : ""}
+        ${nextRun ? `<span>${nextRun}</span>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
 
 // ─── Branding Logos ───
 async function loadBrandingDropdown(selectId, selected) {

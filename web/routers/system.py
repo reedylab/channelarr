@@ -17,6 +17,12 @@ def api_system_stats():
     return shared_state.get_stats_snapshot()
 
 
+@router.get("/tasks/status")
+def api_tasks_status():
+    """Return all background tasks and scheduler jobs."""
+    return {"tasks": shared_state.get_tasks()}
+
+
 # ── VPN ──────────────────────────────────────────────────────────────────
 
 @router.get("/vpn/status")
