@@ -152,6 +152,11 @@ def _make_browser():
         raise RuntimeError("Chrome startup returned None")
 
     logger.info("Chrome started successfully")
+    # Set page load timeout so browser.get() can't block forever
+    try:
+        result[0].set_page_load_timeout(120)
+    except Exception:
+        pass
     return result[0]
 
 
@@ -405,21 +410,34 @@ def _decode_body(result):
     return text
 
 
+_health_failures = 0
+_MAX_HEALTH_FAILURES = 6  # 6 failures × 30s interval = 3 minutes stuck → self-kill
+
 @app.get("/health")
 def health():
     """Health check that detects a stuck browser lock.
 
     Tries to acquire _browser_lock with a 5s timeout. If it can't,
-    Chrome startup or a capture is hung — return 503 so Docker
-    restarts the container.
+    Chrome startup or a capture is hung. After repeated failures,
+    kills the process so Docker restarts the container.
     """
+    global _health_failures
     acquired = _browser_lock.acquire(timeout=5)
     if not acquired:
+        _health_failures += 1
+        logger.warning("Health check failed (%d/%d): browser_lock stuck",
+                       _health_failures, _MAX_HEALTH_FAILURES)
+        if _health_failures >= _MAX_HEALTH_FAILURES:
+            logger.error("Browser stuck for too long, killing process for Docker restart")
+            _kill_chrome_processes()
+            os._exit(1)
         return JSONResponse(
             status_code=503,
-            content={"ready": False, "error": "browser_lock stuck", "capture_count": _capture_count},
+            content={"ready": False, "error": "browser_lock stuck",
+                     "failures": _health_failures, "capture_count": _capture_count},
         )
     try:
+        _health_failures = 0  # reset on success
         alive = False
         if _browser is not None:
             try:
@@ -482,7 +500,14 @@ def cookies_youtube():
         try:
             logger.info("Cookie warmup: navigating to youtube.com (capture_count=%d)", _capture_count)
             browser = _get_browser()
-            browser.get("https://www.youtube.com")
+            try:
+                browser.set_page_load_timeout(30)
+            except Exception:
+                pass
+            try:
+                browser.get("https://www.youtube.com")
+            except Exception:
+                logger.debug("YouTube page load timeout, continuing with available cookies")
             try:
                 WebDriverWait(browser, 15).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
@@ -512,7 +537,19 @@ def capture(req: CaptureRequest):
             logger.info("Starting capture: %s (timeout=%ds, count=%d)",
                         req.url, req.timeout, _capture_count)
             browser = _get_browser()
-            browser.get(req.url)
+
+            # Set page load timeout to match capture timeout + buffer
+            try:
+                browser.set_page_load_timeout(req.timeout + 30)
+            except Exception:
+                pass
+
+            try:
+                browser.get(req.url)
+            except Exception as e:
+                # Page load timeout — page may still be partially loaded,
+                # continue to check for manifests that arrived before timeout
+                logger.warning("Page load timeout/error for %s: %s", req.url, e)
 
             if req.switch_iframe:
                 try:
