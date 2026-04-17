@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=29" />
+  <link rel="stylesheet" href="/static/style.css?v=30" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -257,24 +257,27 @@
 
       <!-- SYSTEM -->
       <section id="view-system" class="view">
-        <div class="stats-grid">
-          <div class="stat-card" id="cpu-card">
-            <div class="stat-card-header"><h4>CPU</h4><span class="stat-live" id="cpu-live">--%</span></div>
-            <div class="stat-chart" id="cpu-chart"></div>
+        <div class="stats-layout">
+          <div class="stats-left">
+            <div class="stat-card stat-card-compact" id="cpu-card">
+              <div class="stat-card-header"><h4>CPU</h4><span class="stat-live" id="cpu-live">--%</span></div>
+              <div class="stat-chart" id="cpu-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="ram-card">
+              <div class="stat-card-header"><h4>Memory</h4><span class="stat-live" id="ram-live">--%</span></div>
+              <div class="stat-chart" id="ram-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="disk-card">
+              <div class="stat-card-header"><h4>Disk</h4><span class="stat-live" id="disk-live">--</span></div>
+              <div class="stat-chart" id="disk-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="yt-cache-card">
+              <div class="stat-card-header"><h4>YouTube Cache</h4><span class="stat-live" id="yt-cache-live">--</span></div>
+              <div class="stat-chart" id="yt-cache-chart"></div>
+            </div>
           </div>
-          <div class="stat-card" id="ram-card">
-            <div class="stat-card-header"><h4>Memory</h4><span class="stat-live" id="ram-live">--%</span></div>
-            <div class="stat-chart" id="ram-chart"></div>
-          </div>
-          <div class="stat-card" id="disk-card">
-            <div class="stat-card-header"><h4>Disk</h4><span class="stat-live" id="disk-live">--</span></div>
-            <div class="stat-chart" id="disk-chart"></div>
-          </div>
-          <div class="stat-card" id="yt-cache-card">
-            <div class="stat-card-header"><h4>YouTube Cache</h4><span class="stat-live" id="yt-cache-live">--</span></div>
-            <div class="stat-chart" id="yt-cache-chart"></div>
-          </div>
-          <div class="stat-card vpn-stat-card" id="vpn-card">
+          <div class="stats-right">
+            <div class="stat-card vpn-stat-card" id="vpn-card">
             <div class="stat-card-header">
               <h4 id="vpn-card-title">VPN Latency</h4>
               <span class="stat-live" id="vpn-live">--ms</span>
@@ -319,6 +322,7 @@
                 </table>
               </div>
             </div>
+          </div>
           </div>
         </div>
       </section>
@@ -628,6 +632,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=45"></script>
+  <script src="/static/ui.js?v=46"></script>
 </body>
 </html>

@@ -406,7 +406,15 @@ button,input,select,textarea{font-family:inherit}
 .btn-reveal:hover{color:var(--text);background:var(--bg-hover)}
 
 /* System Stats */
-.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px}
+.stats-layout{display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:18px}
+.stats-left{display:flex;flex-direction:column;gap:16px}
+.stats-right{display:flex;flex-direction:column;gap:16px}
+.stats-right .stat-card{flex:1}
+.stat-card-compact{padding:14px}
+.stat-card-compact .stat-card-header{margin-bottom:8px}
+.stat-card-compact .stat-card-header h4{font-size:14px}
+.stat-card-compact .stat-live{font-size:22px}
+.stat-card-compact .stat-chart{height:120px}
 .stat-card{
   background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
   padding:16px;cursor:pointer;transition:border-color 0.15s;
@@ -473,7 +481,7 @@ button,input,select,textarea{font-family:inherit}
   .channel-grid{grid-template-columns:1fr}
   .modal-two-col{grid-template-columns:1fr}
   .settings-panel{min-height:auto}
-  .stats-grid{grid-template-columns:1fr}
+  .stats-layout{grid-template-columns:1fr}
   .chart-modal-chart{height:280px}
   .bump-grid{grid-template-columns:1fr}
   .guide-grid{grid-template-columns:120px 1fr}
