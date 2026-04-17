@@ -532,6 +532,43 @@ def cookies_youtube():
             _release_browser()
 
 
+def _check_paywall(browser):
+    """Check for premium/paywall elements in the current frame.
+
+    Returns a descriptive string if a paywall is detected, None otherwise.
+    Checks both element selectors and page text for common premium gates.
+    """
+    paywall_selectors = [
+        "[class*='premium']", "[class*='Premium']",
+        "[class*='paywall']", "[class*='Paywall']",
+        "[class*='subscribe']", "[class*='Subscribe']",
+        "[class*='upgrade']", "[class*='Upgrade']",
+        "a[href*='premium']", "a[href*='subscribe']",
+        "button[class*='premium']", ".get-premium",
+        "#premium-overlay", ".premium-wall",
+    ]
+    for sel in paywall_selectors:
+        try:
+            el = browser.find_element(By.CSS_SELECTOR, sel)
+            if el.is_displayed():
+                text = (el.text or "").strip()[:80]
+                return text or sel
+        except Exception:
+            continue
+    # Also check page text for premium keywords
+    try:
+        body = browser.find_element(By.TAG_NAME, "body").text or ""
+        lower = body.lower()
+        for phrase in ["get premium", "go premium", "premium only",
+                       "subscribe to watch", "upgrade to watch",
+                       "premium members only", "unlock this stream"]:
+            if phrase in lower:
+                return phrase
+    except Exception:
+        pass
+    return None
+
+
 def _try_click_play(browser):
     """Attempt to click play button overlays to start a stream.
 
@@ -601,6 +638,13 @@ def capture(req: CaptureRequest):
                     logger.info("Switched to iframe")
                 except Exception:
                     logger.debug("No iframe, continuing in main frame")
+
+            # Check for premium/paywall gate — skip immediately instead of
+            # waiting 90s for a manifest that will never come
+            paywall = _check_paywall(browser)
+            if paywall:
+                logger.info("Premium/paywall detected for %s: %s", req.url, paywall)
+                return {"ok": False, "error": f"Premium content: {paywall}"}
 
             # Try clicking play button — pregame streams often need a click
             # before the m3u8 loads. Try common selectors, then fall back to

@@ -2123,16 +2123,17 @@ async function loadResolver() {
     persisted = j.results || [];
   } catch (e) {}
 
-  // Layer any in-flight batch state on top
+  // Layer any in-flight batch state on top of persisted manifests
   try {
     const r = await fetch(`${API}/resolve/batch/status`);
     const b = await r.json();
     if (b.running || (b.results && b.results.some(x => x.status === "resolving" || x.status === "pending"))) {
-      // A batch is active — show batch state (it includes in-progress + recently done)
-      renderResolverQueue(b);
+      // Merge: batch items first, then persisted items not already in the batch
+      const batchUrls = new Set((b.results || []).map(x => x.url));
+      const merged = [...(b.results || []), ...persisted.filter(p => !batchUrls.has(p.url))];
+      renderResolverQueue({ ...b, results: merged });
       if (b.running) startResolverPolling();
     } else {
-      // No active batch — show persisted channels
       renderResolverQueue({ running: false, results: persisted });
     }
   } catch (e) {

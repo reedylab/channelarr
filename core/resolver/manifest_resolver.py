@@ -245,10 +245,15 @@ class ManifestResolverService:
 
     @staticmethod
     def check_selenium() -> bool:
-        """Check if the selenium-uc sidecar is reachable."""
+        """Check if the selenium-uc sidecar is reachable.
+
+        Returns True if the sidecar responds at all (even 503 busy).
+        Only returns False if the sidecar is completely unreachable.
+        """
         try:
             r = http_requests.get(f"{get_setting('SELENIUM_URL', 'http://localhost:4445')}/health", timeout=5)
-            return r.status_code == 200 and r.json().get("ready", False)
+            # Any response means the sidecar is alive — 503 just means busy
+            return True
         except Exception:
             return False
 
