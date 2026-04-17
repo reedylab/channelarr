@@ -406,7 +406,7 @@ button,input,select,textarea{font-family:inherit}
 .btn-reveal:hover{color:var(--text);background:var(--bg-hover)}
 
 /* System Stats */
-.stats-layout{display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:18px}
+.stats-layout{display:grid;grid-template-columns:2fr 3fr;gap:16px;margin-bottom:18px}
 .stats-left{display:flex;flex-direction:column;gap:16px}
 .stats-right{display:flex;flex-direction:column;gap:16px}
 .stats-right .stat-card{flex:1}
