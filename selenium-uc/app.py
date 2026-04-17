@@ -15,10 +15,12 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -38,6 +40,7 @@ JSON_STREAM_PATTERNS = ("ngtv.io", "/api/", "/media/", "/stream", "anvato", "upl
 # Persistent browser singleton
 _PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", "/data/chrome-profile")
 _RECYCLE_AFTER = int(os.getenv("CHROME_RECYCLE_AFTER", "50"))  # captures
+_STARTUP_TIMEOUT = int(os.getenv("CHROME_STARTUP_TIMEOUT", "60"))  # seconds
 _browser_lock = threading.RLock()
 _browser = None
 _capture_count = 0
@@ -67,8 +70,21 @@ def _clear_chrome_singleton_locks():
             logger.warning("Failed to remove %s: %s", name, e)
 
 
+def _kill_chrome_processes():
+    """Kill any orphaned chrome/chromedriver processes."""
+    for name in ("chrome", "chromedriver"):
+        try:
+            subprocess.run(["pkill", "-9", "-f", name], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
 def _make_browser():
-    """Build a fresh undetected Chrome instance with persistent profile dir."""
+    """Build a fresh undetected Chrome instance with persistent profile dir.
+
+    Runs uc.Chrome() in a thread with a timeout so a hung startup
+    doesn't permanently block the sidecar.
+    """
     os.makedirs(_PROFILE_DIR, exist_ok=True)
     _clear_chrome_singleton_locks()
     options = uc.ChromeOptions()
@@ -97,7 +113,6 @@ def _make_browser():
     # Detect installed Chrome major version so uc downloads a matching driver
     version_main = None
     try:
-        import subprocess
         out = subprocess.check_output([chrome_binary, "--version"], text=True).strip()
         m = re.search(r"(\d+)\.\d+\.\d+\.\d+", out)
         if m:
@@ -106,19 +121,56 @@ def _make_browser():
     except Exception as e:
         logger.warning("Could not detect Chrome version: %s", e)
 
-    logger.info("Starting persistent Chrome (profile=%s)", _PROFILE_DIR)
-    return uc.Chrome(
-        options=options,
-        use_subprocess=True,
-        version_main=version_main,
-    )
+    logger.info("Starting persistent Chrome (profile=%s, timeout=%ds)", _PROFILE_DIR, _STARTUP_TIMEOUT)
+
+    result = [None]
+    error = [None]
+
+    def _start():
+        try:
+            result[0] = uc.Chrome(
+                options=options,
+                use_subprocess=True,
+                version_main=version_main,
+            )
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_start, daemon=True)
+    t.start()
+    t.join(timeout=_STARTUP_TIMEOUT)
+
+    if t.is_alive():
+        logger.error("Chrome startup hung after %ds, killing orphaned processes", _STARTUP_TIMEOUT)
+        _kill_chrome_processes()
+        raise RuntimeError(f"Chrome failed to start within {_STARTUP_TIMEOUT}s")
+
+    if error[0]:
+        raise error[0]
+
+    if result[0] is None:
+        raise RuntimeError("Chrome startup returned None")
+
+    logger.info("Chrome started successfully")
+    return result[0]
 
 
 def _get_browser():
-    """Return the persistent browser instance, creating or recreating if needed."""
+    """Return the persistent browser instance, creating or recreating if needed.
+
+    Retries startup once after killing orphans — if Chrome hung last time,
+    leftover processes may block the profile lock.
+    """
     global _browser
     if _browser is None:
-        _browser = _make_browser()
+        try:
+            _browser = _make_browser()
+        except Exception as e:
+            logger.warning("First startup attempt failed (%s), killing orphans and retrying", e)
+            _kill_chrome_processes()
+            _clear_chrome_singleton_locks()
+            time.sleep(2)
+            _browser = _make_browser()  # let this one propagate if it fails
         return _browser
     # Health check — if dead, recreate
     try:
@@ -130,7 +182,14 @@ def _get_browser():
             _browser.quit()
         except Exception:
             pass
-        _browser = _make_browser()
+        _kill_chrome_processes()
+        _browser = None
+        try:
+            _browser = _make_browser()
+        except Exception as e:
+            logger.error("Browser recreation failed: %s", e)
+            _kill_chrome_processes()
+            raise
         return _browser
 
 
@@ -348,7 +407,29 @@ def _decode_body(result):
 
 @app.get("/health")
 def health():
-    return {"ready": True, "browser_alive": _browser is not None, "capture_count": _capture_count}
+    """Health check that detects a stuck browser lock.
+
+    Tries to acquire _browser_lock with a 5s timeout. If it can't,
+    Chrome startup or a capture is hung — return 503 so Docker
+    restarts the container.
+    """
+    acquired = _browser_lock.acquire(timeout=5)
+    if not acquired:
+        return JSONResponse(
+            status_code=503,
+            content={"ready": False, "error": "browser_lock stuck", "capture_count": _capture_count},
+        )
+    try:
+        alive = False
+        if _browser is not None:
+            try:
+                _ = _browser.current_url
+                alive = True
+            except Exception:
+                pass
+        return {"ready": True, "browser_alive": alive, "capture_count": _capture_count}
+    finally:
+        _browser_lock.release()
 
 
 @app.post("/restart")
