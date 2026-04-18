@@ -583,13 +583,12 @@ def _check_paywall(browser):
             logger.info("Paywall check innerHTML (first 300): %s", body_html.strip()[:300])
         else:
             logger.info("Paywall check: iframe body is empty")
-        for phrase in ["get premium", "go premium", "premium only",
+        for phrase in ["premium only", "premium members only",
                        "subscribe to watch", "upgrade to watch",
-                       "premium members only", "unlock this stream",
+                       "unlock this stream",
                        "live stream starting soon", "stream starting soon",
                        "event has not started", "stream will begin shortly",
-                       "broadcast will begin",
-                       "upcoming"]:
+                       "broadcast will begin", "upcoming"]:
             if phrase in combined:
                 return phrase
     except Exception as e:
@@ -603,10 +602,13 @@ def _scan_all_frames_for_skip(browser):
     Looks at the outer page and each iframe for text indicating the stream
     is premium-locked or not yet live. Returns the matched phrase or None.
     """
+    # Only match phrases that definitively mean "this stream is not available".
+    # Do NOT match generic site navigation text like "Go Premium" or "Register"
+    # which appear on every page regardless of stream status.
     skip_phrases = [
-        "get premium", "go premium", "premium only",
+        "premium only", "premium members only",
         "subscribe to watch", "upgrade to watch",
-        "premium members only", "unlock this stream",
+        "unlock this stream",
         "live stream starting soon", "stream starting soon",
         "event has not started", "stream will begin shortly",
         "broadcast will begin", "upcoming",
