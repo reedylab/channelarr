@@ -64,60 +64,19 @@ def refresh_jellyfin(url: str, api_key: str) -> dict:
         r.raise_for_status()
         config = r.json()
 
-        # 2. Find or create channelarr tuner
+        # 2. Check tuner exists (don't modify the path — Jellyfin has its own mount points)
         tuners = config.get("TunerHosts", [])
-        found = False
-        for t in tuners:
-            if _TUNER_NAME.lower() in (t.get("Url") or "").lower() or \
-               t.get("FriendlyName") == _TUNER_NAME:
-                t["Url"] = m3u_source
-                found = True
-                logger.info("[INTEGRATION] Updated Jellyfin tuner to %s", m3u_source)
-                break
-        if not found:
-            tuners.append({
-                "Type": "m3u",
-                "Url": m3u_source,
-                "FriendlyName": _TUNER_NAME,
-                "ImportFavoritesOnly": False,
-                "AllowHWTranscoding": False,
-                "AllowStreamSharing": True,
-                "EnableStreamLooping": False,
-                "TunerCount": 0,
-                "IgnoreDts": True,
-            })
-            logger.info("[INTEGRATION] Added Jellyfin tuner: %s", m3u_source)
-        config["TunerHosts"] = tuners
+        has_tuner = any(
+            _TUNER_NAME.lower() in (t.get("Url") or "").lower() or
+            t.get("FriendlyName") == _TUNER_NAME
+            for t in tuners
+        )
+        if has_tuner:
+            logger.info("[INTEGRATION] Found existing Jellyfin tuner, preserving path")
+        else:
+            logger.info("[INTEGRATION] No channelarr tuner found in Jellyfin — add one manually in Jellyfin's Live TV settings")
 
-        # 3. Find or create XMLTV listing provider
-        listings = config.get("ListingProviders", [])
-        listing_found = False
-        for lp in listings:
-            if lp.get("Type") == "xmltv" and (
-                _TUNER_NAME.lower() in (lp.get("Path") or "").lower() or
-                _TUNER_NAME.lower() in (lp.get("ListingsId") or "").lower()
-            ):
-                lp["Path"] = xmltv_source
-                listing_found = True
-                logger.info("[INTEGRATION] Updated Jellyfin XMLTV to %s", xmltv_source)
-                break
-        if not listing_found:
-            listings.append({
-                "Type": "xmltv",
-                "Path": xmltv_source,
-                "EnableAllTuners": True,
-                "EnabledTuners": [],
-            })
-            logger.info("[INTEGRATION] Added Jellyfin XMLTV listing: %s", xmltv_source)
-        config["ListingProviders"] = listings
-
-        # 4. Write config back
-        r = requests.post(f"{base}/System/Configuration/livetv", headers=headers,
-                          json=config, timeout=_TIMEOUT)
-        r.raise_for_status()
-        logger.info("[INTEGRATION] Saved Jellyfin livetv config")
-
-        # 5. Trigger guide refresh via scheduled task
+        # 3. Trigger guide refresh via scheduled task
         try:
             tasks_r = requests.get(f"{base}/ScheduledTasks", headers=headers, timeout=_TIMEOUT)
             tasks_r.raise_for_status()
