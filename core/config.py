@@ -44,7 +44,7 @@ DEFAULTS = {
     "GLUETUN_CONTROL_PASS": "",
     # Export strategy (url or local path for M3U/EPG)
     "EXPORT_STRATEGY": "url",
-    "EXPORT_LOCAL_PATH": "",
+    "EXPORT_LOCAL_PATH": "/output/m3u",
     # Integrations (strategy uses EXPORT_STRATEGY/EXPORT_LOCAL_PATH above)
     "JELLYFIN_URL": "",
     "JELLYFIN_API_KEY": "",

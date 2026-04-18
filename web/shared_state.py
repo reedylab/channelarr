@@ -59,7 +59,7 @@ SETTINGS_SCHEMA = {
                     {"value": "local", "label": "Local Path (Shared Storage)"},
                 ],
             },
-            "EXPORT_LOCAL_PATH": {"label": "Local Export Path (if local strategy)", "type": "text", "placeholder": "/mnt/das-disk-1/media/m3u"},
+            "EXPORT_LOCAL_PATH": {"label": "Local Export Path (if local strategy)", "type": "text", "placeholder": "/output/m3u"},
         },
     },
     "encoding": {
