@@ -49,6 +49,7 @@ DEFAULTS = {
     "JELLYFIN_URL": "",
     "JELLYFIN_API_KEY": "",
     "JELLYFIN_AUTO_REFRESH": "false",
+    "JELLYFIN_REBIND_MODE": "false",
     "MANIFOLD_URL": "",
     "MANIFOLD_AUTO_REFRESH": "false",
 }

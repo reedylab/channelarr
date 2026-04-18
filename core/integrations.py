@@ -39,62 +39,80 @@ def test_jellyfin(url: str, api_key: str) -> dict:
 
 
 def refresh_jellyfin(url: str, api_key: str) -> dict:
-    """Cache-busting Jellyfin refresh via the livetv configuration API.
-
-    Reads the full livetv config, updates the channelarr tuner's URL
-    (using global export strategy), writes it back, then triggers
-    a guide data refresh task.
-    """
+    """Trigger Jellyfin's guide data refresh scheduled task."""
     base = url.rstrip("/")
     headers = _jf_headers(api_key)
-    strategy = get_setting("EXPORT_STRATEGY", "url")
-    base_url = get_setting("BASE_URL", "http://localhost:5045")
-    local_path = get_setting("EXPORT_LOCAL_PATH", "")
-
-    if strategy == "local" and local_path:
-        m3u_source = f"{local_path}/channelarr.m3u"
-        xmltv_source = f"{local_path}/channelarr.xml"
-    else:
-        m3u_source = f"{base_url}/m3u/channelarr.m3u"
-        xmltv_source = f"{base_url}/m3u/channelarr.xml"
-
     try:
-        # 1. Read current livetv config
-        r = requests.get(f"{base}/System/Configuration/livetv", headers=headers, timeout=_TIMEOUT)
+        r = requests.get(f"{base}/ScheduledTasks", headers=headers, timeout=_TIMEOUT)
         r.raise_for_status()
-        config = r.json()
-
-        # 2. Check tuner exists (don't modify the path — Jellyfin has its own mount points)
-        tuners = config.get("TunerHosts", [])
-        has_tuner = any(
-            _TUNER_NAME.lower() in (t.get("Url") or "").lower() or
-            t.get("FriendlyName") == _TUNER_NAME
-            for t in tuners
-        )
-        if has_tuner:
-            logger.info("[INTEGRATION] Found existing Jellyfin tuner, preserving path")
-        else:
-            logger.info("[INTEGRATION] No channelarr tuner found in Jellyfin — add one manually in Jellyfin's Live TV settings")
-
-        # 3. Trigger guide refresh via scheduled task
-        try:
-            tasks_r = requests.get(f"{base}/ScheduledTasks", headers=headers, timeout=_TIMEOUT)
-            tasks_r.raise_for_status()
-            for task in tasks_r.json():
-                if "guide" in (task.get("Name") or "").lower() or \
-                   "guide" in (task.get("Key") or "").lower():
-                    requests.post(f"{base}/ScheduledTasks/Running/{task['Id']}",
-                                  headers=headers, timeout=_TIMEOUT)
-                    logger.info("[INTEGRATION] Triggered Jellyfin guide refresh")
-                    break
-        except Exception as e:
-            logger.warning("[INTEGRATION] Guide refresh trigger failed: %s", e)
-
-        return {"ok": True, "source": m3u_source}
-
+        for task in r.json():
+            if "guide" in (task.get("Name") or "").lower() or \
+               "guide" in (task.get("Key") or "").lower():
+                requests.post(f"{base}/ScheduledTasks/Running/{task['Id']}",
+                              headers=headers, timeout=_TIMEOUT)
+                logger.info("[INTEGRATION] Triggered Jellyfin guide refresh")
+                return {"ok": True, "mode": "refresh"}
+        return {"ok": False, "error": "Guide refresh task not found"}
     except Exception as e:
         logger.exception("[INTEGRATION] Jellyfin refresh failed")
         return {"ok": False, "error": str(e)}
+
+
+def rebind_jellyfin(url: str, api_key: str) -> dict:
+    """Force Jellyfin to re-bind all XMLTV listings providers pointing at
+    channelarr.xml. Snapshots each matching provider config, DELETEs it,
+    then re-POSTs with the same settings — drops stale channel mappings
+    and re-auto-matches against the current M3U/XMLTV. Guide refresh
+    fires after.
+
+    Non-channelarr XMLTV providers are left alone.
+    """
+    base = url.rstrip("/")
+    headers = _jf_headers(api_key)
+    try:
+        r = requests.get(f"{base}/System/Configuration/livetv", headers=headers, timeout=_TIMEOUT)
+        r.raise_for_status()
+        livetv = r.json()
+        providers = livetv.get("ListingProviders", []) or []
+
+        rebound = 0
+        for p in providers:
+            if (p.get("Type") or "").lower() != "xmltv":
+                continue
+            path = (p.get("Path") or "").lower()
+            if "channelarr" not in path:
+                continue
+            pid = p.get("Id")
+            if not pid:
+                continue
+            # Snapshot all settings; drop Id so Jellyfin generates a new one
+            fresh = {k: v for k, v in p.items() if k != "Id"}
+            try:
+                requests.delete(f"{base}/LiveTv/ListingProviders", headers=headers,
+                                params={"id": pid}, timeout=_TIMEOUT)
+                requests.post(f"{base}/LiveTv/ListingProviders", headers=headers,
+                              json=fresh, timeout=_TIMEOUT).raise_for_status()
+                rebound += 1
+                logger.info("[INTEGRATION] Rebound Jellyfin XMLTV provider: %s", p.get("Path"))
+            except Exception as e:
+                logger.warning("[INTEGRATION] Rebind failed for provider %s: %s", pid, e)
+
+        if rebound == 0:
+            return {"ok": False, "error": "No XMLTV provider found pointing at channelarr"}
+
+        # Refresh guide so the re-bound provider parses the XMLTV immediately
+        refresh_result = refresh_jellyfin(url, api_key)
+        return {"ok": True, "mode": "rebind", "rebound": rebound, "refresh": refresh_result}
+    except Exception as e:
+        logger.exception("[INTEGRATION] Jellyfin rebind failed")
+        return {"ok": False, "error": str(e)}
+
+
+def _refresh_or_rebind_jellyfin(url: str, api_key: str) -> dict:
+    """Dispatch based on the persistent JELLYFIN_REBIND_MODE setting."""
+    if get_setting("JELLYFIN_REBIND_MODE") == "true":
+        return rebind_jellyfin(url, api_key)
+    return refresh_jellyfin(url, api_key)
 
 
 def test_manifold(url: str) -> dict:
@@ -140,7 +158,7 @@ def auto_push():
         jf_key = get_setting("JELLYFIN_API_KEY")
         if jf_url and jf_key:
             try:
-                result = refresh_jellyfin(jf_url, jf_key)
+                result = _refresh_or_rebind_jellyfin(jf_url, jf_key)
                 if result["ok"]:
                     logger.info("[INTEGRATION] Auto-push to Jellyfin succeeded")
                 else:

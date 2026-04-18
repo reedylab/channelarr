@@ -16,6 +16,7 @@ class JellyfinConfig(BaseModel):
     url: str = ""
     api_key: str = ""
     auto_refresh: bool = False
+    rebind_mode: bool = False
 
 
 class ManifoldConfig(BaseModel):
@@ -33,6 +34,7 @@ def integrations_status():
             "url": s.get("JELLYFIN_URL", ""),
             "api_key": s.get("JELLYFIN_API_KEY", ""),
             "auto_refresh": s.get("JELLYFIN_AUTO_REFRESH") == "true",
+            "rebind_mode": s.get("JELLYFIN_REBIND_MODE") == "true",
             "configured": bool(s.get("JELLYFIN_URL") and s.get("JELLYFIN_API_KEY")),
         },
         "manifold": {
@@ -49,6 +51,7 @@ def jellyfin_save_config(body: JellyfinConfig):
         "JELLYFIN_URL": body.url,
         "JELLYFIN_API_KEY": body.api_key,
         "JELLYFIN_AUTO_REFRESH": "true" if body.auto_refresh else "false",
+        "JELLYFIN_REBIND_MODE": "true" if body.rebind_mode else "false",
     })
     return {"ok": True}
 
@@ -65,19 +68,20 @@ def jellyfin_test():
 
 @router.post("/integrations/jellyfin/refresh")
 def jellyfin_refresh():
-    from core.integrations import refresh_jellyfin
+    from core.integrations import _refresh_or_rebind_jellyfin
     url = get_setting("JELLYFIN_URL")
     key = get_setting("JELLYFIN_API_KEY")
     if not url or not key:
         return {"ok": False, "error": "Jellyfin URL and API key required"}
+    mode = "rebind" if get_setting("JELLYFIN_REBIND_MODE") == "true" else "refresh"
 
     def _run():
-        result = refresh_jellyfin(url, key)
+        result = _refresh_or_rebind_jellyfin(url, key)
         if not result["ok"]:
-            logger.warning("[INTEGRATION] Jellyfin refresh failed: %s", result["error"])
+            logger.warning("[INTEGRATION] Jellyfin %s failed: %s", mode, result["error"])
 
     threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "message": "Jellyfin refresh started"}
+    return {"ok": True, "message": f"Jellyfin {mode} started", "mode": mode}
 
 
 @router.put("/integrations/manifold/config")

@@ -1759,8 +1759,12 @@ channelarr.openIntegModal = function(type) {
             <label class="scraper-toggle"><input type="checkbox" id="integ-jf-auto" ${jf.auto_refresh ? "checked" : ""}><span class="slider"></span></label>
             <span>Auto-refresh after M3U regeneration</span>
           </div>
+          <div class="integ-toggle-row">
+            <label class="scraper-toggle"><input type="checkbox" id="integ-jf-rebind" ${jf.rebind_mode ? "checked" : ""}><span class="slider"></span></label>
+            <span>Force rebind on every refresh (drops stale channel bindings)</span>
+          </div>
         </div>
-        <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Export strategy (URL vs Local Path) is set in General settings.</p>
+        <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Refresh triggers Jellyfin's guide data task. Rebind additionally deletes + re-adds the XMLTV listings provider so Jellyfin rediscovers every channel from scratch.</p>
         <div class="integ-modal-actions">
           <button class="btn-sm" id="integ-jf-save">Save</button>
           <button class="btn-sm" id="integ-jf-test">Test Connection</button>
@@ -1776,7 +1780,7 @@ channelarr.openIntegModal = function(type) {
           method: "PUT", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
-            auto_refresh: $("#integ-jf-auto").checked,
+            auto_refresh: $("#integ-jf-auto").checked, rebind_mode: $("#integ-jf-rebind").checked,
           }),
         });
         if ((await r.json()).ok) { toast("success", "Jellyfin config saved"); loadIntegrations(); }
@@ -1810,12 +1814,23 @@ channelarr.openIntegModal = function(type) {
     // Refresh
     $("#integ-jf-refresh").addEventListener("click", async () => {
       const res = $("#integ-jf-result");
-      res.textContent = "Refreshing (cache-bust)...";
+      const willRebind = $("#integ-jf-rebind").checked;
+      // Save first so refresh uses latest rebind_mode
+      await fetch(`${API}/integrations/jellyfin/config`, {
+        method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
+          auto_refresh: $("#integ-jf-auto").checked, rebind_mode: willRebind,
+        }),
+      });
+      res.textContent = willRebind ? "Rebinding provider + refreshing guide..." : "Triggering guide refresh...";
       try {
         const r = await fetch(`${API}/integrations/jellyfin/refresh`, {method: "POST"});
         const d = await r.json();
-        if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Refresh triggered</span>';
-        else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+        if (d.ok) {
+          const msg = d.mode === "rebind" ? "Rebind + guide refresh triggered" : "Guide refresh triggered";
+          res.innerHTML = `<span style="color:var(--ok)">${msg}</span>`;
+        } else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
       } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Refresh failed</span>'; }
     });
 
