@@ -171,9 +171,10 @@ def _get_browser():
         try:
             _browser = _make_browser()
         except Exception as e:
-            logger.warning("First startup attempt failed (%s), killing orphans and retrying", e)
+            logger.warning("First startup attempt failed (%s), nuking profile and retrying", e)
             _kill_chrome_processes()
-            _clear_chrome_singleton_locks()
+            import shutil
+            shutil.rmtree(_PROFILE_DIR, ignore_errors=True)
             time.sleep(2)
             _browser = _make_browser()  # let this one propagate if it fails
         return _browser
@@ -227,6 +228,16 @@ def _release_browser():
         logger.info("Recycle threshold reached (%d captures), restarting browser", _capture_count)
         try:
             _browser.quit()
+        except Exception:
+            pass
+        _kill_chrome_processes()
+        # Nuke the profile dir — stale caches, IndexedDB, service workers,
+        # and corrupted session state cause Chrome startup hangs over time.
+        # YouTube cookies are re-harvested on every download anyway.
+        import shutil
+        try:
+            shutil.rmtree(_PROFILE_DIR, ignore_errors=True)
+            logger.info("Cleared Chrome profile dir %s", _PROFILE_DIR)
         except Exception:
             pass
         _browser = None
