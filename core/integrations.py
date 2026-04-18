@@ -142,7 +142,7 @@ def sync_manifold(url: str, m3u_name: str, epg_name: str, regenerate: bool = Tru
                 "epg_source": epg_name or "",
                 "regenerate": regenerate,
             },
-            timeout=30,
+            timeout=120,
         )
         r.raise_for_status()
         result = r.json()
