@@ -39,9 +39,11 @@ def test_jellyfin(url: str, api_key: str) -> dict:
 
 
 def refresh_jellyfin(url: str, api_key: str) -> dict:
-    """Cache-busting Jellyfin refresh: delete tuner + re-add, then refresh guide.
+    """Cache-busting Jellyfin refresh via the livetv configuration API.
 
-    Uses the global export strategy (url vs local) from settings.
+    Reads the full livetv config, updates the channelarr tuner's URL
+    (using global export strategy), writes it back, then triggers
+    a guide data refresh task.
     """
     base = url.rstrip("/")
     headers = _jf_headers(api_key)
@@ -50,65 +52,86 @@ def refresh_jellyfin(url: str, api_key: str) -> dict:
     local_path = get_setting("EXPORT_LOCAL_PATH", "")
 
     if strategy == "local" and local_path:
-        tuner_source = f"{local_path}/channelarr.m3u"
+        m3u_source = f"{local_path}/channelarr.m3u"
+        xmltv_source = f"{local_path}/channelarr.xml"
     else:
-        tuner_source = f"{base_url}/m3u/channelarr.m3u"
-
-    if not tuner_source:
-        return {"ok": False, "error": "No M3U source configured"}
+        m3u_source = f"{base_url}/m3u/channelarr.m3u"
+        xmltv_source = f"{base_url}/m3u/channelarr.xml"
 
     try:
-        # 1. Find existing channelarr tuner
-        r = requests.get(f"{base}/LiveTv/TunerHosts", headers=headers, timeout=_TIMEOUT)
+        # 1. Read current livetv config
+        r = requests.get(f"{base}/System/Configuration/livetv", headers=headers, timeout=_TIMEOUT)
         r.raise_for_status()
-        tuners = r.json()
-        existing_id = None
+        config = r.json()
+
+        # 2. Find or create channelarr tuner
+        tuners = config.get("TunerHosts", [])
+        found = False
         for t in tuners:
-            if t.get("FriendlyName") == _TUNER_NAME or _TUNER_NAME.lower() in (t.get("Url") or "").lower():
-                existing_id = t.get("Id")
+            if _TUNER_NAME.lower() in (t.get("Url") or "").lower() or \
+               t.get("FriendlyName") == _TUNER_NAME:
+                t["Url"] = m3u_source
+                found = True
+                logger.info("[INTEGRATION] Updated Jellyfin tuner to %s", m3u_source)
                 break
+        if not found:
+            tuners.append({
+                "Type": "m3u",
+                "Url": m3u_source,
+                "FriendlyName": _TUNER_NAME,
+                "ImportFavoritesOnly": False,
+                "AllowHWTranscoding": False,
+                "AllowStreamSharing": True,
+                "EnableStreamLooping": False,
+                "TunerCount": 0,
+                "IgnoreDts": True,
+            })
+            logger.info("[INTEGRATION] Added Jellyfin tuner: %s", m3u_source)
+        config["TunerHosts"] = tuners
 
-        # 2. Delete existing tuner (cache bust)
-        if existing_id:
-            requests.delete(f"{base}/LiveTv/TunerHosts?id={existing_id}",
-                            headers=headers, timeout=_TIMEOUT)
-            logger.info("[INTEGRATION] Deleted Jellyfin tuner %s", existing_id)
+        # 3. Find or create XMLTV listing provider
+        listings = config.get("ListingProviders", [])
+        listing_found = False
+        for lp in listings:
+            if lp.get("Type") == "xmltv" and (
+                _TUNER_NAME.lower() in (lp.get("Path") or "").lower() or
+                _TUNER_NAME.lower() in (lp.get("ListingsId") or "").lower()
+            ):
+                lp["Path"] = xmltv_source
+                listing_found = True
+                logger.info("[INTEGRATION] Updated Jellyfin XMLTV to %s", xmltv_source)
+                break
+        if not listing_found:
+            listings.append({
+                "Type": "xmltv",
+                "Path": xmltv_source,
+                "EnableAllTuners": True,
+                "EnabledTuners": [],
+            })
+            logger.info("[INTEGRATION] Added Jellyfin XMLTV listing: %s", xmltv_source)
+        config["ListingProviders"] = listings
 
-        # 3. Re-add tuner
-        tuner_body = {
-            "Type": "M3U",
-            "Url": tuner_source,
-            "FriendlyName": _TUNER_NAME,
-            "ImportFavoritesOnly": False,
-            "AllowHWTranscoding": True,
-            "EnableStreamLooping": False,
-            "TunerCount": 4,
-        }
-        r = requests.post(f"{base}/LiveTv/TunerHosts", headers=headers,
-                          json=tuner_body, timeout=_TIMEOUT)
+        # 4. Write config back
+        r = requests.post(f"{base}/System/Configuration/livetv", headers=headers,
+                          json=config, timeout=_TIMEOUT)
         r.raise_for_status()
-        new_tuner = r.json()
-        logger.info("[INTEGRATION] Re-added Jellyfin tuner: %s (source: %s)",
-                     new_tuner.get("Id"), tuner_source)
+        logger.info("[INTEGRATION] Saved Jellyfin livetv config")
 
-        # 4. Trigger guide refresh via scheduled task
+        # 5. Trigger guide refresh via scheduled task
         try:
             tasks_r = requests.get(f"{base}/ScheduledTasks", headers=headers, timeout=_TIMEOUT)
             tasks_r.raise_for_status()
-            guide_task = None
             for task in tasks_r.json():
                 if "guide" in (task.get("Name") or "").lower() or \
                    "guide" in (task.get("Key") or "").lower():
-                    guide_task = task.get("Id")
+                    requests.post(f"{base}/ScheduledTasks/Running/{task['Id']}",
+                                  headers=headers, timeout=_TIMEOUT)
+                    logger.info("[INTEGRATION] Triggered Jellyfin guide refresh")
                     break
-            if guide_task:
-                requests.post(f"{base}/ScheduledTasks/Running/{guide_task}",
-                              headers=headers, timeout=_TIMEOUT)
-                logger.info("[INTEGRATION] Triggered Jellyfin guide refresh task %s", guide_task)
         except Exception as e:
             logger.warning("[INTEGRATION] Guide refresh trigger failed: %s", e)
 
-        return {"ok": True, "tuner_id": new_tuner.get("Id"), "source": tuner_source}
+        return {"ok": True, "source": m3u_source}
 
     except Exception as e:
         logger.exception("[INTEGRATION] Jellyfin refresh failed")
