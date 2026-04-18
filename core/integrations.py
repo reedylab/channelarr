@@ -38,19 +38,21 @@ def test_jellyfin(url: str, api_key: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def refresh_jellyfin(url: str, api_key: str, strategy: str,
-                     m3u_url: str, xmltv_url: str,
-                     local_m3u: str = "", local_xmltv: str = "") -> dict:
-    """Cache-busting Jellyfin refresh: delete tuner + re-add, then refresh guide."""
+def refresh_jellyfin(url: str, api_key: str) -> dict:
+    """Cache-busting Jellyfin refresh: delete tuner + re-add, then refresh guide.
+
+    Uses the global export strategy (url vs local) from settings.
+    """
     base = url.rstrip("/")
     headers = _jf_headers(api_key)
+    strategy = get_setting("EXPORT_STRATEGY", "url")
+    base_url = get_setting("BASE_URL", "http://localhost:5045")
+    local_path = get_setting("EXPORT_LOCAL_PATH", "")
 
-    if strategy == "local":
-        tuner_source = local_m3u
-        epg_source = local_xmltv
+    if strategy == "local" and local_path:
+        tuner_source = f"{local_path}/channelarr.m3u"
     else:
-        tuner_source = m3u_url
-        epg_source = xmltv_url
+        tuner_source = f"{base_url}/m3u/channelarr.m3u"
 
     if not tuner_source:
         return {"ok": False, "error": "No M3U source configured"}
@@ -150,21 +152,13 @@ def refresh_manifold(url: str) -> dict:
 
 def auto_push():
     """Push updates to enabled integrations. Called after M3U regeneration."""
-    base_url = get_setting("BASE_URL", "http://localhost:5045")
-    m3u_url = f"{base_url}/m3u/channelarr.m3u"
-    xmltv_url = f"{base_url}/m3u/channelarr.xml"
-
     # Jellyfin
     if get_setting("JELLYFIN_AUTO_REFRESH") == "true":
         jf_url = get_setting("JELLYFIN_URL")
         jf_key = get_setting("JELLYFIN_API_KEY")
-        strategy = get_setting("JELLYFIN_STRATEGY", "url")
-        local_path = get_setting("JELLYFIN_LOCAL_PATH", "")
-        local_m3u = f"{local_path}/channelarr.m3u" if local_path else ""
-        local_xmltv = f"{local_path}/channelarr.xml" if local_path else ""
         if jf_url and jf_key:
             try:
-                result = refresh_jellyfin(jf_url, jf_key, strategy, m3u_url, xmltv_url, local_m3u, local_xmltv)
+                result = refresh_jellyfin(jf_url, jf_key)
                 if result["ok"]:
                     logger.info("[INTEGRATION] Auto-push to Jellyfin succeeded")
                 else:

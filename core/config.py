@@ -42,11 +42,12 @@ DEFAULTS = {
     "GLUETUN_CONTROL_URL": "",
     "GLUETUN_CONTROL_USER": "",
     "GLUETUN_CONTROL_PASS": "",
-    # Integrations
+    # Export strategy (url or local path for M3U/EPG)
+    "EXPORT_STRATEGY": "url",
+    "EXPORT_LOCAL_PATH": "",
+    # Integrations (strategy uses EXPORT_STRATEGY/EXPORT_LOCAL_PATH above)
     "JELLYFIN_URL": "",
     "JELLYFIN_API_KEY": "",
-    "JELLYFIN_STRATEGY": "url",
-    "JELLYFIN_LOCAL_PATH": "",
     "JELLYFIN_AUTO_REFRESH": "false",
     "MANIFOLD_URL": "",
     "MANIFOLD_AUTO_REFRESH": "false",

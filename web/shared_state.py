@@ -52,6 +52,14 @@ SETTINGS_SCHEMA = {
             },
             "BASE_URL": {"label": "Base URL", "type": "text", "placeholder": "http://your-server-ip:5045"},
             "EPG_TIMEZONE": {"label": "EPG Timezone", "type": "text", "placeholder": "America/New_York"},
+            "EXPORT_STRATEGY": {
+                "label": "M3U/EPG Export Strategy", "type": "select",
+                "options": [
+                    {"value": "url", "label": "URL (HTTP)"},
+                    {"value": "local", "label": "Local Path (Shared Storage)"},
+                ],
+            },
+            "EXPORT_LOCAL_PATH": {"label": "Local Export Path (if local strategy)", "type": "text", "placeholder": "/mnt/das-disk-1/media/m3u"},
         },
     },
     "encoding": {

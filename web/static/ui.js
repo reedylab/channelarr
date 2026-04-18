@@ -1701,7 +1701,6 @@ function renderIntegrations() {
   if (!c) return;
   const jf = _integData.jellyfin || {};
   const mf = _integData.manifold || {};
-  const px = _integData.plex || {};
 
   function badge(configured, label) {
     if (!configured) return `<span class="integ-badge integ-not-configured">Not Configured</span>`;
@@ -1714,7 +1713,7 @@ function renderIntegrations() {
         <span class="integ-card-name">Jellyfin</span>
         ${badge(jf.configured)}
       </div>
-      <div class="integ-card-desc">Push M3U/XMLTV updates directly. Supports URL or local path strategy for cache-busting.</div>
+      <div class="integ-card-desc">Push M3U/XMLTV updates directly with cache-busting refresh.</div>
     </div>
     <div class="integ-card" onclick="channelarr.openIntegModal('manifold')">
       <div class="integ-card-header">
@@ -1722,14 +1721,6 @@ function renderIntegrations() {
         ${badge(mf.configured)}
       </div>
       <div class="integ-card-desc">Force manifold to re-ingest M3U and EPG sources after channelarr updates.</div>
-    </div>
-    <div class="integ-card" style="cursor:default" onclick="">
-      <div class="integ-card-header">
-        <span class="integ-card-name">Plex</span>
-        <span class="integ-badge integ-connected">Active</span>
-      </div>
-      <div class="integ-card-desc">HDHomeRun emulation — Plex auto-discovers on your network.</div>
-      <div class="integ-info">${esc(px.hdhr_url || "")}</div>
     </div>
   </div>`;
 }
@@ -1743,23 +1734,17 @@ channelarr.openIntegModal = function(type) {
   if (type === "jellyfin") {
     const jf = _integData.jellyfin || {};
     modal.innerHTML = `
-      <div class="modal-header"><h3>Jellyfin Integration</h3><button class="btn-close" onclick="$('#modal-overlay').classList.add('hidden')">&times;</button></div>
+      <div class="modal-header"><h3>Jellyfin Integration</h3><button class="btn-close" onclick="document.getElementById('modal-overlay').classList.add('hidden')">&times;</button></div>
       <div class="modal-body" style="padding:16px">
         <div class="integ-modal-fields">
           <label>Server URL<input type="text" id="integ-jf-url" value="${esc(jf.url || "")}" placeholder="http://192.168.20.34:8096"></label>
           <label>API Key<input type="text" id="integ-jf-key" value="${esc(jf.api_key || "")}" placeholder="Jellyfin API key"></label>
-          <label>M3U Strategy
-            <select id="integ-jf-strategy">
-              <option value="url" ${jf.strategy !== "local" ? "selected" : ""}>URL (HTTP)</option>
-              <option value="local" ${jf.strategy === "local" ? "selected" : ""}>Local Path (Shared Storage)</option>
-            </select>
-          </label>
-          <label id="integ-jf-path-label" style="${jf.strategy === "local" ? "" : "display:none"}">Local M3U/XMLTV Directory<input type="text" id="integ-jf-path" value="${esc(jf.local_path || "")}" placeholder="/mnt/das-disk-1/media/m3u"></label>
           <div class="integ-toggle-row">
             <label class="scraper-toggle"><input type="checkbox" id="integ-jf-auto" ${jf.auto_refresh ? "checked" : ""}><span class="slider"></span></label>
             <span>Auto-refresh after M3U regeneration</span>
           </div>
         </div>
+        <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Export strategy (URL vs Local Path) is set in General settings.</p>
         <div class="integ-modal-actions">
           <button class="btn-sm" id="integ-jf-save">Save</button>
           <button class="btn-sm" id="integ-jf-test">Test Connection</button>
@@ -1768,11 +1753,6 @@ channelarr.openIntegModal = function(type) {
         <div id="integ-jf-result" style="margin-top:12px;font-size:12px"></div>
       </div>`;
 
-    // Strategy toggle
-    $("#integ-jf-strategy").addEventListener("change", (e) => {
-      $("#integ-jf-path-label").style.display = e.target.value === "local" ? "" : "none";
-    });
-
     // Save
     $("#integ-jf-save").addEventListener("click", async () => {
       try {
@@ -1780,7 +1760,6 @@ channelarr.openIntegModal = function(type) {
           method: "PUT", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
-            strategy: $("#integ-jf-strategy").value, local_path: $("#integ-jf-path").value,
             auto_refresh: $("#integ-jf-auto").checked,
           }),
         });
@@ -1793,12 +1772,10 @@ channelarr.openIntegModal = function(type) {
     $("#integ-jf-test").addEventListener("click", async () => {
       const res = $("#integ-jf-result");
       res.textContent = "Testing...";
-      // Save first so test uses latest values
       await fetch(`${API}/integrations/jellyfin/config`, {
         method: "PUT", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
-          strategy: $("#integ-jf-strategy").value, local_path: $("#integ-jf-path").value,
           auto_refresh: $("#integ-jf-auto").checked,
         }),
       });
@@ -1829,7 +1806,7 @@ channelarr.openIntegModal = function(type) {
   } else if (type === "manifold") {
     const mf = _integData.manifold || {};
     modal.innerHTML = `
-      <div class="modal-header"><h3>Manifold Integration</h3><button class="btn-close" onclick="$('#modal-overlay').classList.add('hidden')">&times;</button></div>
+      <div class="modal-header"><h3>Manifold Integration</h3><button class="btn-close" onclick="document.getElementById('modal-overlay').classList.add('hidden')">&times;</button></div>
       <div class="modal-body" style="padding:16px">
         <div class="integ-modal-fields">
           <label>Manifold URL<input type="text" id="integ-mf-url" value="${esc(mf.url || "")}" placeholder="http://192.168.20.15:5055"></label>
