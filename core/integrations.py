@@ -116,9 +116,9 @@ def _refresh_or_rebind_jellyfin(url: str, api_key: str) -> dict:
 
 
 def test_manifold(url: str) -> dict:
-    """Test manifold connectivity."""
+    """Ping manifold /health to confirm reachability."""
     try:
-        r = requests.get(f"{url.rstrip('/')}/api/status", timeout=_TIMEOUT)
+        r = requests.get(f"{url.rstrip('/')}/health", timeout=_TIMEOUT)
         r.raise_for_status()
         return {"ok": True, "status": r.json()}
     except requests.exceptions.ConnectionError:
@@ -127,27 +127,30 @@ def test_manifold(url: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def refresh_manifold(url: str) -> dict:
-    """Trigger manifold to re-ingest M3U and EPG sources."""
-    base = url.rstrip("/")
-    errors = []
-    try:
-        r = requests.post(f"{base}/api/m3u-sources/ingest", timeout=30)
-        r.raise_for_status()
-        logger.info("[INTEGRATION] Triggered manifold M3U ingest")
-    except Exception as e:
-        errors.append(f"M3U ingest: {e}")
+def sync_manifold(url: str, m3u_name: str, epg_name: str, regenerate: bool = True) -> dict:
+    """Call manifold's /api/integrations/sync with the configured source names.
 
+    This re-ingests only the named channelarr sources (not all 4700+ channels
+    from other sources), then regenerates manifold's combined M3U/XMLTV outputs.
+    If manifold has Jellyfin auto-refresh enabled, it cascades automatically.
+    """
     try:
-        r = requests.post(f"{base}/api/epg-sources/ingest", timeout=30)
+        r = requests.post(
+            f"{url.rstrip('/')}/api/integrations/sync",
+            json={
+                "m3u_source": m3u_name or "",
+                "epg_source": epg_name or "",
+                "regenerate": regenerate,
+            },
+            timeout=30,
+        )
         r.raise_for_status()
-        logger.info("[INTEGRATION] Triggered manifold EPG ingest")
+        result = r.json()
+        logger.info("[INTEGRATION] Manifold sync succeeded: %s", result)
+        return result
     except Exception as e:
-        errors.append(f"EPG ingest: {e}")
-
-    if errors:
-        return {"ok": False, "error": "; ".join(errors)}
-    return {"ok": True}
+        logger.warning("[INTEGRATION] Manifold sync failed: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
 def auto_push():
@@ -167,17 +170,19 @@ def auto_push():
                 logger.warning("[INTEGRATION] Auto-push to Jellyfin error: %s", e)
 
     # Manifold
-    if get_setting("MANIFOLD_AUTO_REFRESH") == "true":
+    if get_setting("MANIFOLD_AUTO_SYNC") == "true":
         mf_url = get_setting("MANIFOLD_URL")
         if mf_url:
+            m3u_name = get_setting("MANIFOLD_M3U_SOURCE_NAME", "Channelarr")
+            epg_name = get_setting("MANIFOLD_EPG_SOURCE_NAME", "Channelarr")
             try:
-                result = refresh_manifold(mf_url)
-                if result["ok"]:
-                    logger.info("[INTEGRATION] Auto-push to Manifold succeeded")
+                result = sync_manifold(mf_url, m3u_name, epg_name, regenerate=True)
+                if result.get("ok"):
+                    logger.info("[INTEGRATION] Auto-sync to Manifold succeeded")
                 else:
-                    logger.warning("[INTEGRATION] Auto-push to Manifold failed: %s", result["error"])
+                    logger.warning("[INTEGRATION] Auto-sync to Manifold failed: %s", result.get("error"))
             except Exception as e:
-                logger.warning("[INTEGRATION] Auto-push to Manifold error: %s", e)
+                logger.warning("[INTEGRATION] Auto-sync to Manifold error: %s", e)
 
 
 def auto_push_async():

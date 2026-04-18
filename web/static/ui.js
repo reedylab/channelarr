@@ -1736,7 +1736,7 @@ function renderIntegrations() {
         <span class="integ-card-name">Manifold</span>
         ${badge(mf.configured)}
       </div>
-      <div class="integ-card-desc">Force manifold to re-ingest M3U and EPG sources after channelarr updates.</div>
+      <div class="integ-card-desc">Sync channelarr's M3U + EPG into manifold and trigger republish. Cascades to Jellyfin if manifold has auto-refresh enabled.</div>
     </div>
   </div>`;
 }
@@ -1840,25 +1840,37 @@ channelarr.openIntegModal = function(type) {
       <div class="modal-header"><h3>Manifold Integration</h3><button class="btn-close" onclick="document.getElementById('modal-overlay').classList.add('hidden')">&times;</button></div>
       <div class="modal-body" style="padding:16px">
         <div class="integ-modal-fields">
-          <label>Manifold URL<input type="text" id="integ-mf-url" value="${esc(mf.url || "")}" placeholder="http://192.168.20.15:5055"></label>
+          <label>Manifold URL<input type="text" id="integ-mf-url" value="${esc(mf.url || "")}" placeholder="http://192.168.20.34:40000"></label>
+          <label>M3U Source Name in Manifold<input type="text" id="integ-mf-m3u" value="${esc(mf.m3u_source_name || "Channelarr")}" placeholder="Channelarr"></label>
+          <label>EPG Source Name in Manifold<input type="text" id="integ-mf-epg" value="${esc(mf.epg_source_name || "Channelarr")}" placeholder="Channelarr"></label>
           <div class="integ-toggle-row">
-            <label class="scraper-toggle"><input type="checkbox" id="integ-mf-auto" ${mf.auto_refresh ? "checked" : ""}><span class="slider"></span></label>
-            <span>Auto-refresh after M3U regeneration</span>
+            <label class="scraper-toggle"><input type="checkbox" id="integ-mf-auto" ${mf.auto_sync ? "checked" : ""}><span class="slider"></span></label>
+            <span>Auto-sync manifold after channelarr regenerates</span>
           </div>
         </div>
+        <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Source names must exactly match the names configured inside manifold's M3U Sources and EPG Sources tables.</p>
         <div class="integ-modal-actions">
           <button class="btn-sm" id="integ-mf-save">Save</button>
           <button class="btn-sm" id="integ-mf-test">Test Connection</button>
-          <button class="btn-sm" id="integ-mf-refresh">Force Refresh</button>
+          <button class="btn-sm" id="integ-mf-sync">Force Sync</button>
         </div>
         <div id="integ-mf-result" style="margin-top:12px;font-size:12px"></div>
       </div>`;
+
+    function _mfPayload() {
+      return {
+        url: $("#integ-mf-url").value.trim(),
+        m3u_source_name: $("#integ-mf-m3u").value.trim(),
+        epg_source_name: $("#integ-mf-epg").value.trim(),
+        auto_sync: $("#integ-mf-auto").checked,
+      };
+    }
 
     $("#integ-mf-save").addEventListener("click", async () => {
       try {
         const r = await fetch(`${API}/integrations/manifold/config`, {
           method: "PUT", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ url: $("#integ-mf-url").value, auto_refresh: $("#integ-mf-auto").checked }),
+          body: JSON.stringify(_mfPayload()),
         });
         if ((await r.json()).ok) { toast("success", "Manifold config saved"); loadIntegrations(); }
         else toast("error", "Save failed");
@@ -1870,7 +1882,7 @@ channelarr.openIntegModal = function(type) {
       res.textContent = "Testing...";
       await fetch(`${API}/integrations/manifold/config`, {
         method: "PUT", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ url: $("#integ-mf-url").value, auto_refresh: $("#integ-mf-auto").checked }),
+        body: JSON.stringify(_mfPayload()),
       });
       try {
         const r = await fetch(`${API}/integrations/manifold/test`, {method: "POST"});
@@ -1884,15 +1896,19 @@ channelarr.openIntegModal = function(type) {
       } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Connection failed</span>'; }
     });
 
-    $("#integ-mf-refresh").addEventListener("click", async () => {
+    $("#integ-mf-sync").addEventListener("click", async () => {
       const res = $("#integ-mf-result");
-      res.textContent = "Triggering re-ingest...";
+      res.textContent = "Syncing channelarr sources in manifold...";
+      await fetch(`${API}/integrations/manifold/config`, {
+        method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(_mfPayload()),
+      });
       try {
-        const r = await fetch(`${API}/integrations/manifold/refresh`, {method: "POST"});
+        const r = await fetch(`${API}/integrations/manifold/sync`, {method: "POST"});
         const d = await r.json();
-        if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Re-ingest triggered</span>';
+        if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Sync triggered — manifold will re-ingest + regenerate</span>';
         else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
-      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Refresh failed</span>'; }
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Sync failed</span>'; }
     });
   }
 };

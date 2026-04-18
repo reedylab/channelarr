@@ -51,7 +51,9 @@ DEFAULTS = {
     "JELLYFIN_AUTO_REFRESH": "false",
     "JELLYFIN_REBIND_MODE": "false",
     "MANIFOLD_URL": "",
-    "MANIFOLD_AUTO_REFRESH": "false",
+    "MANIFOLD_M3U_SOURCE_NAME": "Channelarr",
+    "MANIFOLD_EPG_SOURCE_NAME": "Channelarr",
+    "MANIFOLD_AUTO_SYNC": "false",
 }
 
 

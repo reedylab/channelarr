@@ -21,7 +21,9 @@ class JellyfinConfig(BaseModel):
 
 class ManifoldConfig(BaseModel):
     url: str = ""
-    auto_refresh: bool = False
+    m3u_source_name: str = "Channelarr"
+    epg_source_name: str = "Channelarr"
+    auto_sync: bool = False
 
 
 @router.get("/integrations/status")
@@ -39,7 +41,9 @@ def integrations_status():
         },
         "manifold": {
             "url": s.get("MANIFOLD_URL", ""),
-            "auto_refresh": s.get("MANIFOLD_AUTO_REFRESH") == "true",
+            "m3u_source_name": s.get("MANIFOLD_M3U_SOURCE_NAME", "Channelarr"),
+            "epg_source_name": s.get("MANIFOLD_EPG_SOURCE_NAME", "Channelarr"),
+            "auto_sync": s.get("MANIFOLD_AUTO_SYNC") == "true",
             "configured": bool(s.get("MANIFOLD_URL")),
         },
     }
@@ -88,7 +92,9 @@ def jellyfin_refresh():
 def manifold_save_config(body: ManifoldConfig):
     save_settings({
         "MANIFOLD_URL": body.url,
-        "MANIFOLD_AUTO_REFRESH": "true" if body.auto_refresh else "false",
+        "MANIFOLD_M3U_SOURCE_NAME": body.m3u_source_name,
+        "MANIFOLD_EPG_SOURCE_NAME": body.epg_source_name,
+        "MANIFOLD_AUTO_SYNC": "true" if body.auto_sync else "false",
     })
     return {"ok": True}
 
@@ -102,17 +108,20 @@ def manifold_test():
     return test_manifold(url)
 
 
-@router.post("/integrations/manifold/refresh")
-def manifold_refresh():
-    from core.integrations import refresh_manifold
+@router.post("/integrations/manifold/sync")
+def manifold_sync():
+    """Force an immediate sync — re-ingest channelarr sources in manifold."""
+    from core.integrations import sync_manifold
     url = get_setting("MANIFOLD_URL")
+    m3u_name = get_setting("MANIFOLD_M3U_SOURCE_NAME", "Channelarr")
+    epg_name = get_setting("MANIFOLD_EPG_SOURCE_NAME", "Channelarr")
     if not url:
         return {"ok": False, "error": "Manifold URL required"}
 
     def _run():
-        result = refresh_manifold(url)
-        if not result["ok"]:
-            logger.warning("[INTEGRATION] Manifold refresh failed: %s", result["error"])
+        result = sync_manifold(url, m3u_name, epg_name, regenerate=True)
+        if not result.get("ok"):
+            logger.warning("[INTEGRATION] Manifold sync failed: %s", result.get("error"))
 
     threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "message": "Manifold refresh started"}
+    return {"ok": True, "message": "Manifold sync started"}
