@@ -42,6 +42,14 @@ DEFAULTS = {
     "GLUETUN_CONTROL_URL": "",
     "GLUETUN_CONTROL_USER": "",
     "GLUETUN_CONTROL_PASS": "",
+    # Integrations
+    "JELLYFIN_URL": "",
+    "JELLYFIN_API_KEY": "",
+    "JELLYFIN_STRATEGY": "url",
+    "JELLYFIN_LOCAL_PATH": "",
+    "JELLYFIN_AUTO_REFRESH": "false",
+    "MANIFOLD_URL": "",
+    "MANIFOLD_AUTO_REFRESH": "false",
 }
 
 

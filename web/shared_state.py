@@ -249,3 +249,10 @@ def regenerate_m3u():
 
     xmltv_out = os.path.join(m3u_path, "channelarr.xml")
     generate_channelarr_xmltv(channels, xmltv_out, base_url)
+
+    # Push to enabled integrations (non-blocking)
+    try:
+        from core.integrations import auto_push_async
+        auto_push_async()
+    except Exception as e:
+        logging.debug("[M3U] Integration auto-push skipped: %s", e)

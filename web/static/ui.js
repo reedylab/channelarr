@@ -57,16 +57,17 @@ function switchSettingsSub(sub) {
 
   // Show/hide save button based on sub-tab
   const saveBtn = $("#save-settings");
-  if (saveBtn) saveBtn.style.display = sub === "general" ? "" : "none";
+  if (saveBtn) saveBtn.style.display = (sub === "general") ? "" : "none";
 
   const title = $("#settings-section-title");
   if (title) {
-    const titles = {general: "Settings", tasks: "Background Tasks", branding: "Branding Logos"};
+    const titles = {general: "Settings", tasks: "Background Tasks", integrations: "Integrations", branding: "Branding Logos"};
     title.textContent = titles[sub] || "Settings";
   }
 
   if (sub === "general") loadSettings();
   if (sub === "tasks") loadTasks();
+  if (sub === "integrations") loadIntegrations();
   if (sub === "branding") loadBrandingGrid();
   if (sub !== "tasks") { clearInterval(tasksTimer); tasksTimer = null; }
 }
@@ -1681,6 +1682,212 @@ function renderTasks(tasks) {
     });
   });
 }
+
+// ─── Integrations ───
+let _integData = {};
+
+async function loadIntegrations() {
+  try {
+    const r = await fetch(`${API}/integrations/status`);
+    _integData = await r.json();
+    renderIntegrations();
+  } catch (e) {
+    $("#integrations-container").innerHTML = '<div class="empty-state">Failed to load integrations</div>';
+  }
+}
+
+function renderIntegrations() {
+  const c = $("#integrations-container");
+  if (!c) return;
+  const jf = _integData.jellyfin || {};
+  const mf = _integData.manifold || {};
+  const px = _integData.plex || {};
+
+  function badge(configured, label) {
+    if (!configured) return `<span class="integ-badge integ-not-configured">Not Configured</span>`;
+    return `<span class="integ-badge integ-configured">${label || "Configured"}</span>`;
+  }
+
+  c.innerHTML = `<div class="integ-grid">
+    <div class="integ-card" onclick="channelarr.openIntegModal('jellyfin')">
+      <div class="integ-card-header">
+        <span class="integ-card-name">Jellyfin</span>
+        ${badge(jf.configured)}
+      </div>
+      <div class="integ-card-desc">Push M3U/XMLTV updates directly. Supports URL or local path strategy for cache-busting.</div>
+    </div>
+    <div class="integ-card" onclick="channelarr.openIntegModal('manifold')">
+      <div class="integ-card-header">
+        <span class="integ-card-name">Manifold</span>
+        ${badge(mf.configured)}
+      </div>
+      <div class="integ-card-desc">Force manifold to re-ingest M3U and EPG sources after channelarr updates.</div>
+    </div>
+    <div class="integ-card" style="cursor:default" onclick="">
+      <div class="integ-card-header">
+        <span class="integ-card-name">Plex</span>
+        <span class="integ-badge integ-connected">Active</span>
+      </div>
+      <div class="integ-card-desc">HDHomeRun emulation — Plex auto-discovers on your network.</div>
+      <div class="integ-info">${esc(px.hdhr_url || "")}</div>
+    </div>
+  </div>`;
+}
+
+channelarr.openIntegModal = function(type) {
+  // Reuse the existing modal overlay
+  const overlay = $("#modal-overlay");
+  const modal = overlay.querySelector(".modal");
+  overlay.classList.remove("hidden");
+
+  if (type === "jellyfin") {
+    const jf = _integData.jellyfin || {};
+    modal.innerHTML = `
+      <div class="modal-header"><h3>Jellyfin Integration</h3><button class="btn-close" onclick="$('#modal-overlay').classList.add('hidden')">&times;</button></div>
+      <div class="modal-body" style="padding:16px">
+        <div class="integ-modal-fields">
+          <label>Server URL<input type="text" id="integ-jf-url" value="${esc(jf.url || "")}" placeholder="http://192.168.20.34:8096"></label>
+          <label>API Key<input type="text" id="integ-jf-key" value="${esc(jf.api_key || "")}" placeholder="Jellyfin API key"></label>
+          <label>M3U Strategy
+            <select id="integ-jf-strategy">
+              <option value="url" ${jf.strategy !== "local" ? "selected" : ""}>URL (HTTP)</option>
+              <option value="local" ${jf.strategy === "local" ? "selected" : ""}>Local Path (Shared Storage)</option>
+            </select>
+          </label>
+          <label id="integ-jf-path-label" style="${jf.strategy === "local" ? "" : "display:none"}">Local M3U/XMLTV Directory<input type="text" id="integ-jf-path" value="${esc(jf.local_path || "")}" placeholder="/mnt/das-disk-1/media/m3u"></label>
+          <div class="integ-toggle-row">
+            <label class="scraper-toggle"><input type="checkbox" id="integ-jf-auto" ${jf.auto_refresh ? "checked" : ""}><span class="slider"></span></label>
+            <span>Auto-refresh after M3U regeneration</span>
+          </div>
+        </div>
+        <div class="integ-modal-actions">
+          <button class="btn-sm" id="integ-jf-save">Save</button>
+          <button class="btn-sm" id="integ-jf-test">Test Connection</button>
+          <button class="btn-sm" id="integ-jf-refresh">Force Refresh</button>
+        </div>
+        <div id="integ-jf-result" style="margin-top:12px;font-size:12px"></div>
+      </div>`;
+
+    // Strategy toggle
+    $("#integ-jf-strategy").addEventListener("change", (e) => {
+      $("#integ-jf-path-label").style.display = e.target.value === "local" ? "" : "none";
+    });
+
+    // Save
+    $("#integ-jf-save").addEventListener("click", async () => {
+      try {
+        const r = await fetch(`${API}/integrations/jellyfin/config`, {
+          method: "PUT", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
+            strategy: $("#integ-jf-strategy").value, local_path: $("#integ-jf-path").value,
+            auto_refresh: $("#integ-jf-auto").checked,
+          }),
+        });
+        if ((await r.json()).ok) { toast("success", "Jellyfin config saved"); loadIntegrations(); }
+        else toast("error", "Save failed");
+      } catch (e) { toast("error", "Save failed"); }
+    });
+
+    // Test
+    $("#integ-jf-test").addEventListener("click", async () => {
+      const res = $("#integ-jf-result");
+      res.textContent = "Testing...";
+      // Save first so test uses latest values
+      await fetch(`${API}/integrations/jellyfin/config`, {
+        method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          url: $("#integ-jf-url").value, api_key: $("#integ-jf-key").value,
+          strategy: $("#integ-jf-strategy").value, local_path: $("#integ-jf-path").value,
+          auto_refresh: $("#integ-jf-auto").checked,
+        }),
+      });
+      try {
+        const r = await fetch(`${API}/integrations/jellyfin/test`, {method: "POST"});
+        const d = await r.json();
+        if (d.ok) {
+          res.innerHTML = `<span style="color:var(--ok)">Connected: ${esc(d.server_name)} v${esc(d.version)}</span>`;
+          loadIntegrations();
+        } else {
+          res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+        }
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Connection failed</span>'; }
+    });
+
+    // Refresh
+    $("#integ-jf-refresh").addEventListener("click", async () => {
+      const res = $("#integ-jf-result");
+      res.textContent = "Refreshing (cache-bust)...";
+      try {
+        const r = await fetch(`${API}/integrations/jellyfin/refresh`, {method: "POST"});
+        const d = await r.json();
+        if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Refresh triggered</span>';
+        else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Refresh failed</span>'; }
+    });
+
+  } else if (type === "manifold") {
+    const mf = _integData.manifold || {};
+    modal.innerHTML = `
+      <div class="modal-header"><h3>Manifold Integration</h3><button class="btn-close" onclick="$('#modal-overlay').classList.add('hidden')">&times;</button></div>
+      <div class="modal-body" style="padding:16px">
+        <div class="integ-modal-fields">
+          <label>Manifold URL<input type="text" id="integ-mf-url" value="${esc(mf.url || "")}" placeholder="http://192.168.20.15:5055"></label>
+          <div class="integ-toggle-row">
+            <label class="scraper-toggle"><input type="checkbox" id="integ-mf-auto" ${mf.auto_refresh ? "checked" : ""}><span class="slider"></span></label>
+            <span>Auto-refresh after M3U regeneration</span>
+          </div>
+        </div>
+        <div class="integ-modal-actions">
+          <button class="btn-sm" id="integ-mf-save">Save</button>
+          <button class="btn-sm" id="integ-mf-test">Test Connection</button>
+          <button class="btn-sm" id="integ-mf-refresh">Force Refresh</button>
+        </div>
+        <div id="integ-mf-result" style="margin-top:12px;font-size:12px"></div>
+      </div>`;
+
+    $("#integ-mf-save").addEventListener("click", async () => {
+      try {
+        const r = await fetch(`${API}/integrations/manifold/config`, {
+          method: "PUT", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ url: $("#integ-mf-url").value, auto_refresh: $("#integ-mf-auto").checked }),
+        });
+        if ((await r.json()).ok) { toast("success", "Manifold config saved"); loadIntegrations(); }
+        else toast("error", "Save failed");
+      } catch (e) { toast("error", "Save failed"); }
+    });
+
+    $("#integ-mf-test").addEventListener("click", async () => {
+      const res = $("#integ-mf-result");
+      res.textContent = "Testing...";
+      await fetch(`${API}/integrations/manifold/config`, {
+        method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ url: $("#integ-mf-url").value, auto_refresh: $("#integ-mf-auto").checked }),
+      });
+      try {
+        const r = await fetch(`${API}/integrations/manifold/test`, {method: "POST"});
+        const d = await r.json();
+        if (d.ok) {
+          res.innerHTML = '<span style="color:var(--ok)">Connected to Manifold</span>';
+          loadIntegrations();
+        } else {
+          res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+        }
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Connection failed</span>'; }
+    });
+
+    $("#integ-mf-refresh").addEventListener("click", async () => {
+      const res = $("#integ-mf-result");
+      res.textContent = "Triggering re-ingest...";
+      try {
+        const r = await fetch(`${API}/integrations/manifold/refresh`, {method: "POST"});
+        const d = await r.json();
+        if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Re-ingest triggered</span>';
+        else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Refresh failed</span>'; }
+    });
+  }
+};
 
 // ─── Branding Logos ───
 async function loadBrandingDropdown(selectId, selected) {

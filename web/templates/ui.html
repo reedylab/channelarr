@@ -5,7 +5,7 @@
   <title>Channelarr</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=33" />
+  <link rel="stylesheet" href="/static/style.css?v=34" />
 </head>
 <body class="theme-dark">
   <!-- Header -->
@@ -70,6 +70,7 @@
         <div id="settings-subnav" class="nav-subnav">
           <button class="nav-subitem active" data-sub="general">General</button>
           <button class="nav-subitem" data-sub="tasks">Tasks</button>
+          <button class="nav-subitem" data-sub="integrations">Integrations</button>
           <button class="nav-subitem" data-sub="branding">Branding</button>
         </div>
       </nav>
@@ -358,6 +359,10 @@
             <div id="settings-sub-tasks" class="settings-sub" style="display:none">
               <div id="tasks-container" style="padding:16px 20px"></div>
             </div>
+            <!-- Integrations -->
+            <div id="settings-sub-integrations" class="settings-sub" style="display:none">
+              <div id="integrations-container" style="padding:16px 20px"></div>
+            </div>
             <!-- Branding -->
             <div id="settings-sub-branding" class="settings-sub" style="display:none">
               <div class="settings-section">
@@ -632,6 +637,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=48"></script>
+  <script src="/static/ui.js?v=49"></script>
 </body>
 </html>

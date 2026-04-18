@@ -20,7 +20,7 @@ from core.channels import ChannelManager, materialize_schedule
 from core.streamer import StreamerManager
 
 from web import shared_state
-from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube, resolve, resolved_stream, scrapers
+from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube, resolve, resolved_stream, scrapers, integrations
 
 
 def _clean_stale_hls():
@@ -230,6 +230,7 @@ app.include_router(hdhr.router)
 app.include_router(youtube.router, prefix="/api")
 app.include_router(resolve.router, prefix="/api")
 app.include_router(scrapers.router, prefix="/api")
+app.include_router(integrations.router, prefix="/api")
 app.include_router(resolved_stream.router)
 
 
