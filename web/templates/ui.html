@@ -27,7 +27,7 @@
       <span id="vpn-badge" class="badge vpn-badge hidden">VPN: --</span>
       <span id="streaming-badge" class="streaming-badge hidden" title="Active streams">0 streaming</span>
       <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
-      <div class="output-links">
+      <div class="output-links" id="output-links">
         <a href="/api/export/m3u" target="_blank" class="output-link" title="M3U Playlist URL">M3U</a><button class="copy-btn" data-copy-path="/api/export/m3u" title="Copy M3U URL">&#x2398;</button>
         <a href="/api/export/xmltv" target="_blank" class="output-link" title="XMLTV EPG URL">EPG</a><button class="copy-btn" data-copy-path="/api/export/xmltv" title="Copy EPG URL">&#x2398;</button>
       </div>
@@ -637,6 +637,6 @@
     window.API_BASE = "{{ api_base | default('/api') }}";
   </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="/static/ui.js?v=51"></script>
+  <script src="/static/ui.js?v=52"></script>
 </body>
 </html>

@@ -1462,7 +1462,22 @@ async function loadSettings() {
     settingsOriginal = {...data.values};
     settingsModified = {...data.values};
     renderAllSettings();
+    // Show/hide export links based on strategy
+    _updateExportLinks(data.values);
   } catch(e) {}
+}
+
+function _updateExportLinks(vals) {
+  const links = $("#output-links");
+  if (!links) return;
+  if ((vals || settingsOriginal).EXPORT_STRATEGY === "local") {
+    const path = (vals || settingsOriginal).EXPORT_LOCAL_PATH || "/output/m3u";
+    links.innerHTML = `<span class="output-link" style="cursor:default;font-size:11px" title="Local path exports">${esc(path)}/channelarr.m3u</span>`;
+  } else {
+    links.innerHTML = `
+      <a href="/api/export/m3u" target="_blank" class="output-link" title="M3U Playlist URL">M3U</a><button class="copy-btn" data-copy-path="/api/export/m3u" title="Copy M3U URL">&#x2398;</button>
+      <a href="/api/export/xmltv" target="_blank" class="output-link" title="XMLTV EPG URL">EPG</a><button class="copy-btn" data-copy-path="/api/export/xmltv" title="Copy EPG URL">&#x2398;</button>`;
+  }
 }
 
 function renderAllSettings() {
@@ -1536,6 +1551,7 @@ $("#save-settings").addEventListener("click", async () => {
     status.className = "settings-status success";
     settingsOriginal = {...settingsModified};
     renderAllSettings();
+    _updateExportLinks(settingsModified);
     toast("success", "Settings saved");
   } catch(e) {
     status.textContent = "Save failed";
