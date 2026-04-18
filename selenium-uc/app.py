@@ -697,81 +697,115 @@ def _try_click_play(browser):
         pass
 
 
+def _do_capture(browser, url, timeout, switch_iframe):
+    """Inner capture logic — runs inside a deadline thread."""
+    # Set page load timeout
+    try:
+        browser.set_page_load_timeout(timeout + 30)
+    except Exception:
+        pass
+
+    try:
+        browser.get(url)
+    except Exception as e:
+        logger.warning("Page load timeout/error for %s: %s", url, e)
+
+    # Scan all iframes for skip conditions
+    skip_reason = _scan_all_frames_for_skip(browser)
+    if skip_reason:
+        logger.info("Skip detected for %s: %s", url, skip_reason)
+        return {"ok": False, "error": f"Skipped: {skip_reason}"}
+
+    if switch_iframe:
+        try:
+            browser.switch_to.default_content()
+            WebDriverWait(browser, 10).until(
+                EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe"))
+            )
+            logger.info("Switched to iframe")
+        except Exception:
+            logger.debug("No iframe, continuing in main frame")
+
+    _try_click_play(browser)
+
+    result = _wait_for_manifest(browser, timeout=timeout)
+    if not result:
+        return {"ok": False, "error": "No manifest captured within timeout"}
+
+    body_text = _decode_body(result)
+    if not body_text:
+        return {
+            "ok": False,
+            "error": f"Captured resource is not HLS: {result.get('url')} (MIME: {result.get('mime')})",
+        }
+
+    ua = browser.execute_script("return navigator.userAgent")
+    return {
+        "ok": True,
+        "manifest_url": result["url"],
+        "body": body_text,
+        "mime": result.get("mime"),
+        "headers": result.get("resp_headers", {}),
+        "heartbeat": result.get("heartbeat"),
+        "user_agent": ua,
+    }
+
+
 @app.post("/capture")
 def capture(req: CaptureRequest):
-    """Navigate to a URL and capture an m3u8 manifest using the persistent session."""
+    """Navigate to a URL and capture an m3u8 manifest using the persistent session.
+
+    Runs the entire capture inside a deadline thread so one hung page
+    can never block the sidecar permanently.
+    """
+    # Hard deadline: timeout + 45s covers page load + manifest wait + overhead
+    deadline = req.timeout + 45
+
     with _browser_lock:
+        global _browser
         try:
-            logger.info("Starting capture: %s (timeout=%ds, count=%d)",
-                        req.url, req.timeout, _capture_count)
+            logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d)",
+                        req.url, req.timeout, deadline, _capture_count)
             browser = _get_browser()
 
-            # Set page load timeout to match capture timeout + buffer
-            try:
-                browser.set_page_load_timeout(req.timeout + 30)
-            except Exception:
-                pass
+            # Run capture in a thread with a hard deadline
+            capture_result = [None]
+            capture_error = [None]
 
-            try:
-                browser.get(req.url)
-            except Exception as e:
-                # Page load timeout — page may still be partially loaded,
-                # continue to check for manifests that arrived before timeout
-                logger.warning("Page load timeout/error for %s: %s", req.url, e)
-
-            # Scan all iframes for skip conditions before committing to manifest wait
-            skip_reason = _scan_all_frames_for_skip(browser)
-            if skip_reason:
-                logger.info("Skip detected for %s: %s", req.url, skip_reason)
-                return {"ok": False, "error": f"Skipped: {skip_reason}"}
-
-            if req.switch_iframe:
+            def _run():
                 try:
-                    browser.switch_to.default_content()
-                    WebDriverWait(browser, 10).until(
-                        EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe"))
-                    )
-                    logger.info("Switched to iframe")
+                    capture_result[0] = _do_capture(browser, req.url, req.timeout, req.switch_iframe)
+                except Exception as e:
+                    capture_error[0] = e
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=deadline)
+
+            if t.is_alive():
+                logger.error("Capture deadline exceeded for %s (%ds), killing browser",
+                             req.url, deadline)
+                try:
+                    _browser.quit()
                 except Exception:
-                    logger.debug("No iframe, continuing in main frame")
+                    pass
+                _kill_chrome_processes()
+                _browser = None
+                return {"ok": False, "error": f"Capture deadline exceeded ({deadline}s)"}
 
-            # Try clicking play button — pregame streams often need a click
-            # before the m3u8 loads. Try common selectors, then fall back to
-            # clicking the video element or player container.
-            _try_click_play(browser)
+            if capture_error[0]:
+                raise capture_error[0]
 
-            result = _wait_for_manifest(browser, timeout=req.timeout)
-            if not result:
-                return {"ok": False, "error": "No manifest captured within timeout"}
-
-            body_text = _decode_body(result)
-            if not body_text:
-                return {
-                    "ok": False,
-                    "error": f"Captured resource is not HLS: {result.get('url')} (MIME: {result.get('mime')})",
-                }
-
-            ua = browser.execute_script("return navigator.userAgent")
-
-            return {
-                "ok": True,
-                "manifest_url": result["url"],
-                "body": body_text,
-                "mime": result.get("mime"),
-                "headers": result.get("resp_headers", {}),
-                "heartbeat": result.get("heartbeat"),
-                "user_agent": ua,
-            }
+            return capture_result[0] or {"ok": False, "error": "Capture returned no result"}
 
         except Exception as e:
             logger.exception("Capture failed for %s", req.url)
-            # Force a recycle on errors — browser may be in a bad state
-            global _browser
             try:
                 if _browser:
                     _browser.quit()
             except Exception:
                 pass
+            _kill_chrome_processes()
             _browser = None
             return {"ok": False, "error": str(e)}
 
