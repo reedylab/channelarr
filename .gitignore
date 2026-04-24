@@ -1,0 +1,19 @@
+/.idea/
+/.claude/
+/docker-compose.yml
+/docker-compose.postgres.yml
+/gluetun/
+__pycache__/
+*.pyc
+*.log
+data/
+.env
+.env.*
+!.env.example
+.DS_Store
+scrapers/
+
+# Local planning / design docs — not for public repo
+planning/
+*-PLAN.md
+*-plan.md

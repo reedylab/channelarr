@@ -1,0 +1,310 @@
+"""Module-level shared state for Channelarr.
+
+Managers are set during app lifespan startup and accessed by routers
+and background threads via this module.
+"""
+
+import collections
+import logging
+import os
+import threading
+import time
+
+import psutil
+
+from core.config import get_setting
+from core.xmltv import generate_channelarr_xmltv
+
+# ── Managers (set by app.py lifespan) ──
+bump_mgr = None
+media_lib = None
+channel_mgr = None
+streamer_mgr = None
+log_path: str = ""
+
+LOGO_DIR = os.getenv("LOGO_DIR", "/app/data/logos")
+
+# ── Settings schema ──
+SETTINGS_SCHEMA = {
+    "paths": {
+        "label": "Paths",
+        "fields": {
+            "MEDIA_PATH": {"label": "Media Path", "type": "text", "placeholder": "/media"},
+            "BUMPS_PATH": {"label": "Bumps Path", "type": "text", "placeholder": "/bumps"},
+            "HLS_OUTPUT_PATH": {"label": "HLS Output Path", "type": "text", "placeholder": "/app/data/hls"},
+            "M3U_OUTPUT_PATH": {"label": "M3U Output Path", "type": "text", "placeholder": "/m3u"},
+            "YT_CACHE_PATH": {"label": "YouTube Cache Path", "type": "text", "placeholder": "/yt_cache"},
+        },
+    },
+    "streaming": {
+        "label": "Streaming",
+        "fields": {
+            "HLS_TIME": {"label": "HLS Segment Duration (s)", "type": "text", "placeholder": "6"},
+            "HLS_LIST_SIZE": {"label": "HLS Playlist Window", "type": "text", "placeholder": "10"},
+            "FFMPEG_LOGLEVEL": {
+                "label": "FFmpeg Log Level", "type": "select",
+                "options": [
+                    {"value": "warning", "label": "Warning"},
+                    {"value": "info", "label": "Info"},
+                    {"value": "verbose", "label": "Verbose"},
+                    {"value": "quiet", "label": "Quiet"},
+                ],
+            },
+            "BASE_URL": {"label": "Base URL", "type": "text", "placeholder": "http://your-server-ip:5045"},
+            "EPG_TIMEZONE": {"label": "EPG Timezone", "type": "text", "placeholder": "America/New_York"},
+            "EXPORT_STRATEGY": {
+                "label": "M3U/EPG Export Strategy", "type": "select",
+                "options": [
+                    {"value": "url", "label": "URL (HTTP)"},
+                    {"value": "local", "label": "Local Path (Shared Storage)"},
+                ],
+            },
+            "EXPORT_LOCAL_PATH": {"label": "Local Export Path (if local strategy)", "type": "text", "placeholder": "/output/m3u"},
+        },
+    },
+    "encoding": {
+        "label": "Encoding",
+        "fields": {
+            "VIDEO_PRESET": {
+                "label": "x264 Preset", "type": "select",
+                "options": [
+                    {"value": "ultrafast", "label": "Ultrafast"},
+                    {"value": "superfast", "label": "Superfast"},
+                    {"value": "veryfast", "label": "Veryfast"},
+                    {"value": "faster", "label": "Faster"},
+                    {"value": "fast", "label": "Fast"},
+                    {"value": "medium", "label": "Medium"},
+                    {"value": "slow", "label": "Slow"},
+                ],
+            },
+            "VIDEO_CRF": {
+                "label": "Video CRF", "type": "select",
+                "options": [
+                    {"value": "", "label": "Codec Default"},
+                    {"value": "18", "label": "18 — Visually Lossless"},
+                    {"value": "20", "label": "20"},
+                    {"value": "22", "label": "22"},
+                    {"value": "23", "label": "23 — x264 Default"},
+                    {"value": "25", "label": "25"},
+                    {"value": "28", "label": "28"},
+                ],
+            },
+            "FFMPEG_THREADS": {
+                "label": "FFmpeg Threads", "type": "select",
+                "options": [
+                    {"value": "1", "label": "1"},
+                    {"value": "2", "label": "2"},
+                    {"value": "4", "label": "4"},
+                    {"value": "8", "label": "8"},
+                    {"value": "0", "label": "Auto (all cores)"},
+                ],
+            },
+            "X264_THREADS": {
+                "label": "x264 Threads", "type": "select",
+                "options": [
+                    {"value": "1", "label": "1"},
+                    {"value": "2", "label": "2"},
+                    {"value": "4", "label": "4"},
+                    {"value": "8", "label": "8"},
+                    {"value": "0", "label": "Auto (all cores)"},
+                ],
+            },
+            "AUDIO_BITRATE": {
+                "label": "Audio Bitrate", "type": "select",
+                "options": [
+                    {"value": "128k", "label": "128k"},
+                    {"value": "192k", "label": "192k"},
+                    {"value": "256k", "label": "256k"},
+                    {"value": "320k", "label": "320k"},
+                    {"value": "448k", "label": "448k"},
+                ],
+            },
+        },
+    },
+    "channel_tags": {
+        "label": "Channel Tags",
+        "fields": {
+            "CHANNEL_TAG_CONFIG": {
+                "label": "Tag Configuration (JSON)",
+                "type": "textarea",
+                "placeholder": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
+            },
+        },
+    },
+    "event_queue": {
+        "label": "Event Queue (JIT Resolver)",
+        "fields": {
+            "EVENT_RESOLVE_LEAD_MINUTES": {
+                "label": "Resolve Lead Time (min)",
+                "type": "text",
+                "placeholder": "15",
+            },
+            "EVENT_RETRY_MINUTES": {
+                "label": "Retry Backoff (min)",
+                "type": "text",
+                "placeholder": "5",
+            },
+            "EVENT_MAX_ATTEMPTS": {
+                "label": "Max Attempts Before failed_final",
+                "type": "text",
+                "placeholder": "20",
+            },
+        },
+    },
+}
+
+# ── Stats collector ──
+_cpu_history = collections.deque(maxlen=2880)
+_ram_history = collections.deque(maxlen=2880)
+_yt_cache_history = collections.deque(maxlen=2880)
+_stats_timestamps = collections.deque(maxlen=2880)
+_stats_started = False
+
+
+def _stats_collector():
+    from core.youtube import yt_cache_size
+    while True:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        _cpu_history.append(cpu)
+        _ram_history.append(mem.percent)
+        _yt_cache_history.append(yt_cache_size())
+        _stats_timestamps.append(time.time())
+        time.sleep(29)
+
+
+def start_stats_collector():
+    global _stats_started
+    if _stats_started:
+        return
+    _stats_started = True
+    t = threading.Thread(target=_stats_collector, daemon=True)
+    t.start()
+
+
+def get_stats_snapshot():
+    mem = psutil.virtual_memory()
+    current = {
+        "cpu_percent": psutil.cpu_percent(interval=0),
+        "ram_percent": mem.percent,
+        "ram_used": mem.used,
+        "ram_total": mem.total,
+        "disk": None,
+    }
+    try:
+        hls_path = get_setting("HLS_OUTPUT_PATH", "/app/data/hls")
+        du = psutil.disk_usage(hls_path)
+        current["disk"] = {
+            "total": du.total,
+            "used": du.used,
+            "free": du.free,
+            "percent": du.percent,
+        }
+    except Exception:
+        pass
+    from core.youtube import yt_cache_size
+    current["yt_cache_bytes"] = yt_cache_size()
+
+    return {
+        "current": current,
+        "history": {
+            "timestamps": list(_stats_timestamps),
+            "cpu": list(_cpu_history),
+            "ram": list(_ram_history),
+            "yt_cache": list(_yt_cache_history),
+        },
+    }
+
+
+
+# ── M3U + XMLTV regeneration ──
+def _group_title(tags, fallback: str) -> str:
+    """Build the M3U group-title attribute value from a channel's tag list.
+
+    Joins tags with ';' so downstream parsers that recognize the convention
+    (manifold, tvheadend, some IPTV clients) can split them back into a
+    multi-tag set. Filters out blanks, coerces to str, and strips anything
+    that would break the attribute quoting (`"` and `;` inside a tag body).
+    Single-tag channels still produce exactly one tag string — the separator
+    only appears when there are two or more tags.
+    """
+    if not tags:
+        return fallback
+    cleaned = []
+    for t in tags:
+        s = str(t).strip()
+        if not s:
+            continue
+        # ';' is the separator; '"' would break group-title="..." quoting.
+        s = s.replace(";", "").replace('"', "")
+        if s:
+            cleaned.append(s)
+    return ";".join(cleaned) if cleaned else fallback
+
+
+def regenerate_m3u():
+    m3u_path = get_setting("M3U_OUTPUT_PATH", "/m3u")
+    base_url = get_setting("BASE_URL", "http://localhost:5045")
+    channels = channel_mgr.list_channels()  # unified list (scheduled + resolved)
+
+    os.makedirs(m3u_path, exist_ok=True)
+    out = os.path.join(m3u_path, "channelarr.m3u")
+
+    scheduled = [ch for ch in channels if ch.get("type") != "resolved"]
+    resolved = [ch for ch in channels if ch.get("type") == "resolved"]
+
+    with open(out, "w") as f:
+        f.write("#EXTM3U\n")
+        chno = 1
+        for ch in scheduled:
+            cid = ch["id"]
+            name = ch["name"]
+            logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
+            logo_tag = ""
+            if os.path.isfile(logo_path):
+                logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
+            group = _group_title(ch.get("tags"), "Channelarr")
+            f.write(
+                f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
+                f'group-title="{group}",{name}\n'
+            )
+            f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
+            chno += 1
+
+        # Resolved channels — different group-title and stream URL pattern.
+        # Transcode-mediated channels publish the unified /live/{id}/ URL
+        # because that's where the FFmpeg pipeline writes its output. Pure
+        # passthrough channels publish the /live-resolved/{manifest_id}/ URL.
+        for ch in resolved:
+            cid = ch["id"]
+            mid = ch.get("manifest_id")
+            if not mid:
+                continue
+            name = ch["name"]
+            logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
+            logo_tag = ""
+            if os.path.isfile(logo_path):
+                logo_tag = f' tvg-logo="{base_url}/api/logo/{cid}"'
+            group = _group_title(ch.get("tags"), "Channelarr Resolved")
+            f.write(
+                f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
+                f'group-title="{group}",{name}\n'
+            )
+            if ch.get("transcode_mediated") or ch.get("encoder_mode") == "proxy":
+                f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
+            else:
+                f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")
+            chno += 1
+
+    logging.info("[M3U] Regenerated %s with %d channels (%d scheduled, %d resolved)",
+                 out, len(channels), len(scheduled), len(resolved))
+
+    xmltv_out = os.path.join(m3u_path, "channelarr.xml")
+    generate_channelarr_xmltv(channels, xmltv_out, base_url)
+
+    # Push to enabled integrations (non-blocking)
+    try:
+        from core.integrations import auto_push_async
+        auto_push_async()
+    except Exception as e:
+        logging.debug("[M3U] Integration auto-push skipped: %s", e)

@@ -1,0 +1,76 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.36.0
+    container_name: channelarr-vpn
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER:-mullvad}
+      - VPN_TYPE=${VPN_TYPE:-wireguard}
+      - WIREGUARD_PRIVATE_KEY=${WG_PRIVATE_KEY:?Set WG_PRIVATE_KEY in .env}
+      - WIREGUARD_ADDRESSES=${WG_ADDRESSES:-10.70.17.30/32}
+      - SERVER_CITIES=${VPN_CITIES:-New York NY,Chicago IL,Atlanta GA,Dallas TX,Miami FL,Ashburn VA,Raleigh NC,Denver CO,Salt Lake City UT,Houston TX,Phoenix AZ,Secaucus NJ}
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      - DNS_KEEP_NAMESERVER=on
+      - CONTROL_SERVER=true
+      - CONTROL_SERVER_USERNAME=${VPN_CONTROL_USER:-admin}
+      - CONTROL_SERVER_PASSWORD=${VPN_CONTROL_PASS:?Set VPN_CONTROL_PASS in .env}
+    ports:
+      - "5045:5045"
+    volumes:
+      - ./gluetun:/gluetun
+    restart: unless-stopped
+
+  channelarr:
+    build: .
+    container_name: channelarr
+    network_mode: service:gluetun
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BASE_URL=${BASE_URL:-http://your-server-ip:5045}
+      # Shared Postgres (point at your existing DB — or use docker-compose.postgres.yml for a bundled sidecar)
+      - PG_HOST=${PG_HOST:-your.postgres.host}
+      - PG_PORT=${PG_PORT:-5432}
+      - PG_USER=${PG_USER:-channelarr}
+      - PG_PASS=${PG_PASS:?Set PG_PASS in .env}
+      - PG_DB=${PG_DB:-channelarr}
+      - SELENIUM_URL=http://localhost:4445
+    volumes:
+      - /path/to/media:/media:ro
+      - /path/to/bumps:/bumps
+      - /path/to/m3u:/m3u
+      - channelarr-data:/app/data
+      - channelarr-logs:/app/logs
+      - /path/to/youtube-cache:/yt_cache
+    depends_on:
+      - gluetun
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr"
+
+  selenium-uc:
+    build: ./selenium-uc
+    container_name: channelarr-selenium-uc
+    network_mode: service:gluetun
+    shm_size: 2g
+    depends_on:
+      - gluetun
+    volumes:
+      - selenium_profile:/data
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr-selenium-uc"
+
+volumes:
+  channelarr-data:
+  channelarr-logs:
+  selenium_profile:
+    external: true
+    name: channelarr_selenium_profile

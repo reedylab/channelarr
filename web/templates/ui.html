@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Channelarr</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css?v=35" />
+</head>
+<body class="theme-dark">
+  <!-- Header -->
+  <header class="app-header">
+    <div class="brand">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 80" class="brand-logo">
+        <rect x="0" y="0" width="80" height="80" rx="16" fill="#1E293B"/>
+        <line x1="40" y1="28" x2="40" y2="66" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        <line x1="40" y1="50" x2="18" y2="66" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <line x1="40" y1="50" x2="62" y2="66" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M 29 25 C 27 19, 53 19, 51 25" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M 21 17 C 17 7, 63 7, 59 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.55"/>
+        <path d="M 13 9 C 7 -4, 73 -4, 67 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.25"/>
+        <circle cx="40" cy="28" r="3.5" fill="currentColor"/>
+        <text x="96" y="52" font-family="'Arial Black','Helvetica Neue',sans-serif" font-size="42" font-weight="900" fill="#F8FAFC" letter-spacing="-1.5">CHANNEL<tspan fill="currentColor">ARR</tspan></text>
+      </svg>
+    </div>
+    <div class="header-actions">
+      <span id="vpn-badge" class="badge vpn-badge hidden">VPN: --</span>
+      <span id="streaming-badge" class="streaming-badge hidden" title="Active streams">0 streaming</span>
+      <button id="new-channel-btn" class="btn btn-primary btn-sm-header">New Channel</button>
+      <div class="output-links" id="output-links">
+        <a href="/api/export/m3u" target="_blank" class="output-link" title="M3U Playlist URL">M3U</a><button class="copy-btn" data-copy-path="/api/export/m3u" title="Copy M3U URL">&#x2398;</button>
+        <a href="/api/export/xmltv" target="_blank" class="output-link" title="XMLTV EPG URL">EPG</a><button class="copy-btn" data-copy-path="/api/export/xmltv" title="Copy EPG URL">&#x2398;</button>
+      </div>
+      <button id="soft-refresh-btn" class="btn btn-ghost btn-sm-header" title="Refresh M3U + EPG from current schedules">Refresh</button>
+    </div>
+  </header>
+
+  <!-- Shell -->
+  <div class="app-shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <nav class="nav">
+        <button class="nav-item active" data-view="channels" title="Channels">
+          <span class="nav-ic">&#9635;</span> <span>Channels</span>
+        </button>
+        <button class="nav-item" data-view="guide" title="Guide">
+          <span class="nav-ic">&#9636;</span> <span>Guide</span>
+        </button>
+        <button class="nav-item" data-view="media" title="Media">
+          <span class="nav-ic">&#9654;</span> <span>Media</span>
+        </button>
+        <button class="nav-item" data-view="bumps" title="Bumps">
+          <span class="nav-ic">&#9670;</span> <span>Bumps</span>
+        </button>
+        <button class="nav-item" data-view="resolver" title="Resolver">
+          <span class="nav-ic">&#9906;</span> <span>Resolver</span>
+        </button>
+        <button class="nav-item" data-view="scrapers" title="Scrapers">
+          <span class="nav-ic">&#9830;</span> <span>Scrapers</span>
+        </button>
+        <button class="nav-item" data-view="logs" title="Logs">
+          <span class="nav-ic">&#9776;</span> <span>Logs</span>
+        </button>
+        <button class="nav-item" data-view="system" title="System">
+          <span class="nav-ic">&#9673;</span> <span>System</span>
+        </button>
+        <button class="nav-item nav-item-parent" data-view="settings" title="Settings">
+          <span class="nav-ic">&#9881;</span> <span>Settings</span> <span class="nav-arrow">&#9662;</span>
+        </button>
+        <div id="settings-subnav" class="nav-subnav">
+          <button class="nav-subitem active" data-sub="general">General</button>
+          <button class="nav-subitem" data-sub="tasks">Tasks</button>
+          <button class="nav-subitem" data-sub="integrations">Integrations</button>
+          <button class="nav-subitem" data-sub="branding">Branding</button>
+        </div>
+      </nav>
+      <div class="sidebar-info">
+        <div><strong>Channels:</strong> <span id="sidebar-total">0</span></div>
+        <div><strong>Streaming:</strong> <span id="sidebar-streaming">0</span></div>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="content">
+
+      <!-- CHANNELS -->
+      <section id="view-channels" class="view visible">
+        <div class="channel-grid" id="channel-grid">
+          <div class="empty-state"><div class="empty-icon">&#128250;</div>No channels yet. Create one to get started.</div>
+        </div>
+      </section>
+
+      <!-- GUIDE -->
+      <section id="view-guide" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>TV Guide</h3>
+            <div class="panel-actions guide-controls">
+              <button class="btn btn-ghost guide-range active" data-hours="3">3h</button>
+              <button class="btn btn-ghost guide-range" data-hours="6">6h</button>
+              <button class="btn btn-ghost guide-range" data-hours="12">12h</button>
+              <button class="btn btn-ghost guide-range" data-hours="24">24h</button>
+              <button id="hard-regen-btn" class="btn btn-primary btn-sm-header" title="Regenerate all channel schedules">Regenerate</button>
+            </div>
+          </div>
+          <div class="guide-container">
+            <div class="guide-grid" id="guide-grid">
+              <div class="guide-channels" id="guide-channels"></div>
+              <div class="guide-timeline" id="guide-timeline">
+                <div class="guide-time-header" id="guide-time-header"></div>
+                <div class="guide-rows" id="guide-rows"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- MEDIA -->
+      <section id="view-media" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Media Library</h3>
+            <div class="panel-actions">
+              <button class="btn btn-ghost media-tab active" data-tab="movies">Movies</button>
+              <button class="btn btn-ghost media-tab" data-tab="tv">TV Shows</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <input type="text" id="media-search" class="media-search" placeholder="Search..." />
+            <div id="media-list" class="media-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- BUMPS -->
+      <section id="view-bumps" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Bump Clips</h3>
+            <div class="panel-actions">
+              <button id="rescan-bumps" class="btn btn-ghost">Rescan</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <div class="bump-download-form">
+              <h4>Download from YouTube</h4>
+              <div class="bump-dl-row">
+                <input type="text" id="bump-dl-url" class="media-search" placeholder="YouTube URL..." style="margin-bottom:0;flex:2" />
+                <input type="text" id="bump-dl-folder" class="media-search" placeholder="Folder name (e.g. nature)" style="margin-bottom:0;flex:1" />
+                <select id="bump-dl-res" style="margin-bottom:0">
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                </select>
+                <button id="bump-dl-btn" class="btn btn-primary">Download</button>
+              </div>
+            </div>
+            <div id="bumps-grid" class="bump-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RESOLVER -->
+      <section id="view-resolver" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Manifest Library</h3>
+            <div class="panel-actions">
+              <span id="selenium-badge" class="badge" title="Selenium sidecar status">Selenium: --</span>
+              <button id="resolver-clear" class="btn btn-ghost">Clear</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div class="resolver-input">
+              <textarea id="resolver-urls" class="resolver-textarea" rows="3" placeholder="Paste URLs to resolve (one per line)&#10;&#10;Or JSON: [{&quot;url&quot;: &quot;...&quot;, &quot;title&quot;: &quot;...&quot;}, ...]"></textarea>
+              <div class="resolver-controls">
+                <input type="text" id="resolver-title" class="filter-search" placeholder="Title (optional, single URL)" style="width:180px">
+                <input type="text" id="resolver-tags" class="filter-search" placeholder="Tags (e.g. Sports, Events)" style="width:180px">
+                <input type="datetime-local" id="resolver-event-start" class="filter-search" title="Event start" style="width:170px">
+                <input type="datetime-local" id="resolver-event-end" class="filter-search" title="Event end" style="width:170px">
+                <select id="resolver-timeout" class="filter-status">
+                  <option value="30">30s timeout</option>
+                  <option value="60">60s timeout</option>
+                  <option value="90" selected>90s timeout</option>
+                  <option value="120">120s timeout</option>
+                </select>
+                <label class="toggle-label" style="font-size:12px;white-space:nowrap"><input type="checkbox" id="resolver-auto-create"> Auto-create channels</label>
+                <button id="resolver-go" class="btn btn-primary">Resolve All</button>
+              </div>
+            </div>
+
+            <div id="resolver-progress" class="resolver-progress hidden">
+              <div class="resolver-progress-text"><span id="resolver-progress-label">Resolving...</span></div>
+              <div class="resolver-progress-bar"><div id="resolver-progress-fill" class="resolver-progress-fill"></div></div>
+            </div>
+
+            <table class="tbl resolver-tbl" id="resolver-queue-table">
+              <thead>
+                <tr>
+                  <th style="width:40px"></th>
+                  <th>Title</th>
+                  <th style="width:35%">URL</th>
+                  <th style="text-align:right;white-space:nowrap">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="resolver-queue-body"></tbody>
+            </table>
+
+            <div id="resolver-player" class="resolver-player hidden">
+              <div class="resolver-player-header">
+                <div>
+                  <strong id="resolver-player-title">--</strong>
+                  <span id="resolver-player-url" class="text-muted" style="font-family:var(--mono);font-size:12px;display:block;margin-top:4px;word-break:break-all"></span>
+                </div>
+                <div class="resolver-player-actions">
+                  <button id="resolver-player-close" class="btn-close">&times;</button>
+                </div>
+              </div>
+              <div class="resolver-player-wrap">
+                <video id="resolver-video" controls autoplay></video>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCRAPERS -->
+      <section id="view-scrapers" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Scraper Plugins</h3>
+            <div class="panel-actions">
+              <span id="scraper-count" class="badge">0 plugins</span>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div id="scraper-grid" class="scraper-grid">
+              <div class="empty-state">No scraper plugins found.<br><small class="text-muted">Drop .py scripts into the scrapers/ directory to get started.</small></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" id="event-queue-panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h3>Event Queue</h3>
+            <div class="panel-actions">
+              <span id="jit-status-badge" class="badge" title="JIT event resolver status">JIT: --</span>
+              <span id="event-queue-count" class="badge">0</span>
+              <button class="btn btn-ghost btn-sm-header" onclick="channelarr.eqReload()">Refresh</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div class="eq-filters">
+              <select id="eq-filter-scraper" class="filter-status" onchange="channelarr.eqReload()">
+                <option value="">All scrapers</option>
+              </select>
+              <div class="eq-status-pills" id="eq-status-pills"></div>
+              <select id="eq-filter-window" class="filter-status" onchange="channelarr.eqReload()">
+                <option value="upcoming">All upcoming</option>
+                <option value="24h">Next 24h</option>
+                <option value="all">All (incl. past)</option>
+              </select>
+              <span style="flex:1"></span>
+              <span id="eq-bulk-bar" class="eq-bulk-bar" style="display:none">
+                <span id="eq-bulk-count" class="text-muted"></span>
+                <button class="btn-sm" onclick="channelarr.eqBulkDismiss()">Dismiss</button>
+                <button class="btn-sm-danger" onclick="channelarr.eqBulkDelete()">Delete</button>
+              </span>
+            </div>
+            <div id="eq-progress" class="resolver-progress" style="display:none">
+              <div class="resolver-progress-text"><span id="eq-progress-label">Resolving…</span></div>
+              <div class="resolver-progress-bar"><div id="eq-progress-fill" class="resolver-progress-fill"></div></div>
+            </div>
+            <div class="eq-table-wrap">
+              <table class="tbl eq-tbl" id="event-queue-table">
+                <colgroup>
+                  <col style="width:36px">
+                  <col style="width:100px">
+                  <col>
+                  <col style="width:220px">
+                  <col style="width:150px">
+                  <col style="width:100px">
+                  <col style="width:58px">
+                  <col style="width:18%">
+                  <col style="width:220px">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th><input type="checkbox" id="eq-select-all" onchange="channelarr.eqSelectAll(this)"></th>
+                    <th>Scraper</th>
+                    <th>Title</th>
+                    <th>Tags</th>
+                    <th>Event Start</th>
+                    <th>Status</th>
+                    <th style="text-align:right">Att.</th>
+                    <th>Last Error</th>
+                    <th style="text-align:right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="event-queue-body">
+                  <tr><td colspan="9" class="empty-state" style="padding:24px">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- LOGS -->
+      <section id="view-logs" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Recent Logs</h3>
+            <div class="panel-actions">
+              <button id="clear-log" class="btn btn-ghost">Clear View</button>
+            </div>
+          </div>
+          <div class="log-container">
+            <pre id="log-output"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- SYSTEM -->
+      <section id="view-system" class="view">
+        <div class="stats-layout">
+          <div class="stats-left">
+            <div class="stat-card stat-card-compact" id="cpu-card">
+              <div class="stat-card-header"><h4>CPU</h4><span class="stat-live" id="cpu-live">--%</span></div>
+              <div class="stat-chart" id="cpu-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="ram-card">
+              <div class="stat-card-header"><h4>Memory</h4><span class="stat-live" id="ram-live">--%</span></div>
+              <div class="stat-chart" id="ram-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="disk-card">
+              <div class="stat-card-header"><h4>Disk</h4><span class="stat-live" id="disk-live">--</span></div>
+              <div class="stat-chart" id="disk-chart"></div>
+            </div>
+            <div class="stat-card stat-card-compact" id="yt-cache-card">
+              <div class="stat-card-header"><h4>YouTube Cache</h4><span class="stat-live" id="yt-cache-live">--</span></div>
+              <div class="stat-chart" id="yt-cache-chart"></div>
+            </div>
+          </div>
+          <div class="stats-right">
+            <div class="stat-card vpn-stat-card" id="vpn-card">
+            <div class="stat-card-header">
+              <h4 id="vpn-card-title">VPN Latency</h4>
+              <span class="stat-live" id="vpn-live">--ms</span>
+            </div>
+            <div class="stat-chart" id="vpn-chart"></div>
+            <div class="vpn-stat-footer">
+              <span id="vpn-exit" class="text-muted">--</span>
+              <button id="vpn-rotate-btn" class="btn btn-sm" title="Cycle VPN tunnel — picks a new server from your SERVER_CITIES list">&#x21BB; Rotate</button>
+            </div>
+            <div class="vpn-history-section" id="vpn-history-section">
+              <div class="vpn-history-controls">
+                <h5>Server History</h5>
+                <label>Sort:
+                  <select id="vpn-history-sort" class="filter-status">
+                    <option value="avg_rtt">Best avg latency</option>
+                    <option value="success_rate">Best success rate</option>
+                    <option value="last_seen">Most recently used</option>
+                    <option value="connected">Most time connected</option>
+                    <option value="total_samples">Most samples</option>
+                    <option value="first_seen">Oldest first</option>
+                  </select>
+                </label>
+                <span id="vpn-history-count" class="text-muted"></span>
+              </div>
+              <div class="vpn-history-table-wrap">
+                <table class="tbl vpn-history-tbl" id="vpn-history-table">
+                  <thead>
+                    <tr>
+                      <th>City</th>
+                      <th>IP</th>
+                      <th>Org</th>
+                      <th class="num">Avg</th>
+                      <th class="num">Min</th>
+                      <th class="num">Max</th>
+                      <th class="num">Success</th>
+                      <th class="num">Samples</th>
+                      <th class="num">Connected</th>
+                      <th>Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vpn-history-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHART MODAL -->
+      <div id="chart-modal-overlay" class="modal-overlay hidden">
+        <div class="modal chart-modal">
+          <div class="modal-header">
+            <h3 id="chart-modal-title">CPU</h3>
+            <button class="btn-close" id="chart-modal-close">&times;</button>
+          </div>
+          <div class="chart-modal-ranges" id="chart-modal-ranges"></div>
+          <div class="chart-modal-chart" id="chart-modal-chart"></div>
+        </div>
+      </div>
+
+      <!-- SETTINGS -->
+      <section id="view-settings" class="view">
+        <div class="settings-panel">
+          <div class="settings-main">
+            <div class="settings-header">
+              <h2 id="settings-section-title">Settings</h2>
+              <div class="settings-actions">
+                <span id="settings-status" class="settings-status"></span>
+                <button id="save-settings" type="button" class="btn btn-primary">Save</button>
+              </div>
+            </div>
+            <!-- General (settings form) -->
+            <div id="settings-sub-general" class="settings-sub">
+              <div id="settings-container" class="settings-content"></div>
+            </div>
+            <!-- Tasks -->
+            <div id="settings-sub-tasks" class="settings-sub" style="display:none">
+              <div id="tasks-container" style="padding:16px 20px"></div>
+            </div>
+            <!-- Integrations -->
+            <div id="settings-sub-integrations" class="settings-sub" style="display:none">
+              <div id="integrations-container" style="padding:16px 20px"></div>
+            </div>
+            <!-- Branding -->
+            <div id="settings-sub-branding" class="settings-sub" style="display:none">
+              <div class="settings-section">
+                <h3>Branding Logos</h3>
+                <p style="color:#888;font-size:13px;margin-bottom:12px;">Upload logos to overlay on channel streams. Assign per-channel in the channel editor.</p>
+                <div id="branding-grid" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;"></div>
+                <label class="btn btn-secondary" style="cursor:pointer;">
+                  Upload Logo
+                  <input type="file" id="branding-upload" accept="image/png,image/jpeg" style="display:none;">
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Channel Editor Modal -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">New Channel</h3>
+        <button id="modal-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-top-row">
+          <div class="setting-field" style="flex:1">
+            <label>Channel Name</label>
+            <input type="text" id="ch-name" placeholder="Movie Night" />
+          </div>
+          <div class="setting-field ch-logo-field">
+            <label>Logo</label>
+            <div class="ch-logo-row">
+              <img id="ch-logo-preview" class="ch-logo-thumb" style="display:none" alt="Logo" />
+              <input type="file" id="ch-logo-input" accept="image/png,image/jpeg" />
+              <button type="button" class="btn btn-sm btn-danger" id="ch-logo-delete" style="display:none" onclick="channelarr.deleteLogo()">Remove</button>
+            </div>
+          </div>
+        </div>
+        <div class="setting-field" style="margin-top:8px">
+          <label>Tags</label>
+          <input type="text" id="ch-tags" placeholder="Events, Sports, 24-7" />
+          <div class="muted" style="margin-top:4px;font-size:11px">Comma-separated. Tags control M3U grouping and can trigger auto-cleanup for event channels.</div>
+        </div>
+
+        <div id="ch-scheduled-only">
+        <div class="modal-three-col">
+          <!-- Left: current items -->
+          <div class="modal-col">
+            <h4>Content <span id="ch-item-count" class="muted">(0)</span></h4>
+            <div id="ch-items" class="ch-items-list"></div>
+          </div>
+          <!-- Center: media picker -->
+          <div class="modal-col">
+            <h4>Add Content</h4>
+            <div class="picker-tabs">
+              <button class="btn btn-ghost picker-tab active" data-ptab="movies">Movies</button>
+              <button class="btn btn-ghost picker-tab" data-ptab="tv">TV</button>
+              <button class="btn btn-ghost picker-tab" data-ptab="youtube">YouTube</button>
+            </div>
+            <input type="text" id="picker-search" class="media-search" placeholder="Search..." />
+            <div id="picker-list" class="picker-list"></div>
+          </div>
+          <!-- Right: bumps + playback -->
+          <div class="modal-col modal-col-config">
+            <h4>Bumps</h4>
+            <div class="bump-cfg">
+              <div class="bump-cfg-toggles-col">
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-enabled" /> Enable bumps
+                </label>
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-start" /> Start bumps
+                </label>
+                <label class="toggle-label">
+                  <input type="checkbox" id="ch-bump-next" /> "Up Next" overlay
+                </label>
+              </div>
+              <div class="setting-field">
+                <label>Folders</label>
+                <div id="ch-bump-folders" class="bump-folders-checklist"></div>
+              </div>
+              <div class="setting-field">
+                <label>Frequency</label>
+                <select id="ch-bump-freq">
+                  <option value="between">Between each</option>
+                  <option value="2">Every 2</option>
+                  <option value="3">Every 3</option>
+                </select>
+              </div>
+              <div class="setting-field">
+                <label>Count</label>
+                <input type="number" id="ch-bump-count" value="1" min="1" max="5" />
+              </div>
+            </div>
+            <h4 style="margin-top:12px">Playback</h4>
+            <div class="setting-field">
+              <label>Shuffle Mode</label>
+              <select id="ch-shuffle-mode">
+                <option value="none">None (play in order)</option>
+                <option value="random">Random</option>
+                <option value="round_robin">Round Robin (alternate shows)</option>
+                <option value="weighted">Weighted Random</option>
+              </select>
+            </div>
+            <div id="ch-weights-section" class="ch-weights-section" style="display:none">
+              <label class="ch-weights-label">Weight per show (must total 100%)</label>
+              <div id="ch-weights-list" class="ch-weights-list"></div>
+              <div id="ch-weights-total" class="ch-weights-total"></div>
+            </div>
+            <label class="toggle-label" style="margin-top:8px"><input type="checkbox" id="ch-loop" checked /> Loop</label>
+            <div class="setting-field" style="margin-top:10px">
+              <label>Branding Logo</label>
+              <select id="ch-branding">
+                <option value="">None</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Overlay a branding logo in the bottom-right corner.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <h4>Schedule Preview</h4>
+          <div id="ch-schedule" class="schedule-preview"></div>
+        </div>
+        </div>
+        <div id="ch-resolved-only" style="display:none">
+          <div class="modal-section">
+            <h4>Resolved Stream</h4>
+            <div class="setting-field">
+              <label>Source URL</label>
+              <input type="text" id="ch-resolved-url" readonly />
+            </div>
+            <div style="display:flex;gap:12px;margin-top:10px">
+              <div class="setting-field" style="flex:1">
+                <label>Event Start</label>
+                <input type="datetime-local" id="ch-event-start" />
+              </div>
+              <div class="setting-field" style="flex:1">
+                <label>Event End</label>
+                <input type="datetime-local" id="ch-event-end" />
+              </div>
+            </div>
+            <div class="muted" style="margin-top:4px;font-size:11px">Optional. Sets real EPG blocks for the event window. Channels with auto-cleanup tags are deleted after the event ends.</div>
+
+            <div class="setting-field" style="margin-top:10px">
+              <label>Stream Mode</label>
+              <select id="ch-resolved-encoder-mode">
+                <option value="proxy">Proxy (no re-encode, lossless)</option>
+                <option value="single">Transcode — Single encoder (seamless)</option>
+                <option value="multi">Transcode — Multi encoder (robust)</option>
+                <option value="tab_proxy">Tab Proxy (persistent browser tab — for session-locked CDNs)</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks. Tab Proxy keeps a browser tab open to play streams whose CDN tokens can't be replayed (e.g. NTV).</div>
+            </div>
+
+            <div id="ch-transcode-options" style="display:none">
+            <div class="setting-field" style="margin-top:10px">
+              <label>Stream Profile</label>
+              <select id="ch-resolved-profile">
+                <option value="auto">Auto-detect</option>
+                <option value="adultswim">Adult Swim / Turner CDN (SCTE-35)</option>
+                <option value="anvato_lura">Anvato / Lura Live (local TV affiliates, e.g. WSPA)</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">How channelarr detects ad breaks in the upstream playlist.</div>
+            </div>
+
+            <div class="setting-field" style="margin-top:10px">
+              <label>Branding Logo</label>
+              <select id="ch-resolved-branding">
+                <option value="">None</option>
+              </select>
+              <div class="muted" style="margin-top:4px;font-size:11px">Overlay a branding logo in the bottom-right corner of the stream. Upload logos in Settings.</div>
+            </div>
+
+            <div id="ch-resolved-bump-section" style="display:none;margin-top:12px">
+              <h4 style="margin-bottom:6px">Bump Folders</h4>
+              <div class="setting-field">
+                <div id="ch-resolved-bump-folders" class="bump-folders-checklist"></div>
+              </div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Bumps are picked at random from the selected folders and packed to fit each ad break exactly. The last bump is truncated as needed.</div>
+              <label class="toggle-label" style="margin-top:10px">
+                <input type="checkbox" id="ch-resolved-shownext" />
+                Show "RESUMING IN" countdown + UP NEXT overlay during bumps
+              </label>
+              <div class="muted" style="margin-top:4px;font-size:11px">Same overlay style as scheduled channels. The countdown ticks down across all bumps in a break, hitting 0:00 right when the upstream show resumes. Channel logo (if uploaded) appears as the UP NEXT poster.</div>
+            </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="modal-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="modal-save" class="btn btn-primary">Save Channel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Player Modal -->
+  <div id="player-overlay" class="modal-overlay hidden">
+    <div class="modal player-modal">
+      <div class="modal-header">
+        <h3 id="player-title">Watch</h3>
+        <button id="player-close" class="btn-close">&times;</button>
+      </div>
+      <div class="player-wrap">
+        <video id="player-video" controls autoplay></video>
+      </div>
+    </div>
+  </div>
+
+  <!-- Channel Type Picker Modal -->
+  <div id="type-picker-overlay" class="modal-overlay hidden">
+    <div class="modal type-picker-modal">
+      <div class="modal-header">
+        <h3>Create New Channel</h3>
+        <button id="type-picker-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted" style="margin-bottom:16px">Choose what kind of channel to create.</p>
+        <div class="type-picker-options">
+          <button class="type-picker-card" id="type-pick-scheduled">
+            <div class="type-picker-icon">&#128250;</div>
+            <h4>Scheduled</h4>
+            <p>Local media + YouTube items playing on a schedule, with bumps, shuffle, and looping.</p>
+          </button>
+          <button class="type-picker-card" id="type-pick-resolved">
+            <div class="type-picker-icon">&#128225;</div>
+            <h4>Resolved Stream</h4>
+            <p>Live stream sourced from a captured manifest in the library. Pure live, no schedule.</p>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Resolved Channel Modal -->
+  <div id="create-resolved-overlay" class="modal-overlay hidden">
+    <div class="modal create-resolved-modal">
+      <div class="modal-header">
+        <h3>Create Resolved Channel</h3>
+        <button id="create-resolved-close" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="cr-picker-section">
+          <h4 style="margin-bottom:8px">Pick a Manifest from the Library</h4>
+          <div id="cr-manifest-list" class="cr-manifest-list">
+            <div class="empty-state">Loading library...</div>
+          </div>
+        </div>
+        <div id="cr-form-section" style="display:none">
+          <div class="setting-field">
+            <label>Source Manifest</label>
+            <div id="cr-selected-manifest" class="cr-selected-manifest"></div>
+          </div>
+          <div class="setting-field">
+            <label>Channel Name</label>
+            <input type="text" id="cr-channel-name" placeholder="My Channel" />
+          </div>
+          <div class="muted" style="margin-top:8px">After creating the channel you can upload a logo from the channel editor. Resolved channels have no schedule — they proxy the upstream HLS directly.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="create-resolved-back" class="btn btn-ghost" style="display:none">&larr; Back to picker</button>
+        <button id="create-resolved-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="create-resolved-submit" class="btn btn-primary" disabled>Create Channel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.API_BASE = "{{ api_base | default('/api') }}";
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="/static/ui.js?v=62"></script>
+</body>
+</html>

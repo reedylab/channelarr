@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 80" width="480" height="80">
+  <defs>
+    <linearGradient id="towerGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#7C3AED"/>
+      <stop offset="100%" style="stop-color:#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon -->
+  <rect x="0" y="0" width="80" height="80" rx="16" fill="#E2E8F0"/>
+
+  <!-- Tower: vertical spine -->
+  <line x1="40" y1="28" x2="40" y2="66" stroke="url(#towerGrad)" stroke-width="3" stroke-linecap="round"/>
+  <!-- Tower: left diagonal leg -->
+  <line x1="40" y1="50" x2="18" y2="66" stroke="#7C3AED" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Tower: right diagonal leg -->
+  <line x1="40" y1="50" x2="62" y2="66" stroke="#7C3AED" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Signal wave 1 -->
+  <path d="M 29 25 C 27 19, 53 19, 51 25" fill="none" stroke="#7C3AED" stroke-width="2.5" stroke-linecap="round" opacity="1"/>
+  <!-- Signal wave 2 -->
+  <path d="M 21 17 C 17 7, 63 7, 59 17" fill="none" stroke="#7C3AED" stroke-width="2" stroke-linecap="round" opacity="0.55"/>
+  <!-- Signal wave 3 -->
+  <path d="M 13 9 C 7 -4, 73 -4, 67 9" fill="none" stroke="#7C3AED" stroke-width="1.5" stroke-linecap="round" opacity="0.25"/>
+
+  <!-- Tip dot -->
+  <circle cx="40" cy="28" r="3.5" fill="#7C3AED"/>
+
+  <!-- Wordmark -->
+  <text x="96" y="52" font-family="'Arial Black', 'Helvetica Neue', sans-serif" font-size="42" font-weight="900" fill="#0F172A" letter-spacing="-1.5">CHANNEL<tspan fill="#7C3AED">ARR</tspan></text>
+</svg>

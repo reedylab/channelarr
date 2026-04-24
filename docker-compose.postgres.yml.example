@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: channelarr-db
+    environment:
+      POSTGRES_DB: ${PG_DB:-channelarr}
+      POSTGRES_USER: ${PG_USER:-channelarr}
+      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+
+  gluetun:
+    # v3.41.1+ required — older versions ship a stale Mullvad server list
+    # (June 2023) and WG handshakes will silently fail against retired servers.
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: channelarr-vpn
+    cap_add:
+      - NET_ADMIN
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER:-mullvad}
+      - VPN_TYPE=${VPN_TYPE:-wireguard}
+      - WIREGUARD_PRIVATE_KEY=${WG_PRIVATE_KEY:?Set WG_PRIVATE_KEY in .env}
+      - WIREGUARD_ADDRESSES=${WG_ADDRESSES:?Set WG_ADDRESSES in .env}
+      # Pin to cities close to your location for lower latency. Gluetun picks
+      # a random server from this list on each start.
+      - SERVER_CITIES=${VPN_CITIES:-Atlanta GA,Raleigh NC,Ashburn VA}
+      # 127.0.0.1/32 is REQUIRED for chromedriver → Chrome loopback traffic
+      - FIREWALL_OUTBOUND_SUBNETS=127.0.0.1/32,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      - DNS_KEEP_NAMESERVER=on
+      # Pull fresh Mullvad server list every 24h — Mullvad retires WG servers
+      # constantly, stale lists cause silent handshake failures
+      - UPDATER_PERIOD=24h
+      - CONTROL_SERVER=true
+      - CONTROL_SERVER_USERNAME=${VPN_CONTROL_USER:-admin}
+      - CONTROL_SERVER_PASSWORD=${VPN_CONTROL_PASS:?Set VPN_CONTROL_PASS in .env}
+    ports:
+      - "4445:4445"
+    networks:
+      - internal
+    volumes:
+      - ./gluetun:/gluetun
+    restart: unless-stopped
+
+  selenium-uc:
+    build: ./selenium-uc
+    container_name: channelarr-selenium-uc
+    network_mode: service:gluetun
+    shm_size: 2g
+    # tini as PID 1 reaps zombie Chrome children so they don't pile up.
+    init: true
+    depends_on:
+      - gluetun
+    volumes:
+      - selenium_profile:/data
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr-selenium-uc"
+
+  channelarr:
+    build: .
+    container_name: channelarr
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BASE_URL=${BASE_URL:-http://your-server-ip:5045}
+      - PG_HOST=channelarr-db
+      - PG_PORT=5432
+      - PG_USER=${PG_USER:-channelarr}
+      - PG_PASS=${PG_PASS}
+      - PG_DB=${PG_DB:-channelarr}
+      # selenium-uc shares gluetun's netns; reach it via gluetun's hostname
+      - SELENIUM_URL=http://channelarr-vpn:4445
+    ports:
+      - "5045:5045"
+    volumes:
+      - /path/to/media:/media:ro
+      - /path/to/bumps:/bumps
+      - /path/to/m3u:/m3u
+      - channelarr-data:/app/data
+      - channelarr-logs:/app/logs
+      - /path/to/youtube-cache:/yt_cache
+    depends_on:
+      - postgres
+      - selenium-uc
+    networks:
+      - internal
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr"
+
+networks:
+  internal:
+
+volumes:
+  channelarr-data:
+  channelarr-logs:
+  pgdata:
+  selenium_profile:
+    external: true
+    name: channelarr_selenium_profile
