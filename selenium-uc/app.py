@@ -787,6 +787,11 @@ def _scan_all_frames_for_skip(browser):
         "live stream starting soon", "stream starting soon",
         "event has not started", "stream will begin shortly",
         "broadcast will begin",
+        # Some sites render "DELAYED START" as a status badge when the
+        # broadcast hasn't gone live yet — the player never initializes, so
+        # no manifest is ever requested and we'd otherwise wait the full
+        # timeout for nothing.
+        "delayed start",
         # The bare word 'upcoming' false-triggers on sites with secondary
         # 'Upcoming Listings' sections while a live stream is playing.
         # Match contextual pregame wording instead.
