@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 2  # seconds between playlist polls
 MAX_SEGMENTS_ON_DISK = 10  # rolling window of segment files to keep
 
+# Trigger a manifest refresh after N consecutive segment-decrypt failures.
+# Mid-stream decrypt failures mean the upstream session went stale (typically
+# a VPN exit-IP rotation invalidated the IP-bound AES key endpoint) — the
+# playlist URL still serves valid HLS, but every key fetched returns garbage.
+# Without this, the proxy would log "Padding is incorrect" indefinitely until
+# expires_at rolled around (up to 30 min). 3 failures × 2-3s per segment
+# means ~6-10s of broken playback before we self-heal.
+DECRYPT_FAILURES_BEFORE_REFRESH = 3
+# Don't kick another refresh more often than this — gives the new manifest
+# time to land + the player time to re-fetch the playlist.
+DECRYPT_REFRESH_DEBOUNCE_SECONDS = 60
+
+
+class _DecryptError(Exception):
+    """Raised by _download_segment when AES decryption fails (wrong key /
+    stale session). Distinguished from generic download errors so the
+    poller loop can react with a manifest refresh instead of just retrying."""
+
 
 def _parse_key_directive(line: str) -> Optional[dict]:
     """Parse an #EXT-X-KEY: directive into {method, uri, iv}.
@@ -77,6 +95,11 @@ class ProxyStream:
         self._stop_event = threading.Event()
         self._started_at: Optional[float] = None
         self._last_access = time.time()
+
+        # Stale-session detection: count consecutive segment decrypt failures,
+        # debounce refresh attempts so we don't hammer the resolver.
+        self._consecutive_decrypt_failures = 0
+        self._last_decrypt_refresh_at = 0.0
 
         # AES key cache, keyed by absolute key URL — populated lazily as
         # encrypted playlists are seen. Key URLs rotate as the upstream
@@ -368,9 +391,38 @@ class ProxyStream:
                     segment_files.append((local_seq, local_filename, seg["duration"], seg.get("discontinuity", False)))
                     local_seq += 1
                     new_count += 1
+                    self._consecutive_decrypt_failures = 0
+                except _DecryptError as e:
+                    self._consecutive_decrypt_failures += 1
+                    logging.warning("[PROXY] %s decrypt failed for %s: %s (#%d consecutive)",
+                                    self.channel_id, uri[:80], e,
+                                    self._consecutive_decrypt_failures)
                 except Exception as e:
                     logging.warning("[PROXY] %s download failed for %s: %s",
                                     self.channel_id, uri[:80], e)
+
+            # If decrypt has been failing for several segments in a row, the
+            # upstream session is stale — kick the resolver to re-establish
+            # it. Debounced so we don't queue refreshes faster than they can
+            # take effect.
+            if self._consecutive_decrypt_failures >= DECRYPT_FAILURES_BEFORE_REFRESH:
+                now_mono = time.monotonic()
+                since_last = now_mono - self._last_decrypt_refresh_at
+                if since_last >= DECRYPT_REFRESH_DEBOUNCE_SECONDS:
+                    logging.warning("[PROXY] %s triggering manifest refresh after %d "
+                                    "consecutive decrypt failures (stale session?)",
+                                    self.channel_id, self._consecutive_decrypt_failures)
+                    self._last_decrypt_refresh_at = now_mono
+                    fresh = self._refresh_manifest_url()
+                    if fresh:
+                        self.manifest_url = fresh
+                        variant_url = self._resolve_variant_url(fresh)
+                        # Old keys were tied to the dead session — drop them
+                        # so the new playlist's key URLs get fetched fresh.
+                        self._key_cache.clear()
+                        self._consecutive_decrypt_failures = 0
+                        logging.info("[PROXY] %s manifest refreshed, switched to new variant",
+                                     self.channel_id)
 
             # Trim old segments and write playlist
             if segment_files:
@@ -426,7 +478,15 @@ class ProxyStream:
             from Crypto.Cipher import AES
             from Crypto.Util.Padding import unpad
             cipher = AES.new(key, AES.MODE_CBC, iv)
-            plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
+            try:
+                plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
+            except (ValueError, Exception) as e:
+                # Padding / unpad errors here mean the ciphertext didn't
+                # match this key — almost always a stale session (VPN
+                # rotation invalidated the IP-bound key endpoint while
+                # we were mid-stream). Surface as a typed error so the
+                # poller loop can trigger a manifest refresh.
+                raise _DecryptError(str(e)) from e
             with open(local_path, "wb") as f:
                 f.write(plaintext)
             return
