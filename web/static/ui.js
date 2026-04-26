@@ -1185,6 +1185,11 @@ function parseTags() {
 }
 
 async function saveChannel() {
+  const saveBtn = $("#modal-save");
+  // Guard against double-click: schedule generation for big YouTube
+  // playlists takes seconds, and an enabled button + visible modal during
+  // that window invites repeat clicks that each create a duplicate channel.
+  if (saveBtn && saveBtn.disabled) return;
   const name = $("#ch-name").value.trim();
   if (!name) { toast("error", "Channel name required"); return; }
 
@@ -1241,26 +1246,48 @@ async function saveChannel() {
     };
   }
 
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.dataset.origLabel = saveBtn.textContent;
+    saveBtn.textContent = "Saving…";
+  }
   try {
+    let r;
     if (editingChannel) {
-      await fetch(`${API}/channels/${editingChannel.id}`, {
+      r = await fetch(`${API}/channels/${editingChannel.id}`, {
         method: "PUT",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(data),
       });
-      toast("success", "Channel updated — schedule regenerated");
     } else {
-      await fetch(`${API}/channels`, {
+      r = await fetch(`${API}/channels`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(data),
       });
-      toast("success", "Channel created — schedule generated");
     }
+    if (!r.ok) {
+      let detail = `${r.status}`;
+      try { detail = (await r.json()).detail || detail; } catch(_) {}
+      toast("error", `Failed to save channel: ${detail}`);
+      return;
+    }
+    toast("success", editingChannel ? "Channel updated — schedule regenerated"
+                                    : "Channel created — schedule generated");
     closeEditor();
     loadChannels();
     updateStatus();
-  } catch(e) { toast("error", "Failed to save channel"); }
+  } catch(e) {
+    toast("error", `Failed to save channel: ${e}`);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      if (saveBtn.dataset.origLabel) {
+        saveBtn.textContent = saveBtn.dataset.origLabel;
+        delete saveBtn.dataset.origLabel;
+      }
+    }
+  }
 }
 
 // ─── Guide View ───
