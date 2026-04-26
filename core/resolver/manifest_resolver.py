@@ -7,6 +7,7 @@ in channelarr's resolver Postgres tables (parallel to existing JSON storage).
 
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
@@ -351,6 +352,10 @@ class ManifestResolverService:
                             logger.info("[RESOLVER] Auto-created channel %s for manifest %s",
                                         ch["name"], manifest_id)
                             # Generate channel logo from scraper-provided URLs
+                            # (matchup card stitched from team logos), or fall
+                            # back to a SearxNG image search keyed on the
+                            # channel name when no scraper-supplied URLs exist
+                            # — common for non-event 24/7 channels.
                             if logo_urls:
                                 try:
                                     from core.logo_gen import generate_channel_logo
@@ -358,6 +363,25 @@ class ManifestResolverService:
                                 except Exception as e:
                                     logger.warning("[RESOLVER] Logo gen failed for %s: %s",
                                                    ch["id"], e)
+                            else:
+                                _logo_path = os.path.join(shared_state.LOGO_DIR,
+                                                          f"{ch['id']}.png")
+                                if not os.path.isfile(_logo_path):
+                                    try:
+                                        from core import logo_search as _ls
+                                        os.makedirs(shared_state.LOGO_DIR, exist_ok=True)
+                                        ok, msg = _ls.auto_pick(
+                                            ch["id"], ch["name"], _logo_path,
+                                        )
+                                        if ok:
+                                            logger.info("[RESOLVER] Auto-logo for %s: %s",
+                                                        ch["name"], msg)
+                                        else:
+                                            logger.info("[RESOLVER] Auto-logo skipped for %s: %s",
+                                                        ch["name"], msg)
+                                    except Exception as e:
+                                        logger.warning("[RESOLVER] Auto-logo failed for %s: %s",
+                                                       ch["id"], e)
                             shared_state.regenerate_m3u()
                 except Exception as e:
                     logger.warning("[RESOLVER] Auto-create channel failed for %s: %s", manifest_id, e)

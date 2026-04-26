@@ -260,7 +260,8 @@ function renderChannels() {
             <div class="channel-card-actions">
               <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
               <button class="btn btn-sm" onclick="channelarr.editChannel('${ch.id}')">Edit</button>
-              <button class="btn btn-sm" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
+              <button class="btn btn-sm" onclick="channelarr.generateLogo('${ch.id}')">Logo</button>
+              <button class="btn btn-sm btn-danger" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
             </div>
           </div>
         </div>`;
@@ -688,6 +689,55 @@ channelarr.runLogoSearch = async function() {
     });
   } catch(ex) {
     status.textContent = `Search failed: ${ex}`;
+  }
+};
+
+// Refresh just the visible logo for a single channel without reloading
+// the whole channel list — append a cache-buster so the browser pulls
+// the new bytes.
+channelarr.refreshLogoFor = function(channelId) {
+  document.querySelectorAll(`.channel-card[data-id="${channelId}"] .channel-card-logo`).forEach(img => {
+    img.src = `${API}/logo/${channelId}?t=${Date.now()}`;
+  });
+};
+
+channelarr.generateLogo = async function(channelId) {
+  try {
+    const r = await fetch(`${API}/channels/${channelId}/logo-auto`, { method: "POST" });
+    const d = await r.json();
+    if (!r.ok) {
+      toast("error", `Generate failed: ${d.detail || r.status}`);
+      return;
+    }
+    if (d.applied) {
+      channelarr.refreshLogoFor(channelId);
+      toast("success", `Logo generated (${d.message || "ok"})`);
+    } else {
+      // Soft skip — top hit was below the auto-pick threshold. Open the
+      // manual picker so the user can choose from candidates.
+      toast("info", `${d.message}. Opening picker…`);
+      channelarr.editChannel(channelId);
+      setTimeout(() => channelarr.openLogoSearch(), 350);
+    }
+  } catch(ex) {
+    toast("error", `Generate failed: ${ex}`);
+  }
+};
+
+channelarr.backfillLogos = async function() {
+  if (!confirm("Search SearxNG and apply a logo to every channel currently missing one. Continue?")) return;
+  toast("info", "Backfill running — this may take a minute…");
+  try {
+    const r = await fetch(`${API}/logo-search/backfill`, { method: "POST" });
+    const d = await r.json();
+    if (!r.ok) {
+      toast("error", `Backfill failed: ${d.detail || r.status}`);
+      return;
+    }
+    toast("success", `Filled ${d.filled}, skipped ${d.skipped_existing} (already had logos), failed ${d.failed}`);
+    if (typeof loadChannels === "function") loadChannels();
+  } catch(ex) {
+    toast("error", `Backfill failed: ${ex}`);
   }
 };
 

@@ -169,6 +169,35 @@ def search(query: str, max_results: int = 8) -> list[dict]:
     return out
 
 
+# Minimum score required for auto-pick to avoid obviously-bad matches.
+# 60 covers PNG/SVG with "logo" in URL or a known-good domain — anything
+# below that is usually a generic stock photo or unrelated thumbnail.
+AUTO_PICK_MIN_SCORE = 60
+
+
+def auto_pick(channel_id: str, query: str, dest_path: str,
+              min_score: float = AUTO_PICK_MIN_SCORE) -> tuple[bool, str]:
+    """Search and apply the top-ranked candidate in one call.
+
+    Used by the auto-create path and the per-channel 'Generate Logo' button.
+    Returns (ok, message). ok=False with reason='no candidates' or
+    'below threshold' is a soft skip — the channel just stays without a
+    logo rather than getting a wrong one.
+    """
+    candidates = search(query, max_results=5)
+    if not candidates:
+        return False, "no candidates"
+    top = candidates[0]
+    if top["score"] < min_score:
+        return False, f"top score {top['score']} below {min_score} threshold"
+    ok, msg = download_to_logo(top["url"], dest_path)
+    if not ok:
+        return False, f"download failed: {msg}"
+    logger.info("[LOGO] auto-picked for %s: score=%.1f domain=%s",
+                channel_id, top["score"], top["domain"])
+    return True, f"picked {top['domain']} (score {top['score']})"
+
+
 def download_to_logo(url: str, dest_path: str) -> tuple[bool, str]:
     """Fetch a candidate URL and save as PNG at dest_path. PNG is preserved
     byte-for-byte; JPEG/WebP/SVG are converted via Pillow / cairosvg so the
