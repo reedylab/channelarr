@@ -1176,6 +1176,7 @@ def _do_capture(browser, url, timeout, switch_iframe, debug=False):
             "headers": result.get("resp_headers", {}),
             "heartbeat": result.get("heartbeat"),
             "user_agent": result.get("_user_agent") or result.get("req_headers", {}).get("User-Agent") or "Mozilla/5.0",
+            "referer": result.get("req_headers", {}).get("Referer"),
             "cookies": [],
             "_browser_needs_reset": True,
         }
@@ -1222,6 +1223,7 @@ def _do_capture(browser, url, timeout, switch_iframe, debug=False):
         "headers": result.get("resp_headers", {}),
         "heartbeat": result.get("heartbeat"),
         "user_agent": ua,
+        "referer": result.get("req_headers", {}).get("Referer"),
         "cookies": cookies,
     }
 

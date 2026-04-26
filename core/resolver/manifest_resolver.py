@@ -300,6 +300,7 @@ class ManifestResolverService:
                 existing_manifest_id=existing_manifest_id,
                 user_tags=tags,
                 cookies=capture.get("cookies"),
+                referer_url=capture.get("referer"),
             )
 
             _status["last_manifest_id"] = manifest_id
@@ -515,15 +516,26 @@ def _store_manifest(
     existing_manifest_id: str | None = None,
     user_tags: list | None = None,
     cookies: list | None = None,
+    referer_url: str | None = None,
 ) -> str:
     """Insert or update a manifest in Manifold's DB. Returns manifest ID.
 
     If existing_manifest_id is given, the specified row is updated in place
     regardless of hash changes (used for token refresh).
     """
-    # Use the page URL domain (the site that embedded the stream), not the
-    # manifest/CDN domain. CDNs check the Referer against the embedding site.
-    source_domain = urlparse(page_url).netloc or urlparse(manifest_url).netloc
+    # Source domain drives the Referer/Origin used on segment, key, and
+    # nested-playlist fetches. The Referer Chrome actually sent for the
+    # captured manifest is the most accurate signal — some sources serve
+    # different bytes (e.g. fake AES keys) when the Referer doesn't match
+    # the player iframe's origin. Fall back to the page URL host (the
+    # embedding site) for sources whose capture path doesn't surface a
+    # Referer, then to the manifest/CDN host as a last resort.
+    referer_host = urlparse(referer_url).netloc if referer_url else ""
+    source_domain = (
+        referer_host
+        or urlparse(page_url).netloc
+        or urlparse(manifest_url).netloc
+    )
     # Filter cookies to CDN/source domains only
     cdn_domain = urlparse(manifest_url).netloc
     filtered_cookies = []
