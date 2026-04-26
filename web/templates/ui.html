@@ -464,7 +464,17 @@
             <div class="ch-logo-row">
               <img id="ch-logo-preview" class="ch-logo-thumb" style="display:none" alt="Logo" />
               <input type="file" id="ch-logo-input" accept="image/png,image/jpeg" />
+              <button type="button" class="btn btn-sm" id="ch-logo-find" onclick="channelarr.openLogoSearch()">Find</button>
               <button type="button" class="btn btn-sm btn-danger" id="ch-logo-delete" style="display:none" onclick="channelarr.deleteLogo()">Remove</button>
+            </div>
+            <div id="ch-logo-search-panel" class="ch-logo-search" style="display:none">
+              <div class="ch-logo-search-controls">
+                <input type="text" id="ch-logo-search-q" placeholder="Search query (defaults to channel name)" />
+                <button type="button" class="btn btn-sm" onclick="channelarr.runLogoSearch()">Search</button>
+                <button type="button" class="btn btn-sm" onclick="channelarr.closeLogoSearch()">Close</button>
+              </div>
+              <div id="ch-logo-search-status" class="muted" style="font-size:11px;margin:6px 0"></div>
+              <div id="ch-logo-search-results" class="ch-logo-search-grid"></div>
             </div>
           </div>
         </div>

@@ -198,6 +198,15 @@ button,input,select,textarea{font-family:inherit}
 .ch-logo-row{display:flex;align-items:center;gap:12px}
 .ch-logo-thumb{width:52px;height:52px;border-radius:6px;object-fit:cover;border:1px solid var(--border)}
 .ch-logo-row input[type="file"]{font-size:13px;color:var(--text-muted)}
+.ch-logo-search{margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-hover)}
+.ch-logo-search-controls{display:flex;gap:8px;align-items:center}
+.ch-logo-search-controls input[type="text"]{flex:1;padding:4px 8px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text)}
+.ch-logo-search-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;max-height:340px;overflow-y:auto}
+.ch-logo-candidate{position:relative;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--bg);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px;transition:border-color .15s,transform .15s}
+.ch-logo-candidate:hover{border-color:var(--accent);transform:translateY(-1px)}
+.ch-logo-candidate.applying{opacity:0.5;pointer-events:none}
+.ch-logo-candidate img{width:96px;height:72px;object-fit:contain;background:#fff;border-radius:4px}
+.ch-logo-candidate-meta{font-size:10px;color:var(--text-muted);text-align:center;line-height:1.2;word-break:break-all}
 
 /* Media picker */
 .picker-tabs{display:flex;gap:6px;margin-bottom:10px}

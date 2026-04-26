@@ -632,6 +632,92 @@ channelarr.deleteLogo = async function() {
   } catch(ex) { toast("error", "Failed to remove logo"); }
 };
 
+// ── Logo search (SearxNG-backed) ────────────────────────────────────
+channelarr.openLogoSearch = function() {
+  if (!editingChannel) {
+    toast("error", "Save the channel first before searching for a logo");
+    return;
+  }
+  const panel = $("#ch-logo-search-panel");
+  if (panel.style.display === "none") {
+    panel.style.display = "block";
+    $("#ch-logo-search-q").value = "";
+    $("#ch-logo-search-results").innerHTML = "";
+    $("#ch-logo-search-status").textContent = "";
+    channelarr.runLogoSearch();
+  } else {
+    channelarr.closeLogoSearch();
+  }
+};
+
+channelarr.closeLogoSearch = function() {
+  $("#ch-logo-search-panel").style.display = "none";
+};
+
+channelarr.runLogoSearch = async function() {
+  if (!editingChannel) return;
+  const grid = $("#ch-logo-search-results");
+  const status = $("#ch-logo-search-status");
+  const q = $("#ch-logo-search-q").value.trim();
+  grid.innerHTML = "";
+  status.textContent = "Searching…";
+  try {
+    const url = q
+      ? `${API}/channels/${editingChannel.id}/logo-search?q=${encodeURIComponent(q)}`
+      : `${API}/channels/${editingChannel.id}/logo-search`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!r.ok) {
+      status.textContent = `Search failed: ${d.detail || r.status}`;
+      return;
+    }
+    const cands = d.candidates || [];
+    if (!cands.length) {
+      status.textContent = `No results for ${esc(d.query || "")}.`;
+      return;
+    }
+    status.textContent = `${cands.length} candidates for ${esc(d.query)}. Click to apply.`;
+    grid.innerHTML = cands.map((c, i) => `
+      <div class="ch-logo-candidate" data-idx="${i}" title="${esc(c.title || "")} — ${esc(c.domain || "")} (score ${c.score})">
+        <img src="${esc(c.thumbnail || c.url)}" alt="" loading="lazy" onerror="this.style.opacity=0.2"/>
+        <div class="ch-logo-candidate-meta">${esc(c.domain || "")}</div>
+      </div>
+    `).join("");
+    grid.querySelectorAll(".ch-logo-candidate").forEach(el => {
+      el.addEventListener("click", () => channelarr.pickLogo(cands[Number(el.dataset.idx)].url, el));
+    });
+  } catch(ex) {
+    status.textContent = `Search failed: ${ex}`;
+  }
+};
+
+channelarr.pickLogo = async function(url, el) {
+  if (!editingChannel) return;
+  if (el) el.classList.add("applying");
+  try {
+    const r = await fetch(`${API}/channels/${editingChannel.id}/logo-pick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      toast("error", `Failed to apply logo: ${d.detail || r.status}`);
+      if (el) el.classList.remove("applying");
+      return;
+    }
+    const preview = $("#ch-logo-preview");
+    preview.src = `${API}/logo/${editingChannel.id}?t=${Date.now()}`;
+    preview.style.display = "block";
+    $("#ch-logo-delete").style.display = "inline-block";
+    toast("success", `Logo applied (${d.message || "ok"})`);
+    channelarr.closeLogoSearch();
+  } catch(ex) {
+    toast("error", `Failed to apply logo: ${ex}`);
+    if (el) el.classList.remove("applying");
+  }
+};
+
 async function loadResolvedBumpFolders(selectedFolders) {
   try {
     const r = await fetch(`${API}/bumps`);

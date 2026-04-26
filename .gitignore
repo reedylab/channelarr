@@ -13,6 +13,11 @@ data/
 .DS_Store
 scrapers/
 
+# SearxNG runtime config — secret_key is per-install. Tracked example
+# alongside lets a user copy + generate their own without leaking ours.
+searxng/*
+!searxng/*.example
+
 # Local planning / design docs — not for public repo
 planning/
 *-PLAN.md

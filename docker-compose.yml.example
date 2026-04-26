@@ -68,6 +68,23 @@ services:
         syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
         tag: "channelarr-selenium-uc"
 
+  searxng:
+    image: searxng/searxng:latest
+    container_name: channelarr-searxng
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr-searxng"
+
 volumes:
   channelarr-data:
   channelarr-logs:
