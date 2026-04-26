@@ -123,9 +123,6 @@ async def lifespan(app: FastAPI):
                 logging.info("[DB] Added column channels.event_end")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
-        # Start demand-driven refresh worker (only if DB is reachable)
-        from core.resolver.manifest_resolver import start_refresh_worker
-        start_refresh_worker()
         # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the
         # JSON safety net, clean orphaned resolved channels.
         from core.channels import (
@@ -202,6 +199,13 @@ async def lifespan(app: FastAPI):
     logging.info("[QUEUE] Scheduled JIT event resolver (120s interval)")
     add_job("event_expire", expire_stale_events, seconds=300)
     logging.info("[QUEUE] Scheduled event queue expire job (300s interval)")
+
+    # Manifest refresh tick — keeps resolved channels (esp. 24/7) tunable.
+    # Shares pipeline_lock with event_resolver so only one is using the
+    # single-threaded sidecar at a time.
+    from core.resolver.manifest_resolver import refresh_due_manifests
+    add_job("manifest_refresh", refresh_due_manifests, seconds=60, max_instances=1)
+    logging.info("[RESOLVER] Scheduled manifest refresh tick (60s interval)")
 
     # YouTube pre-cache worker (stays as thread — cookie warmup + failure tracking)
     from core.youtube import start_yt_cache_worker

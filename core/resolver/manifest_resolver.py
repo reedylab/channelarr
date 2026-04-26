@@ -39,6 +39,19 @@ _inflight: dict[str, threading.Event] = {}  # page_url -> Event (set when done)
 _inflight_results: dict[str, dict] = {}     # page_url -> result dict
 _inflight_lock = threading.Lock()
 
+# ── Pipeline lock ──────────────────────────────────────────────────────
+# Acquired non-blocking by scheduled ticks (manifest_refresh, event_resolver)
+# so only one of them is pumping work into the single-threaded sidecar at
+# a time. User-driven resolves bypass this lock — they still serialize at
+# the sidecar but shouldn't be blocked by an in-progress sweep.
+pipeline_lock = threading.Lock()
+
+# Cap on heavy sidecar refreshes per refresh tick. Light refreshes are cheap
+# (HTTP only) and uncapped, but heavy refreshes launch Chrome and chew RAM.
+# After a VPN rotation every session goes stale at once — without this cap a
+# single tick would queue 10+ Chrome captures back-to-back and OOM the box.
+HEAVY_REFRESH_BUDGET_PER_TICK = 3
+
 
 def _default_resolved_name(title: str | None, manifest_url: str, source_domain: str | None) -> str:
     """Pick a sensible display name for a resolved channel when the user
@@ -123,108 +136,112 @@ def _parse_master_variants(body_text: str, manifest_url: str) -> list[dict]:
     return out
 
 
-import threading
+def refresh_due_manifests():
+    """One refresh tick — selects manifests near expiry and refreshes them
+    through the same sidecar pipeline used by user-driven resolves and the
+    JIT event resolver.
 
-_refresh_worker_started = False
-_refresh_worker_lock = threading.Lock()
-
-
-def _refresh_worker_loop():
-    """Daemon loop: every 60s, refresh manifests near expiry.
-
-    Two pools each cycle:
+    Two pools per tick:
       1. Demand-driven — manifests whose channel was accessed in the last
-         10 min. Standard live-stream model where viewer activity drives
-         the freshness window.
+         10 min. Standard live-stream freshness window.
       2. 24/7 channels — resolved channels with no event_start/event_end
-         (always-on intent). These are refreshed regardless of access
-         because the user expects them to be tunable at any time.
+         (always-on intent). Refreshed regardless of access because the
+         user expects them to be tunable at any time.
 
-    Each manifest is first attempted via light_refresh_manifest() — a
-    single HTTP GET against the stored manifest URL with stored cookies,
-    indistinguishable from a real HLS player polling its playlist. Only
-    if that fails (upstream session rotated, 401/403, garbage body) does
-    the worker fall through to the heavy sidecar-based refresh. This
-    keeps selenium-uc usage rare while still recovering from real session
-    expiry.
+    Each manifest is first tried via light_refresh_manifest() (HTTP only,
+    cheap, uncapped). Light refreshes that fail get queued for the heavy
+    sidecar path — but only HEAVY_REFRESH_BUDGET_PER_TICK of them per tick.
+    This prevents the post-VPN-rotation thundering herd that would
+    otherwise queue 10+ back-to-back Chrome captures and OOM the box.
+    Remaining failures stay eligible for the next tick (their
+    last_refreshed_at didn't advance), so 18 stale channels recover
+    serially over ~6 ticks (~6 min) instead of crushing the host.
+
+    Acquires the module-level pipeline_lock non-blocking so it can't
+    overlap with the JIT event resolver — both pump work into the single
+    selenium sidecar and must take turns.
     """
-    import time
-    from core.models.channel import Channel
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            soon = now + timedelta(minutes=5)
-            cooldown = now - timedelta(minutes=3)
-            watching_window = now - timedelta(minutes=10)
-            with get_session() as session:
-                # Pool 1: demand-driven (recently accessed)
-                demand_rows = (
-                    session.query(Manifest.id)
-                    .filter(Manifest.tags.contains(["resolved"]))
-                    .filter(Manifest.active == True)
-                    .filter(Manifest.last_accessed_at.isnot(None))
-                    .filter(Manifest.last_accessed_at > watching_window)
-                    .filter(
-                        (Manifest.expires_at.is_(None)) |
-                        (Manifest.expires_at < soon)
-                    )
-                    .filter(
-                        (Manifest.last_refreshed_at.is_(None)) |
-                        (Manifest.last_refreshed_at < cooldown)
-                    )
-                    .limit(5)
-                    .all()
+    if not pipeline_lock.acquire(blocking=False):
+        logger.info("[RESOLVER] Refresh tick skipped — pipeline busy (JIT or prior tick)")
+        return
+    try:
+        from core.models.channel import Channel
+        now = datetime.now(timezone.utc)
+        soon = now + timedelta(minutes=5)
+        cooldown = now - timedelta(minutes=3)
+        watching_window = now - timedelta(minutes=10)
+        with get_session() as session:
+            demand_rows = (
+                session.query(Manifest.id)
+                .filter(Manifest.tags.contains(["resolved"]))
+                .filter(Manifest.active == True)
+                .filter(Manifest.last_accessed_at.isnot(None))
+                .filter(Manifest.last_accessed_at > watching_window)
+                .filter(
+                    (Manifest.expires_at.is_(None)) |
+                    (Manifest.expires_at < soon)
                 )
-                # Pool 2: 24/7 channels (always-on intent — null event window)
-                always_on_rows = (
-                    session.query(Manifest.id)
-                    .join(Channel, Channel.manifest_id == Manifest.id)
-                    .filter(Manifest.active == True)
-                    .filter(Channel.type == "resolved")
-                    .filter(Channel.event_start.is_(None))
-                    .filter(Channel.event_end.is_(None))
-                    .filter(
-                        (Manifest.expires_at.is_(None)) |
-                        (Manifest.expires_at < soon)
-                    )
-                    .filter(
-                        (Manifest.last_refreshed_at.is_(None)) |
-                        (Manifest.last_refreshed_at < cooldown)
-                    )
-                    .limit(10)
-                    .all()
+                .filter(
+                    (Manifest.last_refreshed_at.is_(None)) |
+                    (Manifest.last_refreshed_at < cooldown)
                 )
-                ids = list({r[0] for r in (demand_rows + always_on_rows)})
-            if ids:
-                logger.info("[RESOLVER] Refresh sweep: %d manifests due (demand=%d always-on=%d)",
-                            len(ids), len(demand_rows), len(always_on_rows))
-                for mid in ids:
-                    try:
-                        light = ManifestResolverService.light_refresh_manifest(mid)
-                        if light.get("ok"):
-                            logger.info("[RESOLVER] Light-refreshed %s (next expiry %s)",
-                                        mid, light.get("expires_at"))
-                            continue
-                        logger.info("[RESOLVER] Light refresh of %s failed (%s) — falling back to sidecar",
-                                    mid, light.get("error"))
-                        ManifestResolverService.refresh_manifest(mid)
-                    except Exception as e:
-                        logger.warning("[RESOLVER] refresh %s failed: %s", mid, e)
-        except Exception as e:
-            logger.exception("[RESOLVER] refresh worker error: %s", e)
-        time.sleep(60)
+                .limit(5)
+                .all()
+            )
+            always_on_rows = (
+                session.query(Manifest.id)
+                .join(Channel, Channel.manifest_id == Manifest.id)
+                .filter(Manifest.active == True)
+                .filter(Channel.type == "resolved")
+                .filter(Channel.event_start.is_(None))
+                .filter(Channel.event_end.is_(None))
+                .filter(
+                    (Manifest.expires_at.is_(None)) |
+                    (Manifest.expires_at < soon)
+                )
+                .filter(
+                    (Manifest.last_refreshed_at.is_(None)) |
+                    (Manifest.last_refreshed_at < cooldown)
+                )
+                .limit(10)
+                .all()
+            )
+            ids = list({r[0] for r in (demand_rows + always_on_rows)})
 
-
-def start_refresh_worker():
-    """Spawn the demand-driven refresh worker daemon thread (idempotent)."""
-    global _refresh_worker_started
-    with _refresh_worker_lock:
-        if _refresh_worker_started:
+        if not ids:
             return
-        t = threading.Thread(target=_refresh_worker_loop, name="resolver-refresh", daemon=True)
-        t.start()
-        _refresh_worker_started = True
-        logger.info("[RESOLVER] Demand refresh worker started")
+
+        logger.info("[RESOLVER] Refresh tick: %d manifests due (demand=%d always-on=%d)",
+                    len(ids), len(demand_rows), len(always_on_rows))
+        needs_heavy: list[str] = []
+        for mid in ids:
+            try:
+                light = ManifestResolverService.light_refresh_manifest(mid)
+                if light.get("ok"):
+                    logger.info("[RESOLVER] Light-refreshed %s (next expiry %s)",
+                                mid, light.get("expires_at"))
+                    continue
+                logger.info("[RESOLVER] Light refresh of %s failed (%s) — queuing heavy",
+                            mid, light.get("error"))
+                needs_heavy.append(mid)
+            except Exception as e:
+                logger.warning("[RESOLVER] light refresh %s errored: %s", mid, e)
+
+        if not needs_heavy:
+            return
+
+        budget = HEAVY_REFRESH_BUDGET_PER_TICK
+        logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
+                    len(needs_heavy), budget)
+        for mid in needs_heavy[:budget]:
+            try:
+                ManifestResolverService.refresh_manifest(mid)
+            except Exception as e:
+                logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
+    except Exception as e:
+        logger.exception("[RESOLVER] refresh tick error: %s", e)
+    finally:
+        pipeline_lock.release()
 
 
 def _call_sidecar(url: str, timeout: int) -> dict:

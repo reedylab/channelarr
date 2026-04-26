@@ -148,7 +148,26 @@ def upsert_events(scraper_name: str, events: list[dict]) -> dict:
 def resolve_due_events():
     """Select pending events whose kickoff is within the lead window and hand
     them to `ManifestResolverService.resolve_batch`. Reconcile statuses from
-    the batch result."""
+    the batch result.
+
+    Acquires the resolver pipeline_lock non-blocking — if the manifest
+    refresh tick (or another JIT tick) is already pumping work into the
+    single-threaded sidecar, skip this tick. The next interval will retry.
+    """
+    from core.database import get_session
+    from core.models import ScrapedEvent
+    from core.resolver.manifest_resolver import pipeline_lock
+
+    if not pipeline_lock.acquire(blocking=False):
+        logger.info("[QUEUE] JIT tick skipped — resolver pipeline busy")
+        return
+    try:
+        _resolve_due_events_inner()
+    finally:
+        pipeline_lock.release()
+
+
+def _resolve_due_events_inner():
     from core.database import get_session
     from core.models import ScrapedEvent
 
