@@ -321,7 +321,7 @@ def _proxy_m3u8(mid: str, url: str, source_domain: str = "", _retried: bool = Fa
         if not m:
             return line
         absolute = urljoin(r.url, m.group(1))
-        proxied = f"/live-resolved/proxy?url={quote(absolute, safe='')}{ref_param}{mid_param}"
+        proxied = f"/live-resolved/proxy.ts?url={quote(absolute, safe='')}{ref_param}{mid_param}"
         return line[:m.start(1)] + proxied + line[m.end(1):]
 
     lines = []
@@ -335,7 +335,7 @@ def _proxy_m3u8(mid: str, url: str, source_domain: str = "", _retried: bool = Fa
             if any(s.endswith(x) for x in (".m3u8", ".m3u")):
                 s = f"/live-resolved/{mid}.m3u8?src={quote(a, safe='')}"
             else:
-                s = f"/live-resolved/proxy?url={quote(a, safe='')}{ref_param}{mid_param}"
+                s = f"/live-resolved/proxy.ts?url={quote(a, safe='')}{ref_param}{mid_param}"
         lines.append(s)
     return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl")
 
@@ -401,7 +401,14 @@ def resolved_playlist(manifest_id: str, src: str = Query(default=None)):
 
 
 @router.get("/live-resolved/proxy")
+@router.get("/live-resolved/proxy.ts")
 def resolved_proxy(url: str = Query(default=None), ref: str = Query(default=""), mid: str = Query(default="")):
+    """Proxy a single upstream resource (segment, key, init segment) with
+    cookies attached. The .ts alias exists so ffmpeg's allowed_segment_
+    extensions check sees a media-like extension on the path; ffmpeg
+    rejects URLs whose extension isn't whitelisted, and many sources serve
+    encrypted segments under disguised non-media extensions. The original
+    extensionless route stays for backwards-compatible clients."""
     if not url:
         raise HTTPException(status_code=400)
     cookies = _get_cookies(mid) if mid else []
