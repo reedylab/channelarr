@@ -274,7 +274,10 @@ def regenerate_m3u():
         # Resolved channels — different group-title and stream URL pattern.
         # Transcode-mediated channels publish the unified /live/{id}/ URL
         # because that's where the FFmpeg pipeline writes its output. Pure
-        # passthrough channels publish the /live-resolved/{manifest_id}/ URL.
+        # passthrough channels publish the /live-resolved/{manifest_id}/ URL,
+        # which forwards segment + key fetches with the manifest's stored
+        # cookies attached — important for sources whose segments or AES
+        # keys are gated by session auth. Matches the HDHR lineup logic.
         for ch in resolved:
             cid = ch["id"]
             mid = ch.get("manifest_id")
@@ -290,7 +293,7 @@ def regenerate_m3u():
                 f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
                 f'group-title="{group}",{name}\n'
             )
-            if ch.get("transcode_mediated") or ch.get("encoder_mode") == "proxy":
+            if ch.get("transcode_mediated"):
                 f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
             else:
                 f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")
