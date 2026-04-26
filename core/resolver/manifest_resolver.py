@@ -130,12 +130,26 @@ _refresh_worker_lock = threading.Lock()
 
 
 def _refresh_worker_loop():
-    """Daemon loop: every 60s, refresh resolved manifests with recent access near expiry.
+    """Daemon loop: every 60s, refresh manifests near expiry.
 
-    Demand-driven — dormant channels are left alone. First request after dormancy
-    is handled by the 403 safety net in the stream router.
+    Two pools each cycle:
+      1. Demand-driven — manifests whose channel was accessed in the last
+         10 min. Standard live-stream model where viewer activity drives
+         the freshness window.
+      2. 24/7 channels — resolved channels with no event_start/event_end
+         (always-on intent). These are refreshed regardless of access
+         because the user expects them to be tunable at any time.
+
+    Each manifest is first attempted via light_refresh_manifest() — a
+    single HTTP GET against the stored manifest URL with stored cookies,
+    indistinguishable from a real HLS player polling its playlist. Only
+    if that fails (upstream session rotated, 401/403, garbage body) does
+    the worker fall through to the heavy sidecar-based refresh. This
+    keeps selenium-uc usage rare while still recovering from real session
+    expiry.
     """
     import time
+    from core.models.channel import Channel
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -143,7 +157,8 @@ def _refresh_worker_loop():
             cooldown = now - timedelta(minutes=3)
             watching_window = now - timedelta(minutes=10)
             with get_session() as session:
-                rows = (
+                # Pool 1: demand-driven (recently accessed)
+                demand_rows = (
                     session.query(Manifest.id)
                     .filter(Manifest.tags.contains(["resolved"]))
                     .filter(Manifest.active == True)
@@ -160,11 +175,38 @@ def _refresh_worker_loop():
                     .limit(5)
                     .all()
                 )
-                ids = [r[0] for r in rows]
+                # Pool 2: 24/7 channels (always-on intent — null event window)
+                always_on_rows = (
+                    session.query(Manifest.id)
+                    .join(Channel, Channel.manifest_id == Manifest.id)
+                    .filter(Manifest.active == True)
+                    .filter(Channel.type == "resolved")
+                    .filter(Channel.event_start.is_(None))
+                    .filter(Channel.event_end.is_(None))
+                    .filter(
+                        (Manifest.expires_at.is_(None)) |
+                        (Manifest.expires_at < soon)
+                    )
+                    .filter(
+                        (Manifest.last_refreshed_at.is_(None)) |
+                        (Manifest.last_refreshed_at < cooldown)
+                    )
+                    .limit(10)
+                    .all()
+                )
+                ids = list({r[0] for r in (demand_rows + always_on_rows)})
             if ids:
-                logger.info("[RESOLVER] Demand refresh: %d manifests due", len(ids))
+                logger.info("[RESOLVER] Refresh sweep: %d manifests due (demand=%d always-on=%d)",
+                            len(ids), len(demand_rows), len(always_on_rows))
                 for mid in ids:
                     try:
+                        light = ManifestResolverService.light_refresh_manifest(mid)
+                        if light.get("ok"):
+                            logger.info("[RESOLVER] Light-refreshed %s (next expiry %s)",
+                                        mid, light.get("expires_at"))
+                            continue
+                        logger.info("[RESOLVER] Light refresh of %s failed (%s) — falling back to sidecar",
+                                    mid, light.get("error"))
                         ManifestResolverService.refresh_manifest(mid)
                     except Exception as e:
                         logger.warning("[RESOLVER] refresh %s failed: %s", mid, e)
@@ -412,11 +454,81 @@ class ManifestResolverService:
                 evt.set()
 
     @staticmethod
+    def light_refresh_manifest(manifest_id: str) -> dict:
+        """Cheap refresh: re-fetch the stored manifest URL with the stored
+        cookies + UA + Referer and update last_refreshed_at + expires_at.
+        Indistinguishable from a real player polling its playlist URL — no
+        browser, no captcha, no iframe drilldown. Returns ok=True with
+        path='light' on success.
+
+        Used by the periodic refresh worker so idle 24/7 channels stay alive
+        without burning the selenium sidecar (a scarce resource) on every
+        cycle. The full sidecar-based refresh_manifest() stays as the
+        fallback path for when the upstream session has actually rotated.
+        """
+        with get_session() as session:
+            row = (
+                session.query(Manifest.url, Manifest.headers,
+                              Manifest.source_domain, Manifest.cookies)
+                .filter(Manifest.id == manifest_id)
+                .first()
+            )
+        if not row:
+            return {"ok": False, "error": "manifest not found"}
+        url, stored_headers, source_domain, cookies_data = row
+        if not url:
+            return {"ok": False, "error": "no manifest url"}
+
+        # The Manifest model stores response headers, not request headers,
+        # so we don't have the original UA — but every modern HLS upstream
+        # we've seen accepts a vanilla Chrome UA. The cookies + Referer are
+        # what gate access on session-locked sources.
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        headers = {"User-Agent": ua}
+        if source_domain:
+            headers["Referer"] = f"https://{source_domain}/"
+            headers["Origin"] = f"https://{source_domain}"
+        cookie_jar = {}
+        for c in (cookies_data or []):
+            name = c.get("name")
+            val = c.get("value")
+            if name and val:
+                cookie_jar[name] = val
+
+        try:
+            resp = http_requests.get(url, headers=headers, cookies=cookie_jar,
+                                     timeout=15, allow_redirects=True)
+        except Exception as e:
+            return {"ok": False, "error": f"fetch failed: {e}", "path": "light"}
+        if resp.status_code != 200:
+            return {"ok": False, "error": f"status {resp.status_code}", "path": "light"}
+        body = resp.text or ""
+        if "#EXTM3U" not in body:
+            return {"ok": False, "error": "response is not HLS", "path": "light"}
+
+        # Refresh is real. Update expiry from the new body if it carries one,
+        # otherwise just push the default-30min window forward.
+        now = datetime.now(timezone.utc)
+        new_expiry = parse_body_expiry(body, url) or (now + timedelta(minutes=30))
+        with get_session() as session:
+            m = session.query(Manifest).filter_by(id=manifest_id).first()
+            if m:
+                m.expires_at = new_expiry
+                m.last_refreshed_at = now
+                session.commit()
+        return {"ok": True, "manifest_id": manifest_id, "manifest_url": url,
+                "expires_at": new_expiry.isoformat(), "path": "light"}
+
+    @staticmethod
     def refresh_manifest(manifest_id: str, timeout: int = 60) -> dict:
         """Re-resolve an existing manifest using its stored page_url.
 
         Updates the same row in place (preserves manifest_id) so active streams
-        see a seamless URL swap on their next playlist poll.
+        see a seamless URL swap on their next playlist poll. This is the heavy
+        path — launches a browser, navigates the watch page, drills iframes,
+        captures the manifest. Reserve for cases where light_refresh_manifest()
+        has failed (upstream session rotated, manifest URL no longer valid).
         """
         with get_session() as session:
             row = (
@@ -431,11 +543,14 @@ class ManifestResolverService:
         if not page_url:
             return {"ok": False, "manifest_id": manifest_id, "error": "no page_url for refresh"}
 
-        logger.info("Refreshing manifest %s from %s", manifest_id, page_url)
-        return ManifestResolverService.resolve(
+        logger.info("Refreshing manifest %s from %s (full sidecar path)", manifest_id, page_url)
+        result = ManifestResolverService.resolve(
             url=page_url, title=title, timeout=timeout,
             existing_manifest_id=manifest_id,
         )
+        if result.get("ok"):
+            result["path"] = "full"
+        return result
 
     @staticmethod
     def get_batch_status():
