@@ -507,6 +507,59 @@ class ManifestResolverService:
         if "#EXTM3U" not in body:
             return {"ok": False, "error": "response is not HLS", "path": "light"}
 
+        # AES-128 sources can keep serving a valid playlist long after their
+        # /key/ endpoint has silently rotated to returning fake bytes for our
+        # stale session. The playlist alone is not enough to prove the
+        # session still works end-to-end. Probe with a single AES block:
+        # fetch the key, fetch the first 16 bytes of the first segment, do
+        # one AES-CBC block decrypt, check the result starts with 0x47
+        # (MPEG-TS sync). One block is all we need — if the session is dead,
+        # the wrong key produces random bytes and the sync byte misses ~99%
+        # of the time.
+        if "#EXT-X-KEY:METHOD=AES-128" in body:
+            key_match = re.search(r'#EXT-X-KEY:[^\n]*?URI="([^"]+)"', body)
+            iv_match = re.search(r'IV=0x([0-9a-fA-F]+)', body)
+            seg_line = next(
+                (line.strip() for line in body.splitlines()
+                 if line.strip() and not line.startswith("#")),
+                None,
+            )
+            if key_match and iv_match and seg_line:
+                from urllib.parse import urljoin
+                key_url = urljoin(url, key_match.group(1))
+                seg_url = urljoin(url, seg_line)
+                hex_iv = iv_match.group(1)
+                if len(hex_iv) % 2:
+                    hex_iv = "0" + hex_iv
+                iv = bytes.fromhex(hex_iv)[-16:].rjust(16, b"\x00")
+                try:
+                    key_resp = http_requests.get(key_url, headers=headers,
+                                                 cookies=cookie_jar, timeout=10)
+                    seg_resp = http_requests.get(
+                        seg_url,
+                        headers={**headers, "Range": "bytes=0-15"},
+                        cookies=cookie_jar, timeout=10,
+                    )
+                except Exception as e:
+                    return {"ok": False, "error": f"decrypt probe fetch: {e}",
+                            "path": "light"}
+                if key_resp.status_code != 200 or len(key_resp.content) != 16:
+                    return {"ok": False, "path": "light",
+                            "error": f"key probe status={key_resp.status_code} len={len(key_resp.content)}"}
+                if seg_resp.status_code not in (200, 206) or len(seg_resp.content) < 16:
+                    return {"ok": False, "path": "light",
+                            "error": f"seg probe status={seg_resp.status_code} len={len(seg_resp.content)}"}
+                try:
+                    from Crypto.Cipher import AES
+                    cipher = AES.new(key_resp.content, AES.MODE_CBC, iv)
+                    plaintext = cipher.decrypt(seg_resp.content[:16])
+                except Exception as e:
+                    return {"ok": False, "error": f"decrypt failed: {e}",
+                            "path": "light"}
+                if not plaintext or plaintext[0] != 0x47:
+                    return {"ok": False, "path": "light",
+                            "error": "decrypt probe: TS sync byte missing (session likely stale)"}
+
         # Refresh is real. Update expiry from the new body if it carries one,
         # otherwise just push the default-30min window forward.
         now = datetime.now(timezone.utc)
