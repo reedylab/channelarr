@@ -44,7 +44,12 @@ except Exception as e:
 
 MATCH_PATTERNS = ("m3u8", "application/x-mpegurl", "application/vnd.apple.mpegurl")
 INCLUDE_TYPES = ("Media", "Fetch", "XHR", "Document", "Other")
-JSON_STREAM_PATTERNS = ("ngtv.io", "/api/", "/media/", "/stream", "anvato", "uplynk")
+# /proxy/ catches HLS playlists served from generic proxy paths whose
+# filename has been disguised (.css/.csv/.txt/.json) to evade scrapers
+# that key on .m3u8. The body still has #EXTM3U; the body-sniff path in
+# _wait_for_manifest handles validation.
+JSON_STREAM_PATTERNS = ("ngtv.io", "/api/", "/media/", "/stream", "anvato",
+                        "uplynk", "/proxy/")
 
 # Persistent browser singleton. --user-data-dir is required — without it,
 # chromedriver's perf-log subscription is flaky and captures end up with
@@ -76,6 +81,7 @@ class CaptureRequest(BaseModel):
     url: str
     timeout: int = 60
     switch_iframe: bool = True
+    debug: bool = False
 
 
 def _kill_chrome_processes():
@@ -499,6 +505,30 @@ def _wait_for_manifest(browser, *, timeout=60, preloaded_entries=None):
                         except Exception:
                             decoded_body = ""
 
+                    # Direct HLS body: some proxies serve manifests with
+                    # disguised extensions (.css/.csv/.txt) to evade scrapers
+                    # that key on .m3u8. The body still has #EXTM3U.
+                    text_body = decoded_body if is_b64 else body
+                    if text_body and "#EXTM3U" in text_body[:4096]:
+                        logger.info("Found disguised HLS manifest at %s", req_url[:200])
+                        req_headers = req_info.get("headers", {}) or {}
+                        ua = req_headers.get("User-Agent") or req_headers.get("user-agent") or "Mozilla/5.0"
+                        referer = req_headers.get("Referer") or req_headers.get("referer")
+                        fetch_headers = {"User-Agent": ua}
+                        if referer:
+                            fetch_headers["Referer"] = referer
+                        return {
+                            "url": req_url,
+                            "status": resp_info.get("status"),
+                            "mime": resp_info.get("mime") or "application/vnd.apple.mpegurl",
+                            "req_headers": fetch_headers,
+                            "resp_headers": resp_info.get("headers", {}),
+                            "body": text_body,
+                            "base64Encoded": False,
+                            "heartbeat": captured_heartbeat,
+                            "_user_agent": ua,
+                        }
+
                     # JSON API response with embedded m3u8
                     if not is_b64 and body:
                         try:
@@ -893,7 +923,102 @@ def _try_click_play(browser):
         pass
 
 
-def _do_capture(browser, url, timeout, switch_iframe):
+_DBG_DIR = "/tmp/capdbg"
+
+
+def _dbg_screenshot(browser, label: str):
+    """Save a PNG of the current viewport. Tries selenium's native method
+    first (uses Page.captureScreenshot under the hood but with proper window
+    clip), falls back to raw CDP. No-op on failure."""
+    try:
+        os.makedirs(_DBG_DIR, exist_ok=True)
+        path = os.path.join(_DBG_DIR, f"{label}.png")
+
+        # Try CDP with explicit clip and full-page, which forces a layout
+        # pass and avoids the empty-viewport 1x1 case selenium's get_log
+        # reuses sometimes when the renderer hasn't painted yet.
+        try:
+            metrics = browser.execute_cdp_cmd("Page.getLayoutMetrics", {})
+            content = metrics.get("contentSize") or metrics.get("cssContentSize") or {}
+            w = int(content.get("width") or 1920)
+            h = int(content.get("height") or 1080)
+            # Cap absurdly tall pages
+            h = min(h, 4000)
+            res = browser.execute_cdp_cmd("Page.captureScreenshot", {
+                "format": "png",
+                "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": 1},
+                "captureBeyondViewport": True,
+            })
+            data = res.get("data", "")
+            if data:
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(data))
+                logger.info("[DBG-SHOT %s] saved %s (clip %dx%d, %d b64 chars)",
+                            label, path, w, h, len(data))
+                return
+            logger.info("[DBG-SHOT %s] CDP returned empty data", label)
+        except Exception as e:
+            logger.info("[DBG-SHOT %s] CDP failed: %s", label, e)
+
+        # Fallback: selenium's native method
+        try:
+            png = browser.get_screenshot_as_png()
+            if png:
+                with open(path, "wb") as f:
+                    f.write(png)
+                logger.info("[DBG-SHOT %s] saved %s (selenium fallback, %d bytes)",
+                            label, path, len(png))
+                return
+        except Exception as e:
+            logger.info("[DBG-SHOT %s] selenium fallback failed: %s", label, e)
+    except Exception as e:
+        logger.info("[DBG-SHOT %s] outer error: %s", label, e)
+
+
+def _dbg_dump_urls(entries: list, label: str, max_log: int = 80):
+    """Walk perf-log entries and log distinct request URLs (top N) to spot
+    non-m3u8 traffic like CSV / token endpoints. Saves full URL list to disk."""
+    try:
+        urls = []
+        seen = set()
+        for entry in entries:
+            try:
+                msg = json.loads(entry["message"])["message"]
+            except Exception:
+                continue
+            method = msg.get("method", "")
+            if method != "Network.requestWillBeSent":
+                continue
+            req = (msg.get("params", {}) or {}).get("request", {}) or {}
+            u = req.get("url", "")
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            urls.append(u)
+        os.makedirs(_DBG_DIR, exist_ok=True)
+        path = os.path.join(_DBG_DIR, f"{label}_urls.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(urls))
+        logger.info("[DBG-URLS %s] %d distinct requests, saved %s",
+                    label, len(urls), path)
+        # Log the first N non-noise URLs to journal
+        noise = ("google-analytics", "googletagmanager", "histats.com",
+                 "doubleclick.net", "/recaptcha/", "googlesyndication",
+                 "/_next/", "/static/", ".css", ".woff", ".png", ".jpg",
+                 ".svg", ".gif", ".ico", ".woff2", "fonts.gstatic")
+        emitted = 0
+        for u in urls:
+            if any(n in u for n in noise):
+                continue
+            logger.info("[DBG-URLS %s]  %s", label, u[:200])
+            emitted += 1
+            if emitted >= max_log:
+                break
+    except Exception as e:
+        logger.info("[DBG-URLS %s] error: %s", label, e)
+
+
+def _do_capture(browser, url, timeout, switch_iframe, debug=False):
     """Inner capture logic — runs inside a deadline thread."""
     # Set page load timeout
     try:
@@ -933,6 +1058,10 @@ def _do_capture(browser, url, timeout, switch_iframe):
     except Exception as _e:
         logger.info("[DIAG] post-get drain failed: %s", _e)
 
+    if debug:
+        _dbg_screenshot(browser, "01_after_load")
+        _dbg_dump_urls(_early, "01_after_load")
+
     # Scan all iframes for skip conditions
     skip_reason = _scan_all_frames_for_skip(browser)
     if skip_reason:
@@ -940,16 +1069,54 @@ def _do_capture(browser, url, timeout, switch_iframe):
         return {"ok": False, "error": f"Skipped: {skip_reason}"}
 
     if switch_iframe:
+        # Pick the iframe most likely to be the actual player. Naive
+        # "switch to first iframe" picks placeholder/chat/ad iframes on
+        # sites that nest the player behind one or more decoys.
         try:
             browser.switch_to.default_content()
             WebDriverWait(browser, 10).until(
-                EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe"))
+                lambda d: len(d.find_elements(By.TAG_NAME, "iframe")) > 0
             )
-            logger.info("Switched to iframe")
+            iframes = browser.find_elements(By.TAG_NAME, "iframe")
+            _SKIP_PREFIXES = ("javascript:", "about:", "data:", "blob:")
+            _SKIP_SUBSTR = (
+                "chatango.com", "adbanner", "/ads/", "/ad-",
+                "google.com/recaptcha", "doubleclick.net",
+                "googletagmanager.com", "googlesyndication",
+                "googleadservices",
+            )
+            target = None
+            for ifr in iframes:
+                try:
+                    src = (ifr.get_attribute("src") or "").lower()
+                    if not src or src.startswith(_SKIP_PREFIXES):
+                        continue
+                    if any(s in src for s in _SKIP_SUBSTR):
+                        continue
+                    target = ifr
+                    break
+                except Exception:
+                    continue
+            if target is None and iframes:
+                target = iframes[0]
+            if target is not None:
+                src_log = (target.get_attribute("src") or "(no src)")[:140]
+                browser.switch_to.frame(target)
+                logger.info("Switched to iframe: %s", src_log)
         except Exception:
             logger.debug("No iframe, continuing in main frame")
 
+    if debug:
+        _dbg_screenshot(browser, "02_after_iframe_switch")
+
     _try_click_play(browser)
+
+    _post_click_entries = []
+    if debug:
+        _dbg_screenshot(browser, "03_after_click")
+        # Destructive drain — feed back to _wait_for_manifest below.
+        _post_click_entries = browser.get_log("performance")
+        _dbg_dump_urls(_post_click_entries, "03_after_click")
 
     # If the page itself hung during load, cap the manifest wait short.
     # Chrome has already had ~120s — any manifest that was going to be
@@ -958,7 +1125,14 @@ def _do_capture(browser, url, timeout, switch_iframe):
     # is coming. 15s is enough to drain the log and match m3u8s that
     # ARE there, without burning the wall clock for empty cases.
     wait_timeout = 15 if _page_load_timed_out else timeout
-    result = _wait_for_manifest(browser, timeout=wait_timeout, preloaded_entries=_early)
+    result = _wait_for_manifest(
+        browser, timeout=wait_timeout,
+        preloaded_entries=(_early + _post_click_entries),
+    )
+    if debug:
+        _dbg_screenshot(browser, "04_after_wait")
+        # Final URL dump from any remaining perf entries
+        _dbg_dump_urls(browser.get_log("performance"), "04_after_wait")
     if not result:
         if _page_load_timed_out:
             return {"ok": False, "error": "Skipped: page hung and no manifest arrived"}
@@ -1008,12 +1182,35 @@ def _do_capture(browser, url, timeout, switch_iframe):
 
     ua = browser.execute_script("return navigator.userAgent")
 
-    # Capture browser cookies for session-bound streams (e.g. NTV)
+    # Capture cookies for ALL domains touched during the capture, not just
+    # the top-level page. Session-bound streams often serve segments / keys
+    # from a different subdomain (e.g. proxy CDN) than the page itself, so
+    # selenium's per-domain get_cookies() misses the auth needed for
+    # downstream playback. CDP Network.getAllCookies returns the full jar.
     cookies = []
     try:
         browser.switch_to.default_content()
-        cookies = browser.get_cookies() or []
-        logger.info("Captured %d session cookies", len(cookies))
+        try:
+            res = browser.execute_cdp_cmd("Network.getAllCookies", {})
+            raw = res.get("cookies", []) or []
+            # Normalize CDP cookies to the same shape selenium returns so the
+            # streamer doesn't need to know which path produced them.
+            for c in raw:
+                cookies.append({
+                    "name": c.get("name"),
+                    "value": c.get("value"),
+                    "domain": c.get("domain"),
+                    "path": c.get("path") or "/",
+                    "secure": bool(c.get("secure")),
+                    "httpOnly": bool(c.get("httpOnly")),
+                    "expiry": int(c["expires"]) if c.get("expires", -1) and c.get("expires", -1) > 0 else None,
+                    "sameSite": c.get("sameSite"),
+                })
+            logger.info("Captured %d cross-domain cookies (CDP)", len(cookies))
+        except Exception as e:
+            logger.warning("CDP getAllCookies failed (%s); falling back to per-domain", e)
+            cookies = browser.get_cookies() or []
+            logger.info("Captured %d session cookies (selenium)", len(cookies))
     except Exception:
         pass
 
@@ -1052,7 +1249,10 @@ def capture(req: CaptureRequest):
 
             def _run():
                 try:
-                    capture_result[0] = _do_capture(browser, req.url, req.timeout, req.switch_iframe)
+                    capture_result[0] = _do_capture(
+                        browser, req.url, req.timeout, req.switch_iframe,
+                        debug=req.debug,
+                    )
                 except Exception as e:
                     capture_error[0] = e
 
