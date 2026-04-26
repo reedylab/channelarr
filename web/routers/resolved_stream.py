@@ -307,10 +307,30 @@ def _proxy_m3u8(mid: str, url: str, source_domain: str = "", _retried: bool = Fa
 
     ref_param = f"&ref={quote(source_domain, safe='')}" if source_domain else ""
     mid_param = f"&mid={mid}"
+
+    # Tags that carry a URI="..." attribute referencing a resource the player
+    # will fetch separately (AES key, init segment, etc). The HLS spec says
+    # these URIs are resolved relative to the playlist, so the same urljoin
+    # logic used for segments applies. Without this rewriting the client
+    # tries to fetch the key from the original CDN with no cookies → 401.
+    _KEY_URI_TAGS = ("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:", "#EXT-X-MAP:")
+    _URI_RE = re.compile(r'URI="([^"]+)"')
+
+    def _rewrite_uri_attr(line: str) -> str:
+        m = _URI_RE.search(line)
+        if not m:
+            return line
+        absolute = urljoin(r.url, m.group(1))
+        proxied = f"/live-resolved/proxy?url={quote(absolute, safe='')}{ref_param}{mid_param}"
+        return line[:m.start(1)] + proxied + line[m.end(1):]
+
     lines = []
     for line in r.text.splitlines():
         s = line.strip()
-        if s and not s.startswith("#"):
+        if s.startswith("#"):
+            if any(s.startswith(t) for t in _KEY_URI_TAGS):
+                s = _rewrite_uri_attr(s)
+        elif s:
             a = urljoin(r.url, s)
             if any(s.endswith(x) for x in (".m3u8", ".m3u")):
                 s = f"/live-resolved/{mid}.m3u8?src={quote(a, safe='')}"
