@@ -30,28 +30,6 @@ POLL_INTERVAL = 2  # seconds between playlist polls
 MAX_SEGMENTS_ON_DISK = 10  # rolling window of segment files to keep
 
 
-def _parse_key_directive(line: str) -> Optional[dict]:
-    """Parse an #EXT-X-KEY: directive into {method, uri, iv}.
-
-    Returns None if METHOD=NONE or the line can't be parsed. IV is returned
-    as raw 16 bytes when present; the spec defaults it to the segment's
-    media sequence number padded to 128 bits when omitted, but every source
-    we've seen that uses encryption supplies one explicitly.
-    """
-    method = re.search(r'METHOD=([A-Z0-9-]+)', line)
-    uri = re.search(r'URI="([^"]+)"', line)
-    if not method or method.group(1) == "NONE" or not uri:
-        return None
-    iv_match = re.search(r'IV=0x([0-9a-fA-F]+)', line)
-    iv_bytes = None
-    if iv_match:
-        hex_iv = iv_match.group(1)
-        if len(hex_iv) % 2:
-            hex_iv = "0" + hex_iv
-        iv_bytes = bytes.fromhex(hex_iv)[-16:].rjust(16, b"\x00")
-    return {"method": method.group(1), "uri": uri.group(1), "iv": iv_bytes}
-
-
 class ProxyStream:
     """Proxy streamer for one resolved channel. Polls upstream, downloads
     segments, writes a local HLS playlist. No encoding."""
@@ -78,38 +56,14 @@ class ProxyStream:
         self._started_at: Optional[float] = None
         self._last_access = time.time()
 
-        # AES key cache, keyed by absolute key URL — populated lazily as
-        # encrypted playlists are seen. Key URLs rotate as the upstream
-        # MEDIA-SEQUENCE advances; old keys are evicted when no segment
-        # in the current playlist still references them.
-        self._key_cache: dict[str, bytes] = {}
-
-        # Single Session so cookies persist across manifest poll, segment,
-        # and key fetches. Sources whose stream auth lives on a different
-        # subdomain than the page need the captured cross-domain jar
-        # attached or the upstream returns 401/403.
-        self.session = http_requests.Session()
+        # Look up source_domain for Referer headers
         self.source_domain = ""
         try:
             from core.database import get_session
             from core.models.manifest import Manifest as _M
             with get_session() as _s:
-                _row = (_s.query(_M.source_domain, _M.cookies)
-                        .filter_by(id=manifest_id).first())
-                if _row:
-                    self.source_domain = (_row[0] or "") or ""
-                    for c in (_row[1] or []):
-                        name = c.get("name")
-                        value = c.get("value")
-                        domain = c.get("domain")
-                        if not (name and value and domain):
-                            continue
-                        self.session.cookies.set(
-                            name, value,
-                            domain=domain,
-                            path=c.get("path") or "/",
-                            secure=bool(c.get("secure")),
-                        )
+                _row = _s.query(_M.source_domain).filter_by(id=manifest_id).first()
+                self.source_domain = (_row[0] if _row and _row[0] else "") or ""
         except Exception:
             pass
 
@@ -120,24 +74,6 @@ class ProxyStream:
             h["Referer"] = f"https://{self.source_domain}/"
             h["Origin"] = f"https://{self.source_domain}"
         return h
-
-    def _get_key(self, key_url: str) -> Optional[bytes]:
-        """Fetch + cache the AES-128 key bytes for a given URL."""
-        if key_url in self._key_cache:
-            return self._key_cache[key_url]
-        try:
-            resp = self.session.get(key_url, headers=self._upstream_headers(), timeout=10)
-        except Exception as e:
-            logging.warning("[PROXY] %s key fetch failed for %s: %s",
-                            self.channel_id, key_url[:80], e)
-            return None
-        if resp.status_code != 200 or len(resp.content) != 16:
-            logging.warning("[PROXY] %s key fetch %s: status=%d len=%d",
-                            self.channel_id, key_url[:80],
-                            resp.status_code, len(resp.content))
-            return None
-        self._key_cache[key_url] = resp.content
-        return resp.content
 
     # ── Public lifecycle ────────────────────────────────────────────────────
 
@@ -199,7 +135,7 @@ class ProxyStream:
 
     def _resolve_variant_url(self, url: str) -> str:
         try:
-            resp = self.session.get(url, headers=self._upstream_headers(), timeout=10)
+            resp = http_requests.get(url, headers=self._upstream_headers(), timeout=10)
             text = resp.text
         except Exception:
             return url
@@ -257,7 +193,7 @@ class ProxyStream:
 
         while not self._stop_event.is_set():
             try:
-                resp = self.session.get(
+                resp = http_requests.get(
                     variant_url, headers=self._upstream_headers(), timeout=10
                 )
                 if resp.status_code in (401, 403, 404):
@@ -291,17 +227,12 @@ class ProxyStream:
             lines = resp.text.splitlines()
             segments = []
             current_duration = 0.0
-            current_key = None       # raw directive line, kept for legacy callers
-            current_key_info = None  # parsed {method, uri, iv} or None for plaintext
+            current_key = None
             pending_discontinuity = False
             for line in lines:
                 line = line.strip()
                 if line.startswith("#EXT-X-KEY:"):
                     current_key = line
-                    info = _parse_key_directive(line)
-                    if info and info.get("uri"):
-                        info["uri"] = urljoin(resp.url, info["uri"])
-                    current_key_info = info
                 elif line == "#EXT-X-DISCONTINUITY":
                     # Attach to the next segment we see. DAI inserts this
                     # between live content and ad pods and between pods;
@@ -322,20 +253,9 @@ class ProxyStream:
                         "seq": seq,
                         "duration": current_duration,
                         "key_line": current_key,
-                        "key_info": current_key_info,
                         "discontinuity": pending_discontinuity,
                     })
                     pending_discontinuity = False
-
-            # Drop unused keys from the cache so it can't grow unbounded
-            # across long uptimes (key URLs rotate every few minutes).
-            active_key_urls = {
-                s["key_info"]["uri"] for s in segments
-                if s.get("key_info") and s["key_info"].get("uri")
-            }
-            if active_key_urls:
-                for stale in [u for u in self._key_cache if u not in active_key_urls]:
-                    self._key_cache.pop(stale, None)
 
             # First poll optimization: DAI/HLS live playlists can advertise
             # hours of DVR backlog (thousands of segments). We only need the
@@ -398,42 +318,9 @@ class ProxyStream:
             self._stop_event.wait(POLL_INTERVAL)
 
     def _download_segment(self, seg: dict, local_path: str):
-        """Download a single segment to local disk.
-
-        If the segment is AES-128 encrypted (per its #EXT-X-KEY directive),
-        decrypt it server-side using the cached key + IV from the playlist
-        so the local stream.m3u8 can stay plain — every downstream consumer
-        (clients, ffprobe, transcoder mode) then sees a vanilla MPEG-TS
-        playlist with no encryption directive to worry about.
-        """
+        """Download a single segment to local disk."""
         headers = self._upstream_headers()
-        info = seg.get("key_info")
-        # Encrypted: must buffer the full segment, then AES-CBC decrypt.
-        # AES-CBC isn't streamable across an unknown total length without
-        # also tracking padding; the segment is small enough (~2 MB) that
-        # buffering is fine and avoids partial-write corruption.
-        if info and info.get("method") == "AES-128" and info.get("uri"):
-            resp = self.session.get(seg["uri"], headers=headers, timeout=15)
-            resp.raise_for_status()
-            ciphertext = resp.content
-            key = self._get_key(info["uri"])
-            if key is None:
-                raise RuntimeError(f"key fetch failed for {info['uri']}")
-            iv = info.get("iv")
-            if iv is None:
-                # Fallback per HLS spec: media-sequence number padded to 128b
-                iv = seg["seq"].to_bytes(16, "big", signed=False)
-            from Crypto.Cipher import AES
-            from Crypto.Util.Padding import unpad
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
-            with open(local_path, "wb") as f:
-                f.write(plaintext)
-            return
-
-        # Plaintext (or unknown method we'd rather pass through): stream
-        # straight to disk with no buffering.
-        resp = self.session.get(seg["uri"], headers=headers, timeout=15, stream=True)
+        resp = http_requests.get(seg["uri"], headers=headers, timeout=15, stream=True)
         resp.raise_for_status()
         with open(local_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=65536):
