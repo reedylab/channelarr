@@ -206,8 +206,8 @@ class ResolvedChannelStream:
 
     def _upstream_headers(self) -> dict:
         """Build HTTP headers for upstream requests, including Referer if
-        the source domain is known. Some CDNs (e.g. mainstreams.pro) reject
-        requests without a valid Referer from the originating site."""
+        the source domain is known. Some CDNs reject requests without a
+        valid Referer from the originating site."""
         h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
         if self.source_domain:

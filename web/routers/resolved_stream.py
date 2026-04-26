@@ -384,9 +384,10 @@ def resolved_playlist(manifest_id: str, src: str = Query(default=None)):
             status_code=302,
         )
 
-    # Tab-proxy mode — session-locked CDNs (NTV). Serve the playlist out
-    # of a persistent browser tab in the nodriver sidecar instead of
-    # replaying the stored m3u8 URL.
+    # Tab-proxy mode — session-locked CDNs whose tokens can't be replayed
+    # outside the original browser context. Serve the playlist out of a
+    # persistent browser tab in the nodriver sidecar instead of replaying
+    # the stored m3u8 URL.
     tab_channel_id = _find_tab_proxy_channel_for_manifest(manifest_id)
     if tab_channel_id:
         return _tab_proxy_playlist(tab_channel_id, manifest_id)
