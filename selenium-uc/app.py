@@ -137,6 +137,14 @@ def _make_browser():
     options.add_argument(f"--user-data-dir={_PROFILE_DIR}")
 
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    # Default Chrome strategy ('normal') waits for window.onload, which can
+    # hang for >90s on heavy pages with slow ad/tracker SDKs (observed on
+    # Bally Sports MiLB live-game pages — DOMContentLoaded fires fast but
+    # onload never does, so browser.get() times out and the capture is
+    # killed). 'eager' returns as soon as DOMContentLoaded fires; the m3u8
+    # network request fires well before then anyway, so we don't lose
+    # anything by not waiting for trailing trackers/ads.
+    options.set_capability("pageLoadStrategy", "eager")
 
     chrome_binary = os.getenv("CHROME_BINARY", "/usr/bin/google-chrome")
     options.binary_location = chrome_binary
@@ -817,11 +825,14 @@ def _scan_all_frames_for_skip(browser):
         "live stream starting soon", "stream starting soon",
         "event has not started", "stream will begin shortly",
         "broadcast will begin",
-        # Some sites render "DELAYED START" as a status badge when the
-        # broadcast hasn't gone live yet — the player never initializes, so
-        # no manifest is ever requested and we'd otherwise wait the full
-        # timeout for nothing.
-        "delayed start",
+        # NOTE: "delayed start" was previously matched as a fast-skip
+        # phrase but it false-triggers on Bally Sports MiLB game pages
+        # whose related-content sidebars list other "delayed start"
+        # games even when the current page's broadcast is live. Letting
+        # genuinely-delayed games time out at 60s is acceptable; falsely
+        # skipping a live game the user is actively trying to watch is
+        # not. (Re-add only with stricter context matching, e.g. requiring
+        # the phrase to be inside the player container.)
         # The bare word 'upcoming' false-triggers on sites with secondary
         # 'Upcoming Listings' sections while a live stream is playing.
         # Match contextual pregame wording instead.
