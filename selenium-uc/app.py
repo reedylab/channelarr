@@ -825,14 +825,14 @@ def _scan_all_frames_for_skip(browser):
         "live stream starting soon", "stream starting soon",
         "event has not started", "stream will begin shortly",
         "broadcast will begin",
-        # NOTE: "delayed start" was previously matched as a fast-skip
-        # phrase but it false-triggers on Bally Sports MiLB game pages
-        # whose related-content sidebars list other "delayed start"
-        # games even when the current page's broadcast is live. Letting
-        # genuinely-delayed games time out at 60s is acceptable; falsely
-        # skipping a live game the user is actively trying to watch is
-        # not. (Re-add only with stricter context matching, e.g. requiring
-        # the phrase to be inside the player container.)
+        # Some sites render "DELAYED START" as a status badge when the
+        # broadcast hasn't gone live yet — the player never initializes,
+        # so no manifest is ever requested and we'd otherwise wait the
+        # full timeout for nothing. Safe to match here because the scan
+        # below only runs inside iframes (where the player + its status
+        # overlay live), not on the top-level page (where related-game
+        # sidebars list other games' "delayed start" badges).
+        "delayed start",
         # The bare word 'upcoming' false-triggers on sites with secondary
         # 'Upcoming Listings' sections while a live stream is playing.
         # Match contextual pregame wording instead.
@@ -864,15 +864,19 @@ def _scan_all_frames_for_skip(browser):
             pass
         return None
 
-    # Check main frame first
+    # Iframes only — the top-level document on every live-stream source
+    # we resolve is just chrome (nav, ads, related-content sidebars).
+    # Skip phrases on the top page produced false positives that blocked
+    # legitimate captures (Bally MiLB sidebars list other games' "DELAYED
+    # START" badges, which falsely matched on live game pages). The
+    # actual player + its real-time status overlay always live inside an
+    # iframe, so scanning iframes only gives us accurate skip detection.
+    # Worst case for sources without an iframe player: we wait the full
+    # timeout instead of fast-skipping — same outcome as if no skip
+    # phrase existed for them.
     try:
         browser.switch_to.default_content()
         time.sleep(1)
-        result = _check_current_frame()
-        if result:
-            return result
-
-        # Check each iframe
         iframes = browser.find_elements(By.TAG_NAME, "iframe")
         for idx, _ in enumerate(iframes):
             try:
