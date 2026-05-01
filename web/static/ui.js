@@ -1792,9 +1792,15 @@ function renderTasks(tasks) {
   }
 
   container.innerHTML = tasks.map(t => {
+    const isCron = t.trigger_type === "cron";
     const options = TASK_INTERVAL_OPTIONS[t.id] || [];
     let selectHtml = "";
-    if (options.length) {
+    if (isCron) {
+      // Time-of-day picker for cron jobs (vpn_scheduled_rotate). Triggers
+      // a PUT with {time} on change instead of {interval_seconds}.
+      const timeVal = t.cron_time || "04:00";
+      selectHtml = `<input type="time" class="task-time" data-task-cron="${esc(t.id)}" value="${esc(timeVal)}">`;
+    } else if (options.length) {
       selectHtml = `<select class="task-select" data-task-interval="${esc(t.id)}">` +
         options.map(o =>
           `<option value="${o.seconds}" ${t.interval_seconds && Math.abs(t.interval_seconds - o.seconds) < 5 ? "selected" : ""}>${o.label}</option>`
@@ -1802,6 +1808,7 @@ function renderTasks(tasks) {
     } else if (t.interval_seconds) {
       selectHtml = `<span>${_fmtInterval(t.interval_seconds)}</span>`;
     }
+    const labelText = isCron ? "At:" : "Every:";
     const nextRun = t.next_run_time ? _timeUntil(t.next_run_time) : "";
 
     return `<div class="task-card" data-task-id="${esc(t.id)}">
@@ -1812,7 +1819,7 @@ function renderTasks(tasks) {
         </div>
       </div>
       <div class="task-meta">
-        ${selectHtml ? `<span>Every: ${selectHtml}</span>` : ""}
+        ${selectHtml ? `<span>${labelText} ${selectHtml}</span>` : ""}
         ${nextRun ? `<span class="task-next">Next: ${nextRun}</span>` : ""}
       </div>
     </div>`;
@@ -1837,6 +1844,30 @@ function renderTasks(tasks) {
         }
       } catch (e) {
         toast("error", "Failed to update interval");
+      }
+    });
+  });
+
+  // Bind cron time change handlers (for vpn_scheduled_rotate)
+  container.querySelectorAll("[data-task-cron]").forEach(inp => {
+    inp.addEventListener("change", async () => {
+      const jobId = inp.dataset.taskCron;
+      const time = inp.value;
+      if (!time) return;
+      try {
+        const r = await fetch(`${API}/tasks/${encodeURIComponent(jobId)}`, {
+          method: "PUT",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({time}),
+        });
+        if (r.ok) {
+          toast("success", `Scheduled at ${time} daily`);
+          setTimeout(loadTasks, 500);
+        } else {
+          toast("error", "Failed to update schedule");
+        }
+      } catch (e) {
+        toast("error", "Failed to update schedule");
       }
     });
   });

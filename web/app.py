@@ -185,7 +185,18 @@ async def lifespan(app: FastAPI):
         pass
     add_job("vpn_sampler", sample_latency, seconds=60)
     if get_setting("GLUETUN_CONTROL_URL", ""):
+        # Auto-rotate "checker" runs every 60s and self-skips unless the
+        # vpn_auto_rotate_minutes setting > 0 AND enough time has elapsed.
+        # Pass seconds=60 explicitly here; the saved-interval override
+        # (TASK_INTERVALS) is the only way users should change this.
         add_job("vpn_auto_rotate", maybe_auto_rotate, seconds=60)
+        # Scheduled rotate fires once a day at HH:MM in CRON_TZ (Eastern by
+        # default). Default to 04:00 so the task is always visible in the
+        # Tasks UI for VPN-mode users and they can adjust from the time
+        # picker.
+        from core.scheduler import update_vpn_scheduled_rotate
+        sched_time = (get_setting("vpn_scheduled_rotate_time", "") or "").strip() or "04:00"
+        update_vpn_scheduled_rotate(sched_time)
     logging.info("[VPN-MONITOR] Started VPN scheduler jobs")
 
     # Event channel cleanup

@@ -26,7 +26,23 @@ def api_tasks_status():
 
 @router.put("/tasks/{job_id}")
 def api_tasks_update(job_id: str, body: dict):
-    """Update a task's interval."""
+    """Update a task's interval (interval jobs) or time-of-day (cron jobs)."""
+    # Cron-style update for time-of-day jobs (e.g. vpn_scheduled_rotate)
+    if "time" in body:
+        from core.scheduler import update_vpn_scheduled_rotate
+        from core.config import save_settings
+        if job_id != "vpn_scheduled_rotate":
+            return JSONResponse(status_code=400,
+                                content={"error": "time field only supported for cron jobs"})
+        time_str = (body.get("time") or "").strip()
+        ok = update_vpn_scheduled_rotate(time_str)
+        if not ok:
+            return JSONResponse(status_code=400,
+                                content={"error": "invalid time format (expected HH:MM)"})
+        save_settings({"vpn_scheduled_rotate_time": time_str})
+        return {"ok": True}
+
+    # Interval-style update (existing behavior)
     from core.scheduler import update_job_interval
     seconds = body.get("interval_seconds")
     if not seconds or not isinstance(seconds, (int, float)):
