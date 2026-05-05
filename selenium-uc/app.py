@@ -317,6 +317,18 @@ def _wait_for_manifest(browser, *, timeout=60, preloaded_entries=None):
     _event_counts = {"total": 0, "req": 0, "resp": 0, "fin": 0}
     _pending = list(preloaded_entries or [])
 
+    # Detect a dead chromedriver session (Chrome crashed, port closed) and
+    # bail out instead of looping. Without this the loop hammers
+    # browser.get_log() ~12x/sec until `timeout` expires; selenium's urllib3
+    # adds 3 retries per call, each emitting log lines — produces ~125
+    # log lines/sec for the full timeout and burns CPU on a session that
+    # cannot be revived. The outer capture handler will recreate the
+    # browser on the next request.
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+    from selenium.common.exceptions import (
+        InvalidSessionIdException, WebDriverException,
+    )
+
     while (time.time() - start) < timeout:
         try:
             entries = _pending + browser.get_log("performance")
@@ -562,6 +574,16 @@ def _wait_for_manifest(browser, *, timeout=60, preloaded_entries=None):
                         except (json.JSONDecodeError, ValueError):
                             pass
 
+        except (InvalidSessionIdException, MaxRetryError, NewConnectionError) as e:
+            logger.error("Chromedriver session is dead, aborting capture: %s", str(e)[:200])
+            return None
+        except WebDriverException as e:
+            msg = str(e).lower()
+            if "connection refused" in msg or "no such session" in msg \
+                    or "chrome not reachable" in msg or "session deleted" in msg:
+                logger.error("Chromedriver unreachable, aborting capture: %s", str(e)[:200])
+                return None
+            logger.error("Error processing performance logs: %s", e)
         except Exception as e:
             logger.error("Error processing performance logs: %s", e)
 
