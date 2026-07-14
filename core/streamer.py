@@ -697,6 +697,43 @@ class StreamerManager:
         self._streams[channel_id] = stream
         return True
 
+    def start_remux_channel(self, channel_id: str, manifest_id: str,
+                            manifest_url: str) -> bool:
+        """Start a remux-mode resolved channel. Feeds the master URL to ffmpeg
+        -c copy so fMP4/CMAF + demuxed-audio streams (which the proxy can't
+        carry) are muxed to MPEG-TS HLS. No re-encode. Output goes to the same
+        /app/data/hls/{channel_id}/ dir the other modes use."""
+        from core.resolver.remux_stream import RemuxStream
+
+        if channel_id in self._streams:
+            existing = self._streams[channel_id]
+            try:
+                if existing.status().get("running"):
+                    return False
+            except Exception:
+                pass
+            try:
+                existing.stop()
+            except Exception:
+                pass
+            del self._streams[channel_id]
+
+        hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
+        hls_dir = os.path.join(hls_base, channel_id)
+
+        stream = RemuxStream(
+            channel_id=channel_id,
+            manifest_id=manifest_id,
+            manifest_url=manifest_url,
+            hls_dir=hls_dir,
+            hls_time=int(self._get("HLS_TIME", "6")),
+            hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+            loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
+        )
+        stream.start()
+        self._streams[channel_id] = stream
+        return True
+
     def stop_channel(self, channel_id: str) -> bool:
         stream = self._streams.get(channel_id)
         if not stream:

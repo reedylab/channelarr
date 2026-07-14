@@ -23,10 +23,11 @@ def _enrich(ch: dict) -> dict:
 
     if ch.get("type") == "resolved":
         mid = ch.get("manifest_id")
-        if ch.get("transcode_mediated"):
-            # Transcode-mediated resolved channels use the same /live/{id}
-            # endpoint as scheduled channels — output goes through the
-            # unified HLS pipeline so the URL pattern is identical.
+        # Every server-mediated mode (transcode, proxy, remux) writes HLS to the
+        # unified /live/{id}/ dir; only true passthrough serves the raw manifest
+        # via /live-resolved/. Keep this in lockstep with regenerate_m3u().
+        if (ch.get("transcode_mediated")
+                or ch.get("encoder_mode") in ("proxy", "remux")):
             ch["stream_url"] = f"/live/{cid}/stream.m3u8"
             ch["stream_status"] = shared_state.streamer_mgr.get_status(cid)
         else:

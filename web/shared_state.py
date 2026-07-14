@@ -290,7 +290,8 @@ def regenerate_m3u():
                 f'#EXTINF:-1 tvg-id="{cid}" tvg-chno="{chno}" tvg-name="{name}"{logo_tag} '
                 f'group-title="{group}",{name}\n'
             )
-            if ch.get("transcode_mediated") or ch.get("encoder_mode") == "proxy":
+            if (ch.get("transcode_mediated")
+                    or ch.get("encoder_mode") in ("proxy", "remux")):
                 f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
             else:
                 f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")

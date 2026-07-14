@@ -324,6 +324,13 @@ class ChannelManager:
             if not display_name:
                 display_name = m.source_domain or "Unnamed Resolved"
 
+            # Pick the serving mode. The lightweight proxy can't carry a stream
+            # with demuxed audio (a separate EXT-X-MEDIA:TYPE=AUDIO rendition it
+            # can't mux) — detect that signal in the captured master and route it
+            # to remux (ffmpeg -c copy). Plain self-contained sources stay on the
+            # cheaper proxy.
+            _tags = tags or []
+            _needs_remux = "EXT-X-MEDIA:TYPE=AUDIO" in (m.body or "")
             new_id = str(uuid.uuid4())
             row = ChannelRow(
                 id=new_id,
@@ -336,7 +343,8 @@ class ChannelManager:
                 loop=False,
                 schedule_cycle_duration=0,
                 materialized_schedule=[],
-                tags=tags or [],
+                tags=_tags,
+                encoder_mode=("remux" if _needs_remux else "proxy"),
             )
             if event_start:
                 from datetime import datetime as _dt, timezone as _tz

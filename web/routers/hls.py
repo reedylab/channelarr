@@ -72,6 +72,16 @@ def _start_from_schedule(channel_id):
             )
             return ok, "Started" if ok else "Already running"
 
+        # Remux mode — ffmpeg -c copy from the master URL. Handles fMP4/CMAF +
+        # demuxed audio the proxy can't carry. No re-encode.
+        if encoder_mode == "remux":
+            ok = shared_state.streamer_mgr.start_remux_channel(
+                channel_id,
+                manifest_id=manifest_id,
+                manifest_url=manifest_url,
+            )
+            return ok, "Started" if ok else "Already running"
+
         # Transcode mode — full re-encode with bump insertion.
         if ch.get("transcode_mediated"):
             ok = shared_state.streamer_mgr.start_resolved_channel(
