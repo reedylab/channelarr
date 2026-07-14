@@ -393,10 +393,16 @@ class RemuxStream:
                 emit = vmsq + max(0, len(vsegs) - 4)
             elif emit < vmsq:
                 # Fell behind the live window (a slow cycle / token refresh gap):
-                # the segment we want has rolled off. Resync to what's available
-                # so we resume instead of stalling forever.
-                logging.info("[REMUX] %s resync emit %d -> %d", self.channel_id, emit, vmsq)
-                emit = vmsq
+                # the segment we want has rolled off. Resync to the LIVE EDGE
+                # (not the window floor) — jumping to the floor forces us to
+                # re-download and mux the whole window to reach live, which over
+                # a throttled link gets lapped and re-triggers this branch in a
+                # death spiral (output freezes). Resuming near the edge fetches
+                # only the last few segments, so recovery is immediate.
+                edge = vmsq + max(0, len(vsegs) - 4)
+                logging.info("[REMUX] %s resync emit %d -> %d (live edge)",
+                             self.channel_id, emit, edge)
+                emit = edge
                 vbuf.clear(); abuf.clear(); adur.clear()
 
             # Fetch every NEW segment this reload reveals (keeps up with live),
