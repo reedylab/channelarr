@@ -244,8 +244,48 @@ def refresh_due_manifests():
         pipeline_lock.release()
 
 
+_native_mod = False  # False = not yet looked up; None = absent; else module
+
+
+def _native_resolver():
+    """Load the optional user-provided native-resolver module from the scrapers
+    dir (gitignored, site-specific) so no target hosts live in core. It exposes
+    handles(url)->bool and capture(url, timeout)->dict|None. Cached after first
+    load; returns None if absent."""
+    global _native_mod
+    if _native_mod is not False:
+        return _native_mod
+    _native_mod = None
+    try:
+        import importlib.util
+        path = os.path.join(os.getenv("SCRAPERS_DIR", "/app/scrapers"),
+                            "_native_resolvers.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("_native_resolvers", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _native_mod = mod
+    except Exception as e:
+        logger.warning("[RESOLVER] native resolver load failed: %s", e)
+    return _native_mod
+
+
 def _call_sidecar(url: str, timeout: int) -> dict:
-    """POST to the selenium-uc sidecar /capture endpoint."""
+    """Capture a manifest for a page URL. Some sources expose the HLS URL in
+    plain HTML and can be resolved by a pure-HTTP native resolver (no browser);
+    everything else goes through the selenium-uc sidecar /capture endpoint."""
+    native = _native_resolver()
+    if native is not None:
+        try:
+            if native.handles(url):
+                cap = native.capture(url, timeout)
+                if cap and cap.get("ok"):
+                    logger.info("[RESOLVER] Resolved %s via native resolver", url)
+                    return cap
+                logger.info("[RESOLVER] Native resolver declined %s — using sidecar", url)
+        except Exception as e:
+            logger.warning("[RESOLVER] native resolver error for %s: %s", url, e)
+
     sidecar_url = f"{get_setting('SELENIUM_URL', 'http://localhost:4445')}/capture"
     # HTTP timeout = browser timeout + 30s buffer for startup/teardown
     http_timeout = timeout + 30
