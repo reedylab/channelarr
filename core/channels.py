@@ -839,6 +839,19 @@ def materialize_all_channels(channel_mgr, bump_mgr, media_lib):
 # ---------------------------------------------------------------------------
 
 CLEANUP_GRACE_HOURS = 2  # hours after event_end before auto-delete
+# Fallback lifespan for event channels the scraper couldn't stamp an event_end
+# on (no EPG data): drop this long after the event start (or channel creation)
+# so they still self-clean instead of lingering forever.
+EVENT_FALLBACK_HOURS = 10
+
+
+def _as_utc(dt):
+    """Coerce a possibly-naive datetime to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _manifest_is_dead(manifest_id: str) -> bool:
@@ -875,21 +888,31 @@ def cleanup_expired_event_channels():
         from core.models import Channel as ChannelRow, Manifest
         now = datetime.now(timezone.utc)
         grace_cutoff = now - timedelta(hours=CLEANUP_GRACE_HOURS)
+        fallback = timedelta(hours=EVENT_FALLBACK_HOURS)
         deleted = []
         with get_session() as session:
-            rows = (
-                session.query(ChannelRow)
-                .filter(ChannelRow.event_end.isnot(None))
-                .filter(ChannelRow.event_end < now)
-                .all()
-            )
+            # Scan all auto-cleanup-tagged channels; event_end may be null (no
+            # EPG), in which case a fallback window off event_start/created_at
+            # decides expiry — so we can't pre-filter on event_end in SQL.
+            rows = session.query(ChannelRow).all()
             for row in rows:
                 channel_tags = set(row.tags or [])
                 if not channel_tags.intersection(cleanup_tags):
                     continue
 
+                # Effective end: the EPG end if we have one, else a fallback
+                # window after the event start (or creation).
+                eff_end = _as_utc(row.event_end)
+                if eff_end is None:
+                    anchor = _as_utc(row.event_start or row.created_at)
+                    if anchor is None:
+                        continue
+                    eff_end = anchor + fallback
+                if eff_end >= now:
+                    continue  # not expired yet
+
                 # Past grace period — always delete
-                past_grace = row.event_end < grace_cutoff
+                past_grace = eff_end < grace_cutoff
 
                 # Within grace period — only delete if upstream is 404
                 if not past_grace:

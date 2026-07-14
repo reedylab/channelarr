@@ -63,9 +63,9 @@ class RemuxStream:
         # Some CDNs only serve clean (unscrambled) segment bytes to a session
         # that first hit the stream's *entry* URL (the short redirector the
         # player loads) — hitting the resolved master directly reads as a
-        # scraper. Derive that entry from the capture page URL so we can "bless"
-        # the session at startup and periodically.
-        self.entry_url = self._derive_entry_url(self.page_url)
+        # scraper. Read that entry out of the capture page so we can "bless" the
+        # session at startup and periodically.
+        self.entry_url = self._resolve_entry()
 
     def _load_context(self):
         try:
@@ -81,24 +81,51 @@ class RemuxStream:
         except Exception:
             pass
 
+    def _resolve_entry(self):
+        """Find the stream ENTRY redirector the player hits before the master —
+        hitting it blesses the session (hitting the master directly reads as a
+        scraper → scrambled bytes). Generic: reads the entry template out of the
+        capture page's own JS (24/7 pages and live-event pages point at
+        different entry hosts), following ONE hop through an event page's stream
+        source. Returns None if the page carries no such entry."""
+        if not self.page_url:
+            return None
+        try:
+            r = self.session.get(self.page_url, headers=self._headers(), timeout=12)
+            entry = self._extract_entry(r.text, r.url)
+            if entry:
+                return entry
+            # Event pages carry a streams array whose first source is itself a
+            # player page (which holds the entry). Hop to it once.
+            for m in re.finditer(r'''source:\s*["']([^"']+)["']''', r.text):
+                src = m.group(1)
+                if "streamid=" in src or "stream_id=" in src:
+                    try:
+                        r2 = self.session.get(urljoin(r.url, src), headers=self._headers(), timeout=12)
+                        e2 = self._extract_entry(r2.text, r2.url)
+                        if e2:
+                            return e2
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning("[REMUX] %s entry resolve failed: %s", self.channel_id, e)
+        return None
+
     @staticmethod
-    def _derive_entry_url(page_url):
-        """Entry redirector for pages of the form
-        ``https://HOST/247?streamid=X&proid=Y`` → ``https://247v2.HOST/?
-        stream_id=X&pro_id=Y&index.m3u8`` (host taken from page_url, not
-        hardcoded). Returns None for pages that don't match."""
-        if not page_url:
-            return None
+    def _extract_entry(html, base):
+        """Pull the entry URL out of a player page. Its JS holds a template like
+        ``https://<entry-host>/?stream_id=${..}&pro_id=${..}&index.m3u8``; the
+        stream_id/pro_id come from THIS page's own query string."""
         from urllib.parse import urlparse, parse_qs
-        u = urlparse(page_url)
-        if "/247" not in u.path:
+        m = re.search(r'''(https?://[^"'`\s?]+/)\?stream_id=\$\{''', html)
+        if not m:
             return None
-        q = parse_qs(u.query)
+        q = parse_qs(urlparse(base).query)
         sid = (q.get("streamid") or q.get("stream_id") or [None])[0]
-        pid = (q.get("proid") or q.get("pro_id") or ["sling"])[0]
+        pid = (q.get("proid") or q.get("pro_id") or [""])[0]
         if not sid:
             return None
-        return f"https://247v2.{u.netloc}/?stream_id={sid}&pro_id={pid}&index.m3u8"
+        return f"{m.group(1)}?stream_id={sid}&pro_id={pid}&index.m3u8"
 
     def _headers(self) -> dict:
         # Sec-Fetch-* is the browser-authenticity signal the CDN checks — without
