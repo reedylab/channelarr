@@ -589,11 +589,12 @@
               <label>Stream Mode</label>
               <select id="ch-resolved-encoder-mode">
                 <option value="proxy">Proxy (no re-encode, lossless)</option>
+                <option value="remux">Remux (no re-encode — for fMP4/CMAF + demuxed audio)</option>
                 <option value="single">Transcode — Single encoder (seamless)</option>
                 <option value="multi">Transcode — Multi encoder (robust)</option>
                 <option value="tab_proxy">Tab Proxy (persistent browser tab — for session-locked CDNs)</option>
               </select>
-              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks. Tab Proxy keeps a browser tab open to play streams whose CDN tokens can't be replayed outside the original session.</div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Remux is also lossless but repackages fMP4/CMAF and demuxed-audio streams (which Proxy can't carry) to MPEG-TS via FFmpeg <code>-c copy</code>. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks. Tab Proxy keeps a browser tab open to play streams whose CDN tokens can't be replayed outside the original session.</div>
             </div>
 
             <div id="ch-transcode-options" style="display:none">
