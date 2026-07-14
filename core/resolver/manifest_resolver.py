@@ -867,6 +867,12 @@ def _store_manifest(
             manifest.expires_at = expires_at
             manifest.last_refreshed_at = now
             manifest.cookies = filtered_cookies
+            # A successful re-resolve means the stream is live again — restore
+            # the active flag (mirrors the create branch). Without this, a
+            # manifest that ever went active=False stays excluded from the
+            # background refresh worker forever, so the channel only works on
+            # manual access and never gets kept warm.
+            manifest.active = True
             # Refresh variants for master playlists (drop old, insert new)
             if kind == "master":
                 session.query(Variant).filter_by(manifest_id=manifest.id).delete()
