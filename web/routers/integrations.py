@@ -26,6 +26,11 @@ class ManifoldConfig(BaseModel):
     auto_sync: bool = False
 
 
+class EpgPwConfig(BaseModel):
+    enabled: bool = False
+    refresh_hours: str = "12"
+
+
 @router.get("/integrations/status")
 def integrations_status():
     """Return all integration configs and connection status."""
@@ -46,7 +51,72 @@ def integrations_status():
             "auto_sync": s.get("MANIFOLD_AUTO_SYNC") == "true",
             "configured": bool(s.get("MANIFOLD_URL")),
         },
+        "epgpw": {
+            "enabled": s.get("EPGPW_ENABLED") == "true",
+            "refresh_hours": s.get("EPGPW_REFRESH_HOURS", "12"),
+            "configured": s.get("EPGPW_ENABLED") == "true",
+            **_epgpw_counts(),
+        },
     }
+
+
+def _epgpw_counts() -> dict:
+    """Mapped/unmapped/cached counts for the EPG.pw settings panel."""
+    try:
+        from core.database import get_session
+        from core.epgpw import eligible_channels
+        from core.models import EpgPwCache
+        with get_session() as session:
+            chans = eligible_channels(session)
+            mapped = sum(1 for c in chans if c.epg_pw_id)
+            cached = session.query(EpgPwCache).count()
+        return {"eligible": len(chans), "mapped": mapped,
+                "unmapped": len(chans) - mapped, "cached": cached}
+    except Exception as e:
+        logger.warning("[EPGPW] counts failed: %s", e)
+        return {"eligible": 0, "mapped": 0, "unmapped": 0, "cached": 0}
+
+
+@router.put("/integrations/epgpw/config")
+def epgpw_save_config(body: EpgPwConfig):
+    save_settings({
+        "EPGPW_ENABLED": "true" if body.enabled else "false",
+        "EPGPW_REFRESH_HOURS": str(body.refresh_hours or "12"),
+    })
+    return {"ok": True}
+
+
+@router.post("/integrations/epgpw/automap")
+def epgpw_automap(dry_run: bool = True):
+    """Match 24-7 resolved channels to epg.pw ids. dry_run=true reports only.
+    Never overwrites an existing mapping; unmatched channels stay unmapped."""
+    from core.epgpw import auto_map
+    try:
+        return auto_map(dry_run=dry_run)
+    except Exception as e:
+        logger.exception("[EPGPW] automap failed")
+        return {"ok": False, "error": str(e)}
+
+
+@router.post("/integrations/epgpw/refresh")
+def epgpw_refresh(force: bool = False):
+    """Fetch + cache guide data for mapped channels, then regenerate the XMLTV."""
+    from core.epgpw import refresh_cache
+    try:
+        res = refresh_cache(force=force)
+        shared_state_regenerate()
+        return {"ok": True, **res}
+    except Exception as e:
+        logger.exception("[EPGPW] refresh failed")
+        return {"ok": False, "error": str(e)}
+
+
+def shared_state_regenerate():
+    try:
+        from web import shared_state
+        shared_state.regenerate_m3u()
+    except Exception as e:
+        logger.warning("[EPGPW] regenerate after refresh failed: %s", e)
 
 
 @router.put("/integrations/jellyfin/config")

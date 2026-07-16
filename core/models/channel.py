@@ -80,6 +80,10 @@ class Channel(Base):
     event_start = Column(DateTime(timezone=True), nullable=True)
     event_end = Column(DateTime(timezone=True), nullable=True)
 
+    # epg.pw channel id supplying real guide data for a 24-7 resolved channel.
+    # NULL = unmapped; the XMLTV export falls back to placeholder blocks.
+    epg_pw_id = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

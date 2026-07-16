@@ -87,6 +87,14 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
 
     # Programme entries
     total_programmes = 0
+    # Cached epg.pw guides (empty dict when the integration is off/unmapped —
+    # every channel then keeps its placeholder blocks, as before).
+    epgpw_used = 0
+    epgpw_cache = {}
+    from core.config import get_setting as _get_setting
+    if (_get_setting("EPGPW_ENABLED", "false") or "false").lower() == "true":
+        from core.epgpw import load_cache
+        epgpw_cache = load_cache()
     for ch in channels:
         cid = ch["id"]
         # Resolved channels are pure live streams — no real schedule. Generate
@@ -102,9 +110,21 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
                     tv, cid, ch, now, horizon, base_url, ev_start, ev_end
                 )
             else:
-                total_programmes += _generate_placeholder_programmes(
-                    tv, cid, ch["name"], now, horizon, base_url, is_live=True
-                )
+                # 24-7 resolved channel: use real epg.pw guide data when this
+                # channel is mapped and cached, else fall back to placeholders.
+                n = 0
+                epg_id = ch.get("epg_pw_id")
+                if epg_id and epgpw_cache.get(epg_id):
+                    n = _generate_epgpw_programmes(
+                        tv, cid, ch["name"], epgpw_cache[epg_id], now, horizon, base_url
+                    )
+                    if n:
+                        epgpw_used += 1
+                if not n:
+                    n = _generate_placeholder_programmes(
+                        tv, cid, ch["name"], now, horizon, base_url, is_live=True
+                    )
+                total_programmes += n
             continue
 
         schedule = ch.get("materialized_schedule", [])
@@ -179,8 +199,8 @@ def generate_channelarr_xmltv(channels: list, output_path: str, base_url: str):
             pass
         raise
 
-    logging.info("[XMLTV] Generated %s: %d channels, %d programmes",
-                 output_path, len(channels), total_programmes)
+    logging.info("[XMLTV] Generated %s: %d channels, %d programmes (%d from epg.pw)",
+                 output_path, len(channels), total_programmes, epgpw_used)
 
 
 def _merge_bump_gaps(entries_iter):
@@ -260,6 +280,33 @@ def _iterate_schedule_window(schedule: list, epoch_str: str, cycle_dur: float,
                 "stop": projected_stop,
             }
         cycle_num += 1
+
+
+def _generate_epgpw_programmes(tv_element, channel_id: str, channel_name: str,
+                               xml: str, start: datetime, end: datetime,
+                               base_url: str) -> int:
+    """Emit real guide data from a cached epg.pw XMLTV document, re-tagged onto
+    our channel id. Returns 0 if nothing usable is in the window, which lets the
+    caller fall back to placeholder blocks rather than ship an empty channel."""
+    from core.epgpw import programmes_for
+    entries = programmes_for(xml, start, end)
+    if not entries:
+        return 0
+    count = 0
+    for e in entries:
+        prog = SubElement(tv_element, "programme", attrib={
+            "start": _xmltv_ts(e["start"]),
+            "stop": _xmltv_ts(e["stop"]),
+            "channel": channel_id,
+        })
+        SubElement(prog, "title", lang="en").text = e["title"]
+        if e.get("desc"):
+            SubElement(prog, "desc", lang="en").text = e["desc"]
+        if e.get("category"):
+            SubElement(prog, "category", lang="en").text = e["category"]
+        SubElement(prog, "icon", src=f"{base_url}/api/logo/{channel_id}")
+        count += 1
+    return count
 
 
 def _generate_placeholder_programmes(tv_element, channel_id: str, channel_name: str,

@@ -121,6 +121,11 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN event_end TIMESTAMPTZ"))
                     conn.commit()
                 logging.info("[DB] Added column channels.event_end")
+            if "epg_pw_id" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN epg_pw_id VARCHAR"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.epg_pw_id")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the
@@ -203,6 +208,23 @@ async def lifespan(app: FastAPI):
     from core.channels import cleanup_expired_event_channels
     add_job("event_cleanup", cleanup_expired_event_channels, seconds=60)
     logging.info("[CLEANUP] Scheduled event channel cleanup (60s interval)")
+
+    # epg.pw guide refresh — no-op unless the integration is enabled. Runs
+    # hourly; refresh_cache() itself skips ids fetched within EPGPW_REFRESH_HOURS.
+    def _epgpw_tick():
+        if (get_setting("EPGPW_ENABLED", "false") or "false").lower() != "true":
+            return
+        try:
+            from core.epgpw import refresh_cache
+            res = refresh_cache()
+            if res.get("fetched"):
+                from web import shared_state
+                shared_state.regenerate_m3u()
+        except Exception as e:
+            logging.warning("[EPGPW] refresh tick failed: %s", e)
+
+    add_job("epgpw_refresh", _epgpw_tick, seconds=3600, max_instances=1)
+    logging.info("[EPGPW] Scheduled guide refresh (hourly tick)")
 
     # JIT event resolver — drains scraped_events queue as kickoffs approach
     from core.event_resolver import resolve_due_events, expire_stale_events

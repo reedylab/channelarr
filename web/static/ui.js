@@ -1913,6 +1913,7 @@ function renderIntegrations() {
   if (!c) return;
   const jf = _integData.jellyfin || {};
   const mf = _integData.manifold || {};
+  const ep = _integData.epgpw || {};
 
   function badge(configured, label) {
     if (!configured) return `<span class="integ-badge integ-not-configured">Not Configured</span>`;
@@ -1933,6 +1934,13 @@ function renderIntegrations() {
         ${badge(mf.configured)}
       </div>
       <div class="integ-card-desc">Sync channelarr's M3U + EPG into manifold and trigger republish. Cascades to Jellyfin if manifold has auto-refresh enabled.</div>
+    </div>
+    <div class="integ-card" onclick="channelarr.openIntegModal('epgpw')">
+      <div class="integ-card-header">
+        <span class="integ-card-name">EPG.pw</span>
+        ${badge(ep.configured, `${ep.mapped || 0}/${ep.eligible || 0} mapped`)}
+      </div>
+      <div class="integ-card-desc">Free guide data for 24-7 resolved channels. Auto-maps channels to epg.pw by name; unmatched channels keep placeholder blocks.</div>
     </div>
   </div>`;
 }
@@ -2105,6 +2113,100 @@ channelarr.openIntegModal = function(type) {
         if (d.ok) res.innerHTML = '<span style="color:var(--ok)">Sync triggered — manifold will re-ingest + regenerate</span>';
         else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
       } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Sync failed</span>'; }
+    });
+
+  } else if (type === "epgpw") {
+    const ep = _integData.epgpw || {};
+    modal.innerHTML = `
+      <div class="modal-header"><h3>EPG.pw Integration</h3><button class="btn-close" onclick="document.getElementById('modal-overlay').classList.add('hidden')">&times;</button></div>
+      <div class="modal-body" style="padding:16px">
+        <div class="integ-modal-fields">
+          <div class="integ-toggle-row">
+            <label class="scraper-toggle"><input type="checkbox" id="integ-ep-enabled" ${ep.enabled ? "checked" : ""}><span class="slider"></span></label>
+            <span>Enable EPG.pw guide data</span>
+          </div>
+          <label>Refresh Interval (hours)<input type="text" id="integ-ep-hours" value="${esc(ep.refresh_hours || "12")}" placeholder="12"></label>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:8px">
+          Applies to <b>24-7 resolved channels only</b> — live-event channels keep their event programme.
+          Auto-map matches channel names to epg.pw's US catalog; anything it can't match confidently is
+          left unmapped and keeps its placeholder blocks (never a wrong guide).
+          Currently <b>${ep.mapped || 0}/${ep.eligible || 0}</b> mapped, ${ep.cached || 0} cached.
+        </div>
+        <div class="modal-actions" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary" id="integ-ep-save">Save</button>
+          <button class="btn" id="integ-ep-preview">Preview Auto-Map</button>
+          <button class="btn" id="integ-ep-apply">Apply Auto-Map</button>
+          <button class="btn" id="integ-ep-refresh">Refresh Guide Now</button>
+        </div>
+        <div id="integ-ep-result" style="margin-top:10px;font-size:12px"></div>
+      </div>`;
+
+    const _epSave = async () => fetch(`${API}/integrations/epgpw/config`, {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        enabled: $("#integ-ep-enabled").checked,
+        refresh_hours: $("#integ-ep-hours").value || "12",
+      }),
+    });
+
+    $("#integ-ep-save").addEventListener("click", async () => {
+      try {
+        if ((await (await _epSave()).json()).ok) { toast("success", "EPG.pw config saved"); loadIntegrations(); }
+        else toast("error", "Save failed");
+      } catch (e) { toast("error", "Save failed"); }
+    });
+
+    const renderMap = (d, applied) => {
+      const res = $("#integ-ep-result");
+      if (d.error) { res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`; return; }
+      const c = d.counts || {};
+      const rows = (d.matched || []).map(m =>
+        `<tr><td style="padding:2px 8px 2px 0">${esc(m.channel)}</td>
+             <td style="padding:2px 8px 2px 0;color:var(--muted)">${esc(m.epg_pw_name)}</td>
+             <td style="color:var(--ok)">${esc(m.how)}</td></tr>`).join("");
+      const un = (d.unmatched || []).map(u => esc(u.channel)).join(", ");
+      res.innerHTML = `
+        <div style="margin-bottom:6px">
+          <b style="color:var(--ok)">${c.matched || 0} matched</b> ·
+          <b>${c.unmatched || 0} no match</b> ·
+          ${c.already_mapped || 0} already mapped
+          ${applied ? '<span style="color:var(--ok)"> — applied</span>' : '<span class="muted"> — preview only, nothing saved</span>'}
+        </div>
+        <div style="max-height:220px;overflow:auto"><table style="font-size:11px">${rows}</table></div>
+        ${un ? `<div class="muted" style="margin-top:6px;font-size:11px"><b>No match</b> (keeping placeholders): ${un}</div>` : ""}`;
+    };
+
+    $("#integ-ep-preview").addEventListener("click", async () => {
+      $("#integ-ep-result").textContent = "Matching against epg.pw catalog...";
+      try {
+        const r = await fetch(`${API}/integrations/epgpw/automap?dry_run=true`, {method: "POST"});
+        renderMap(await r.json(), false);
+      } catch (e) { $("#integ-ep-result").innerHTML = '<span style="color:var(--danger)">Auto-map failed</span>'; }
+    });
+
+    $("#integ-ep-apply").addEventListener("click", async () => {
+      $("#integ-ep-result").textContent = "Applying mappings...";
+      try {
+        await _epSave();
+        const r = await fetch(`${API}/integrations/epgpw/automap?dry_run=false`, {method: "POST"});
+        renderMap(await r.json(), true);
+        loadIntegrations();
+      } catch (e) { $("#integ-ep-result").innerHTML = '<span style="color:var(--danger)">Apply failed</span>'; }
+    });
+
+    $("#integ-ep-refresh").addEventListener("click", async () => {
+      const res = $("#integ-ep-result");
+      res.textContent = "Fetching guide data from epg.pw...";
+      try {
+        await _epSave();
+        const r = await fetch(`${API}/integrations/epgpw/refresh?force=true`, {method: "POST"});
+        const d = await r.json();
+        if (d.ok) {
+          res.innerHTML = `<span style="color:var(--ok)">${d.fetched} fetched, ${d.still_fresh} already fresh, ${d.failed} failed — XMLTV regenerated</span>`;
+          loadIntegrations();
+        } else res.innerHTML = `<span style="color:var(--danger)">${esc(d.error)}</span>`;
+      } catch (e) { res.innerHTML = '<span style="color:var(--danger)">Refresh failed</span>'; }
     });
   }
 };

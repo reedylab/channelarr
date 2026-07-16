@@ -34,6 +34,10 @@ DEFAULTS = {
     "CHANNEL_TAG_CONFIG": '{"Events": {"auto_cleanup": true}, "24-7": {"auto_cleanup": false}}',
     # EPG display timezone (for event time formatting in descriptions)
     "EPG_TIMEZONE": "America/New_York",
+    # epg.pw integration — real guide data for mapped 24-7 resolved channels.
+    # Off by default; unmapped channels always keep placeholder blocks.
+    "EPGPW_ENABLED": "false",
+    "EPGPW_REFRESH_HOURS": "12",
     # Scraper plugin config (JSON string)
     "SCRAPER_CONFIG": '{}',
     # Event queue (JIT resolver) tunables

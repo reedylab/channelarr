@@ -52,6 +52,7 @@ def _row_to_dict(row, manifest=None) -> dict:
         "tags": getattr(row, "tags", None) or [],
         "event_start": row.event_start.isoformat() if getattr(row, "event_start", None) else None,
         "event_end": row.event_end.isoformat() if getattr(row, "event_end", None) else None,
+        "epg_pw_id": getattr(row, "epg_pw_id", None),
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
