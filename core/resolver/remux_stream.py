@@ -294,12 +294,12 @@ class RemuxStream:
         segment with -c copy (the proven-clean finite operation)."""
         vp = os.path.join(self.src_dir, "v.mp4")
         with open(vp, "wb") as f:
-            f.write(v_init + v_data)
+            f.write((v_init or b"") + v_data)
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", vp]
         if a_init is not None and a_data is not None:
             ap = os.path.join(self.src_dir, "a.mp4")
             with open(ap, "wb") as f:
-                f.write(a_init + a_data)
+                f.write((a_init or b"") + a_data)
             cmd += ["-i", ap, "-map", "0:v:0", "-map", "1:a:0"]
         else:
             cmd += ["-map", "0"]
