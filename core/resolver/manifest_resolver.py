@@ -50,7 +50,10 @@ pipeline_lock = threading.Lock()
 # (HTTP only) and uncapped, but heavy refreshes launch Chrome and chew RAM.
 # After a VPN rotation every session goes stale at once — without this cap a
 # single tick would queue 10+ Chrome captures back-to-back and OOM the box.
-HEAVY_REFRESH_BUDGET_PER_TICK = 3
+# Kept well under that danger zone even after the bump (was 3) — the real
+# fix for the backlog is the ORDER BY below (fair rotation through the
+# candidate pool), this just raises throughput a bit on top of that.
+HEAVY_REFRESH_BUDGET_PER_TICK = 5
 
 
 def _default_resolved_name(title: str | None, manifest_url: str, source_domain: str | None) -> str:
@@ -185,6 +188,7 @@ def refresh_due_manifests():
                     (Manifest.last_refreshed_at.is_(None)) |
                     (Manifest.last_refreshed_at < cooldown)
                 )
+                .order_by(Manifest.last_refreshed_at.asc().nulls_first())
                 .limit(5)
                 .all()
             )
@@ -203,6 +207,7 @@ def refresh_due_manifests():
                     (Manifest.last_refreshed_at.is_(None)) |
                     (Manifest.last_refreshed_at < cooldown)
                 )
+                .order_by(Manifest.last_refreshed_at.asc().nulls_first())
                 .limit(10)
                 .all()
             )

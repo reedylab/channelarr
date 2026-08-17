@@ -198,6 +198,18 @@ def _make_browser():
     except Exception:
         pass
 
+    # Explicitly enable the CDP Network domain. goog:loggingPrefs used to be
+    # enough on its own to get Network.* events into the performance log,
+    # but newer Chrome builds stopped implicitly turning the domain on for
+    # that path — without this call every capture sees perf-log entries
+    # (Page/Timeline) but zero Network.requestWillBeSent/responseReceived,
+    # so no manifest is ever found no matter how long we wait.
+    try:
+        result[0].execute_cdp_cmd("Network.enable", {})
+        logger.info("CDP Network domain enabled")
+    except Exception as e:
+        logger.warning("Failed to enable CDP Network domain: %s", e)
+
     # Warm the session before the first real capture. Without this, the very
     # first capture after Chrome starts reliably times out with zero Network
     # events — the perf-log subscription and TLS/DNS layers haven't been
