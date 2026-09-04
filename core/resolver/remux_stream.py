@@ -322,6 +322,30 @@ class RemuxStream:
             logging.warning("[REMUX] %s mux failed: %s", self.channel_id, e)
             return False
 
+    def _find_keyframe_pos(self, data: bytes) -> int | None:
+        """Byte offset of the first video keyframe packet within this raw
+        MPEG-TS chunk, or None if it has none. Plain-TS sources (no
+        EXT-X-MAP) arrive as arbitrary wall-clock slices of a continuous
+        broadcast — a keyframe can land anywhere inside a slice, not just at
+        its start, so this can't be answered by looking only at packet 0."""
+        probe_path = os.path.join(self.src_dir, "probe.ts")
+        try:
+            with open(probe_path, "wb") as f:
+                f.write(data)
+            r = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-f", "mpegts", "-select_streams", "v:0",
+                 "-show_entries", "packet=pos,flags", "-of", "csv=p=0", probe_path],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                return None
+            for line in r.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) >= 2 and "K" in parts[1]:
+                    return int(parts[0])
+        except Exception:
+            pass
+        return None
+
     def _run(self):
         vurl, aurl = self._resolve_inputs()
         v_init = a_init = None
@@ -332,6 +356,11 @@ class RemuxStream:
         out_segs: deque = deque()             # (name, dur) output window
         out_seq = 0
         target = 3.0
+        plain_ts = None                       # set once EXT-X-MAP presence is known
+        pend_v = bytearray()                  # accumulated plain-TS video, since last flush
+        pend_a = bytearray()
+        pend_dur = 0.0
+        MAX_PEND_DUR = 30.0                   # safety cap if a keyframe never turns up
 
         def _download_new(url, buf, dur_map, is_video):
             """Reload one rendition's playlist and download every NEW segment in
@@ -442,27 +471,75 @@ class RemuxStream:
 
             # Emit every buffered sequence whose (video, audio) pair is ready.
             while emit in vbuf and (aurl is None or emit in abuf) and not self._stop_event.is_set():
-                out_name = f"seg_{out_seq:05d}.ts"
-                out_path = os.path.join(self.hls_dir, out_name)
-                ok = self._mux_pair(v_init, vbuf.pop(emit),
-                                    a_init if aurl else None,
-                                    abuf.pop(emit, None) if aurl else None, out_path)
-                dur = adur.pop(emit, target)
+                v_data = vbuf.pop(emit)
+                a_data = abuf.pop(emit, None) if aurl else None
+                seg_dur = adur.pop(emit, target)
                 emit += 1
-                if not ok:
+
+                if plain_ts is None:
+                    plain_ts = v_init is None
+
+                def _flush(v_bytes, a_bytes, dur):
+                    nonlocal out_seq
+                    out_name = f"seg_{out_seq:05d}.ts"
+                    out_path = os.path.join(self.hls_dir, out_name)
+                    ok = self._mux_pair(v_init if not plain_ts else None, v_bytes,
+                                        (a_init if aurl else None) if not plain_ts else None,
+                                        a_bytes, out_path)
+                    if not ok:
+                        return
+                    out_segs.append((out_name, dur))
+                    out_seq += 1
+                    seq0 = out_seq - len(out_segs)
+                    while len(out_segs) > self.hls_list_size:
+                        old, _ = out_segs.popleft()
+                        try:
+                            os.remove(os.path.join(self.hls_dir, old))
+                        except OSError:
+                            pass
+                        seq0 += 1
+                    hdr_target = max((d for _, d in out_segs), default=target)
+                    self._write_output_playlist(out_segs, seq0, hdr_target)
+                    self._producing = True
+
+                if not plain_ts:
+                    # fMP4 fragments are independently decodable (each carries
+                    # its own moof) — flush immediately, one output per fragment.
+                    _flush(v_data, a_data, seg_dur)
                     continue
-                out_segs.append((out_name, dur))
-                out_seq += 1
-                seq0 = out_seq - len(out_segs)
-                while len(out_segs) > self.hls_list_size:
-                    old, _ = out_segs.popleft()
-                    try:
-                        os.remove(os.path.join(self.hls_dir, old))
-                    except OSError:
-                        pass
-                    seq0 += 1
-                self._write_output_playlist(out_segs, seq0, target)
-                self._producing = True
+
+                # Plain-TS source: buffer consecutive slices and cut a new
+                # output segment right at the next keyframe's byte offset —
+                # which can land anywhere inside a slice, not just at its
+                # start — so every segment we serve opens on a real IDR frame.
+                kf_pos = self._find_keyframe_pos(v_data)
+                if kf_pos is not None:
+                    # pend_dur > 0 means we're already mid-GOP on a real
+                    # keyframe-started buffer — the pre-keyframe bytes from
+                    # THIS chunk complete it. On cold start (pend_dur == 0)
+                    # there's no prior keyframe backing pend_v yet, so any
+                    # pre-keyframe bytes here are orphaned and get discarded
+                    # instead of flushed as a bogus 0-duration segment.
+                    if pend_dur > 0:
+                        pend_v += v_data[:kf_pos]
+                        _flush(bytes(pend_v), bytes(pend_a) if aurl else None, pend_dur)
+                    pend_v.clear(); pend_a.clear(); pend_dur = 0.0
+                    pend_v += v_data[kf_pos:]
+                    if aurl:
+                        pend_a += (a_data or b"")
+                    pend_dur += seg_dur
+                elif pend_dur >= MAX_PEND_DUR:
+                    _flush(bytes(pend_v), bytes(pend_a) if aurl else None, pend_dur)
+                    pend_v.clear(); pend_a.clear(); pend_dur = 0.0
+                    pend_v += v_data
+                    if aurl:
+                        pend_a += (a_data or b"")
+                    pend_dur += seg_dur
+                else:
+                    pend_v += v_data
+                    if aurl:
+                        pend_a += (a_data or b"")
+                    pend_dur += seg_dur
 
             # Drop anything stale we somehow skipped.
             for d in (vbuf, abuf, adur):
