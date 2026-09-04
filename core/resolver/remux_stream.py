@@ -295,7 +295,15 @@ class RemuxStream:
         vp = os.path.join(self.src_dir, "v.mp4")
         with open(vp, "wb") as f:
             f.write((v_init or b"") + v_data)
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", vp]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        if v_init is None:
+            # No EXT-X-MAP means this is a plain MPEG-TS segment, not fMP4.
+            # Some CDNs prefix segment bytes with a decoy image header before
+            # the real TS sync bytes — without an explicit format ffmpeg's
+            # auto-probe latches onto the decoy and the copy-mux emits no
+            # real video/audio track.
+            cmd += ["-f", "mpegts"]
+        cmd += ["-i", vp]
         if a_init is not None and a_data is not None:
             ap = os.path.join(self.src_dir, "a.mp4")
             with open(ap, "wb") as f:

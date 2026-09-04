@@ -629,7 +629,12 @@ def _decode_body(result):
 
 
 _health_failures = 0
-_MAX_HEALTH_FAILURES = 12  # 12 failures × 30s = 6 min stuck → self-kill
+# channelarr's manifest_resolver runs up to HEAVY_REFRESH_BUDGET_PER_TICK (5)
+# heavy captures back-to-back through this single-threaded sidecar per tick,
+# each up to a 105s deadline — a legitimate ~525s (8.75min) lock hold with no
+# true hang. 24 failures × 30s = 12min gives that headroom; a true hang (stuck
+# browser.get/zombie Chrome) still gets caught, just later.
+_MAX_HEALTH_FAILURES = 24  # 24 failures × 30s = 12 min stuck → self-kill
 # Normal 90s captures hold the lock for ~3 health checks. Only a true
 # hang (browser.get stuck, Chrome zombie) should exceed 6 minutes.
 
