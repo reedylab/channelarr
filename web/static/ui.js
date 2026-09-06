@@ -546,6 +546,7 @@ function openEditor(ch) {
     // Event times — convert ISO to datetime-local format (YYYY-MM-DDTHH:MM)
     $("#ch-event-start").value = ch.event_start ? ch.event_start.slice(0, 16) : "";
     $("#ch-event-end").value = ch.event_end ? ch.event_end.slice(0, 16) : "";
+    renderFallbackSources(ch);
   }
 
   const bc = ch ? (ch.bump_config || {}) : {};
@@ -600,6 +601,121 @@ function closeEditor() {
   editingChannel = null;
   editorItems = [];
 }
+
+// ── Fallback sources (resolved channels) ────────────────────────────────
+// Chain edits apply immediately via their own endpoints — independent of
+// the modal's main Save button — so the channel stays correct even if the
+// rest of the edit is abandoned.
+
+function renderFallbackSources(ch) {
+  const list = $("#ch-fallback-list");
+  const sources = ch.fallback_sources || [];
+  if (!sources.length) {
+    list.innerHTML = '<span class="muted">No fallback sources.</span>';
+  } else {
+    list.innerHTML = sources.map((s, i) => {
+      const label = esc(s.title || s.source_domain || s.manifest_id);
+      let expiryHint = "";
+      if (s.expires_at) {
+        const mins = Math.round((new Date(s.expires_at).getTime() - Date.now()) / 60000);
+        expiryHint = mins > 0
+          ? `<span class="muted" style="font-size:11px"> · refreshes in ${mins}m</span>`
+          : '<span class="muted" style="font-size:11px"> · refresh overdue</span>';
+      }
+      const upBtn = `<button type="button" class="btn btn-sm" data-fb-up="${i}" ${i === 0 ? "disabled" : ""} title="Move up">&uarr;</button>`;
+      const downBtn = `<button type="button" class="btn btn-sm" data-fb-down="${i}" ${i === sources.length - 1 ? "disabled" : ""} title="Move down">&darr;</button>`;
+      const rmBtn = `<button type="button" class="btn btn-sm-danger" data-fb-remove="${esc(s.manifest_id)}" title="Remove">&times;</button>`;
+      return `<div class="fallback-row" style="display:flex;align-items:center;gap:6px;padding:3px 0">
+        <span style="flex:1">${i + 1}. ${label}${expiryHint}</span>
+        ${upBtn} ${downBtn} ${rmBtn}
+      </div>`;
+    }).join("");
+  }
+
+  list.querySelectorAll("[data-fb-remove]").forEach(btn => {
+    btn.addEventListener("click", () => removeFallbackSource(btn.dataset.fbRemove));
+  });
+  list.querySelectorAll("[data-fb-up]").forEach(btn => {
+    btn.addEventListener("click", () => reorderFallbackSource(parseInt(btn.dataset.fbUp), -1));
+  });
+  list.querySelectorAll("[data-fb-down]").forEach(btn => {
+    btn.addEventListener("click", () => reorderFallbackSource(parseInt(btn.dataset.fbDown), 1));
+  });
+
+  loadFallbackAddOptions(ch);
+}
+
+async function loadFallbackAddOptions(ch) {
+  const sel = $("#ch-fallback-add-select");
+  sel.innerHTML = '<option value="">Loading library…</option>';
+  try {
+    const r = await fetch(`${API}/resolve/channels`);
+    const j = await r.json();
+    const exclude = new Set([ch.manifest_id, ...(ch.fallback_sources || []).map(s => s.manifest_id)]);
+    const options = (j.results || []).filter(m => m.manifest_id && !exclude.has(m.manifest_id));
+    sel.innerHTML = '<option value="">Select a manifest to add…</option>' + options.map(m =>
+      `<option value="${esc(m.manifest_id)}">${esc(m.title || "(untitled)")} — ${esc(m.manifest_url || m.url || "")}</option>`
+    ).join("");
+  } catch (e) {
+    sel.innerHTML = '<option value="">Failed to load library</option>';
+  }
+}
+
+async function refreshFallbackSources() {
+  if (!editingChannel) return;
+  try {
+    const r = await fetch(`${API}/channels/${editingChannel.id}`);
+    const ch = await r.json();
+    editingChannel = ch;
+    renderFallbackSources(ch);
+  } catch (e) { toast("error", "Failed to refresh fallback sources"); }
+}
+
+async function removeFallbackSource(manifestId) {
+  if (!editingChannel) return;
+  try {
+    const r = await fetch(`${API}/channels/${editingChannel.id}/fallback-sources/${manifestId}`, { method: "DELETE" });
+    if (r.ok) { toast("success", "Removed fallback source"); refreshFallbackSources(); }
+    else { const j = await r.json(); toast("error", j.error || "Remove failed"); }
+  } catch (e) { toast("error", "Remove failed"); }
+}
+
+async function reorderFallbackSource(index, delta) {
+  if (!editingChannel) return;
+  const sources = editingChannel.fallback_sources || [];
+  const target = index + delta;
+  if (target < 0 || target >= sources.length) return;
+  const ids = sources.map(s => s.manifest_id);
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  try {
+    const r = await fetch(`${API}/channels/${editingChannel.id}/fallback-sources`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest_ids: ids }),
+    });
+    if (r.ok) refreshFallbackSources();
+    else { const j = await r.json(); toast("error", j.error || "Reorder failed"); }
+  } catch (e) { toast("error", "Reorder failed"); }
+}
+
+$("#ch-fallback-add-btn").addEventListener("click", async () => {
+  if (!editingChannel) return;
+  const sel = $("#ch-fallback-add-select");
+  const manifestId = sel.value;
+  if (!manifestId) return;
+  const btn = $("#ch-fallback-add-btn");
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${API}/channels/${editingChannel.id}/fallback-sources`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest_id: manifestId }),
+    });
+    if (r.ok) { toast("success", "Added fallback source"); refreshFallbackSources(); }
+    else { const j = await r.json(); toast("error", j.error || "Add failed"); }
+  } catch (e) { toast("error", "Add failed"); }
+  btn.disabled = false;
+});
 
 // Logo upload handler
 $("#ch-logo-input").addEventListener("change", async (e) => {

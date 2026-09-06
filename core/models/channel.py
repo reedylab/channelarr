@@ -53,6 +53,12 @@ class Channel(Base):
         nullable=True,
     )
 
+    # Ordered list of additional manifest ids to try, in order, if manifest_id
+    # fails at stream-start (see web/routers/hls.py::_start_from_schedule).
+    # Purely additive — manifest_id stays the primary/preferred source and
+    # every existing code path that reads manifest_id is unaffected.
+    fallback_manifest_ids = Column(JSONB, default=list, nullable=False)
+
     # B6: when true on a resolved channel, the upstream HLS goes through a
     # full transcode pipeline (same as scheduled channels). Bumps from the
     # channel's bump_config get spliced into ad-break gaps detected via

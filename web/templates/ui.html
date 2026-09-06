@@ -573,6 +573,17 @@
               <label>Source URL</label>
               <input type="text" id="ch-resolved-url" readonly />
             </div>
+
+            <div class="setting-field" style="margin-top:10px">
+              <label>Fallback Sources</label>
+              <div id="ch-fallback-list" class="muted" style="font-size:12px">No fallback sources.</div>
+              <div style="display:flex;gap:8px;margin-top:6px">
+                <select id="ch-fallback-add-select" style="flex:1"><option value="">Select a manifest to add…</option></select>
+                <button type="button" class="btn btn-sm" id="ch-fallback-add-btn">+ Add</button>
+              </div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Tried in order if the primary source fails at stream start. Resolve a new URL in the Manifest Library tab first, then pick it here.</div>
+            </div>
+
             <div style="display:flex;gap:12px;margin-top:10px">
               <div class="setting-field" style="flex:1">
                 <label>Event Start</label>

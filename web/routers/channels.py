@@ -203,6 +203,67 @@ def api_delete_channel(channel_id: str):
     return {"status": "deleted"}
 
 
+def _require_resolved(channel_id: str):
+    """Shared guard for the fallback-sources endpoints below. Returns the
+    channel dict, or a JSONResponse error to return as-is."""
+    existing = shared_state.channel_mgr.get_channel(channel_id)
+    if not existing:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if existing.get("type") != "resolved":
+        return JSONResponse({"error": "Fallback sources only apply to resolved channels"}, status_code=400)
+    return existing
+
+
+@router.post("/channels/{channel_id}/fallback-sources")
+async def api_add_fallback_source(channel_id: str, request: Request):
+    """Append an already-resolved manifest to a channel's fallback chain.
+
+    To add a brand-new source, resolve it first via the existing POST
+    /resolve flow (poll /resolve/status for last_manifest_id) and pass that
+    id here — this endpoint doesn't itself drive the sidecar, matching how
+    the manifest library / channel-creation flow already separates
+    "resolve a URL" from "attach a manifest" as two steps.
+    """
+    data = await request.json()
+    manifest_id = data.get("manifest_id")
+    if not manifest_id:
+        return JSONResponse({"error": "manifest_id required"}, status_code=400)
+    guard = _require_resolved(channel_id)
+    if isinstance(guard, JSONResponse):
+        return guard
+    ch = shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id)
+    if not ch:
+        return JSONResponse({"error": "Manifest not found"}, status_code=404)
+    return _enrich(ch)
+
+
+@router.delete("/channels/{channel_id}/fallback-sources/{manifest_id}")
+def api_remove_fallback_source(channel_id: str, manifest_id: str):
+    guard = _require_resolved(channel_id)
+    if isinstance(guard, JSONResponse):
+        return guard
+    ch = shared_state.channel_mgr.remove_fallback_source(channel_id, manifest_id)
+    if not ch:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return _enrich(ch)
+
+
+@router.put("/channels/{channel_id}/fallback-sources")
+async def api_set_fallback_sources(channel_id: str, request: Request):
+    """Bulk-replace the fallback chain — used by the UI's reorder control."""
+    data = await request.json()
+    manifest_ids = data.get("manifest_ids")
+    if not isinstance(manifest_ids, list):
+        return JSONResponse({"error": "manifest_ids must be a list"}, status_code=400)
+    guard = _require_resolved(channel_id)
+    if isinstance(guard, JSONResponse):
+        return guard
+    ch = shared_state.channel_mgr.set_fallback_sources(channel_id, manifest_ids)
+    if not ch:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return _enrich(ch)
+
+
 @router.get("/channel-tags")
 def api_channel_tags():
     """Return all known tags (in-use + configured) and tag config."""

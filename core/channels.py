@@ -24,13 +24,18 @@ CHANNELS_FILE = os.getenv("CHANNELS_FILE", "/app/data/channels.json")
 # (so resolver features go offline gracefully but local/YT channels keep
 # working).
 
-def _row_to_dict(row, manifest=None) -> dict:
+def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> dict:
     """Convert a Channel SQLAlchemy row to the dict shape callers expect.
 
     Both scheduled and resolved channels return the same top-level shape,
     differentiated by the `type` field. Resolved channels include manifest
     info (manifest_id, manifest_url, source_domain, expires_at) so the
     frontend can render them and route to the right stream URL.
+
+    `fallback_manifests` is an optional {manifest_id: Manifest row} map
+    (bulk-loaded by the caller) used to enrich `fallback_sources` for
+    display — callers that don't need the enrichment can omit it and just
+    get `fallback_manifest_ids` back.
     """
     base = {
         "id": row.id,
@@ -69,6 +74,21 @@ def _row_to_dict(row, manifest=None) -> dict:
             base["manifest_url"] = None
             base["source_domain"] = None
             base["expires_at"] = None
+
+        fb_ids = list(getattr(row, "fallback_manifest_ids", None) or [])
+        base["fallback_manifest_ids"] = fb_ids
+        fb_map = fallback_manifests or {}
+        base["fallback_sources"] = [
+            {
+                "manifest_id": mid,
+                "manifest_url": fb_map[mid].url if mid in fb_map else None,
+                "source_domain": fb_map[mid].source_domain if mid in fb_map else None,
+                "title": fb_map[mid].title if mid in fb_map else None,
+                "expires_at": (fb_map[mid].expires_at.isoformat()
+                               if mid in fb_map and fb_map[mid].expires_at else None),
+            }
+            for mid in fb_ids
+        ]
     return base
 
 
@@ -80,6 +100,7 @@ def _db_list_all() -> list:
     """
     from core.database import get_session
     from core.models import Channel as ChannelRow
+    from core.models.manifest import Manifest
     from sqlalchemy.orm import joinedload
 
     with get_session() as session:
@@ -88,13 +109,19 @@ def _db_list_all() -> list:
             .options(joinedload(ChannelRow.manifest))
             .all()
         )
+        fb_ids = {mid for r in rows for mid in (r.fallback_manifest_ids or [])}
+        fb_map = {}
+        if fb_ids:
+            fb_map = {m.id: m for m in
+                      session.query(Manifest).filter(Manifest.id.in_(fb_ids)).all()}
         # Materialize before session closes
-        return [_row_to_dict(r, r.manifest) for r in rows]
+        return [_row_to_dict(r, r.manifest, fb_map) for r in rows]
 
 
 def _db_get_one(channel_id: str) -> dict | None:
     from core.database import get_session
     from core.models import Channel as ChannelRow
+    from core.models.manifest import Manifest
     from sqlalchemy.orm import joinedload
 
     with get_session() as session:
@@ -106,7 +133,12 @@ def _db_get_one(channel_id: str) -> dict | None:
         )
         if row is None:
             return None
-        return _row_to_dict(row, row.manifest)
+        fb_ids = row.fallback_manifest_ids or []
+        fb_map = {}
+        if fb_ids:
+            fb_map = {m.id: m for m in
+                      session.query(Manifest).filter(Manifest.id.in_(fb_ids)).all()}
+        return _row_to_dict(row, row.manifest, fb_map)
 
 
 def _db_upsert(channel: dict):
@@ -449,6 +481,75 @@ class ChannelManager:
         except Exception as e:
             logging.error("[CHANNELS] Resolved update failed for %s: %s", channel_id, e)
             return None
+        return self.get_channel(channel_id)
+
+    def add_fallback_source(self, channel_id: str, manifest_id: str) -> dict | None:
+        """Append a manifest to a resolved channel's fallback chain.
+
+        No-op (not an error) if the manifest is already the primary or
+        already in the chain — keeps the endpoint idempotent. Returns the
+        updated channel dict, or None if the channel doesn't exist / isn't
+        resolved / the manifest doesn't exist.
+        """
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+        from core.models.manifest import Manifest
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel_id).first()
+            if row is None or row.type != "resolved":
+                return None
+            if session.query(Manifest.id).filter_by(id=manifest_id).first() is None:
+                return None
+            chain = list(row.fallback_manifest_ids or [])
+            if manifest_id != row.manifest_id and manifest_id not in chain:
+                chain.append(manifest_id)
+                row.fallback_manifest_ids = chain
+        logging.info("[CHANNELS] Added fallback source %s to channel %s", manifest_id, channel_id)
+        return self.get_channel(channel_id)
+
+    def remove_fallback_source(self, channel_id: str, manifest_id: str) -> dict | None:
+        """Remove one manifest from a resolved channel's fallback chain.
+
+        Does not delete the underlying Manifest row — manifests are a shared
+        library, not owned by any one channel's chain.
+        """
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel_id).first()
+            if row is None or row.type != "resolved":
+                return None
+            chain = [m for m in (row.fallback_manifest_ids or []) if m != manifest_id]
+            row.fallback_manifest_ids = chain
+        logging.info("[CHANNELS] Removed fallback source %s from channel %s", manifest_id, channel_id)
+        return self.get_channel(channel_id)
+
+    def set_fallback_sources(self, channel_id: str, manifest_ids: list) -> dict | None:
+        """Replace a resolved channel's whole fallback chain at once (bulk
+        reorder). Silently drops the primary manifest_id and any ids that
+        don't correspond to a real Manifest row, and de-dupes."""
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+        from core.models.manifest import Manifest
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel_id).first()
+            if row is None or row.type != "resolved":
+                return None
+            candidates = [m for m in (manifest_ids or []) if m != row.manifest_id]
+            valid_ids = {m.id for m in
+                         session.query(Manifest.id).filter(Manifest.id.in_(candidates)).all()} \
+                if candidates else set()
+            seen = set()
+            chain = []
+            for mid in candidates:
+                if mid in valid_ids and mid not in seen:
+                    chain.append(mid)
+                    seen.add(mid)
+            row.fallback_manifest_ids = chain
+        logging.info("[CHANNELS] Set fallback chain for channel %s: %s", channel_id, chain)
         return self.get_channel(channel_id)
 
     def delete_channel(self, channel_id: str) -> bool:

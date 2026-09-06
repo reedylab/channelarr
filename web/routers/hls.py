@@ -25,43 +25,96 @@ def _get_boot_lock(channel_id):
         return _boot_locks[channel_id]
 
 
+def _is_expired(expires_at) -> bool:
+    if not expires_at:
+        return False
+    try:
+        from datetime import datetime, timezone
+        dt = (datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+              if isinstance(expires_at, str) else expires_at)
+        return dt <= datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _reload_manifest_url(manifest_id):
+    from core.database import get_session
+    from core.models.manifest import Manifest
+    with get_session() as session:
+        row = session.query(Manifest.url).filter_by(id=manifest_id).first()
+        return row[0] if row else None
+
+
+def _pick_working_manifest(ch):
+    """Walk [primary] + fallback_sources in order, returning the first
+    candidate that looks usable as (manifest_id, manifest_url), or
+    (None, None) if the channel has no primary manifest at all.
+
+    A candidate whose stored expires_at hasn't passed is trusted as-is —
+    same as everywhere else expiry is checked in this app — costing nothing
+    extra on the common healthy-primary path. An expired candidate gets one
+    cheap light_refresh_manifest attempt (HTTP-only, no browser) before
+    being skipped for the next candidate in the chain.
+
+    If every candidate is exhausted, falls back to today's exact pre-chain
+    behavior: heavy-refresh the primary via the sidecar and use it
+    best-effort, so a channel with no working fallback is no worse off than
+    before this existed.
+    """
+    from core.resolver.manifest_resolver import ManifestResolverService
+
+    primary_id = ch.get("manifest_id")
+    candidates = []
+    if primary_id:
+        candidates.append({"manifest_id": primary_id, "manifest_url": ch.get("manifest_url"),
+                            "expires_at": ch.get("expires_at")})
+    candidates.extend(ch.get("fallback_sources") or [])
+
+    for i, cand in enumerate(candidates):
+        mid, murl = cand.get("manifest_id"), cand.get("manifest_url")
+        if not mid or not murl:
+            continue
+        if not _is_expired(cand.get("expires_at")):
+            if i > 0:
+                logging.info("[HLS] %s: using fallback source #%d (%s)", ch.get("id"), i, mid)
+            return mid, murl
+        try:
+            if ManifestResolverService.light_refresh_manifest(mid).get("ok"):
+                fresh = _reload_manifest_url(mid)
+                if fresh:
+                    logging.info("[HLS] %s: light-refreshed %s candidate #%d",
+                                 ch.get("id"), "primary" if i == 0 else "fallback", i)
+                    return mid, fresh
+        except Exception as e:
+            logging.warning("[HLS] light refresh failed for candidate %s: %s", mid, e)
+
+    if not primary_id:
+        return None, None
+
+    # Whole chain exhausted — heavy-refresh the primary (sidecar/browser) and
+    # use it best-effort, matching pre-chain behavior exactly.
+    logging.info("[HLS] %s: all %d candidate(s) failed light refresh, heavy-refreshing primary %s",
+                 ch.get("id"), len(candidates), primary_id)
+    try:
+        ManifestResolverService.refresh_manifest(primary_id)
+        fresh = _reload_manifest_url(primary_id)
+        if fresh:
+            return primary_id, fresh
+    except Exception as e:
+        logging.warning("[HLS] Refresh before start failed for %s: %s", primary_id, e)
+    return primary_id, ch.get("manifest_url")
+
+
 def _start_from_schedule(channel_id):
     ch = shared_state.channel_mgr.get_channel(channel_id)
     if not ch:
         return False, "Channel not found"
 
     if ch.get("type") == "resolved":
-        manifest_id = ch.get("manifest_id")
-        manifest_url = ch.get("manifest_url")
+        manifest_id, manifest_url = _pick_working_manifest(ch)
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
         encoder_mode = ch.get("encoder_mode", "proxy")
-
-        # Cold-start freshness check: if the stored manifest is expired (DAI
-        # tokens typically last ~30 min and the demand-driven refresh worker
-        # only touches manifests accessed within the last 10 min, so an idle
-        # channel rots), re-capture synchronously before handing the URL off
-        # to the proxy. Without this the proxy silently polls a dead URL and
-        # never writes a playlist, Jellyfin gets 503s, ffmpeg exits code 8.
-        _expires = ch.get("expires_at")
-        expired = False
-        if _expires:
-            try:
-                from datetime import datetime, timezone
-                _dt = datetime.fromisoformat(_expires.replace("Z", "+00:00")) if isinstance(_expires, str) else _expires
-                expired = _dt <= datetime.now(timezone.utc)
-            except Exception:
-                pass
-        if expired:
-            logging.info("[HLS] Manifest %s expired, refreshing before stream start", manifest_id)
-            try:
-                from core.resolver.manifest_resolver import ManifestResolverService
-                ManifestResolverService.refresh_manifest(manifest_id)
-                # Re-read the channel so we pick up the refreshed manifest_url
-                ch2 = shared_state.channel_mgr.get_channel(channel_id) or {}
-                manifest_url = ch2.get("manifest_url") or manifest_url
-            except Exception as e:
-                logging.warning("[HLS] Refresh before start failed for %s: %s", manifest_id, e)
 
         # Proxy mode — download segments with auth, serve locally. No encode.
         if encoder_mode == "proxy":
