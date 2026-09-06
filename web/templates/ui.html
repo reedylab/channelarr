@@ -579,9 +579,16 @@
               <div id="ch-fallback-list" class="muted" style="font-size:12px">No fallback sources.</div>
               <div style="display:flex;gap:8px;margin-top:6px">
                 <select id="ch-fallback-add-select" style="flex:1"><option value="">Select a manifest to add…</option></select>
+                <select id="ch-fallback-add-mode" title="Stream mode for this fallback (leave as-is to match the primary's mode above)">
+                  <option value="">Mode: same as primary</option>
+                  <option value="proxy">Mode: Proxy</option>
+                  <option value="remux">Mode: Remux</option>
+                  <option value="single">Mode: Transcode (single)</option>
+                  <option value="multi">Mode: Transcode (multi)</option>
+                </select>
                 <button type="button" class="btn btn-sm" id="ch-fallback-add-btn">+ Add</button>
               </div>
-              <div class="muted" style="margin-top:4px;font-size:11px">Tried in order if the primary source fails at stream start. Resolve a new URL in the Manifest Library tab first, then pick it here.</div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Tried in order if the primary source fails at stream start. Resolve a new URL in the Manifest Library tab first, then pick it here. A fallback can use a different stream mode than the primary if its source needs it.</div>
             </div>
 
             <div style="display:flex;gap:12px;margin-top:10px">

@@ -47,8 +47,13 @@ def _reload_manifest_url(manifest_id):
 
 def _pick_working_manifest(ch):
     """Walk [primary] + fallback_sources in order, returning the first
-    candidate that looks usable as (manifest_id, manifest_url), or
-    (None, None) if the channel has no primary manifest at all.
+    candidate that looks usable as (manifest_id, manifest_url,
+    encoder_mode), or (None, None, None) if the channel has no primary
+    manifest at all. `encoder_mode` is the channel's own mode for the
+    primary, or a fallback's override from fallback_encoder_modes if it has
+    one (a source needing different serving behavior than the primary —
+    e.g. a plain-TS fallback source under an otherwise remux-mode primary),
+    else it also inherits the channel's mode.
 
     A candidate whose stored expires_at hasn't passed is trusted as-is —
     same as everywhere else expiry is checked in this app — costing nothing
@@ -64,6 +69,8 @@ def _pick_working_manifest(ch):
     from core.resolver.manifest_resolver import ManifestResolverService
 
     primary_id = ch.get("manifest_id")
+    default_mode = ch.get("encoder_mode", "proxy")
+    fb_modes = ch.get("fallback_encoder_modes") or {}
     candidates = []
     if primary_id:
         candidates.append({"manifest_id": primary_id, "manifest_url": ch.get("manifest_url"),
@@ -74,22 +81,24 @@ def _pick_working_manifest(ch):
         mid, murl = cand.get("manifest_id"), cand.get("manifest_url")
         if not mid or not murl:
             continue
+        mode = fb_modes.get(mid, default_mode) if i > 0 else default_mode
         if not _is_expired(cand.get("expires_at")):
             if i > 0:
-                logging.info("[HLS] %s: using fallback source #%d (%s)", ch.get("id"), i, mid)
-            return mid, murl
+                logging.info("[HLS] %s: using fallback source #%d (%s, encoder_mode=%s)",
+                             ch.get("id"), i, mid, mode)
+            return mid, murl, mode
         try:
             if ManifestResolverService.light_refresh_manifest(mid).get("ok"):
                 fresh = _reload_manifest_url(mid)
                 if fresh:
                     logging.info("[HLS] %s: light-refreshed %s candidate #%d",
                                  ch.get("id"), "primary" if i == 0 else "fallback", i)
-                    return mid, fresh
+                    return mid, fresh, mode
         except Exception as e:
             logging.warning("[HLS] light refresh failed for candidate %s: %s", mid, e)
 
     if not primary_id:
-        return None, None
+        return None, None, None
 
     # Whole chain exhausted — heavy-refresh the primary (sidecar/browser) and
     # use it best-effort, matching pre-chain behavior exactly.
@@ -99,10 +108,10 @@ def _pick_working_manifest(ch):
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
         if fresh:
-            return primary_id, fresh
+            return primary_id, fresh, default_mode
     except Exception as e:
         logging.warning("[HLS] Refresh before start failed for %s: %s", primary_id, e)
-    return primary_id, ch.get("manifest_url")
+    return primary_id, ch.get("manifest_url"), default_mode
 
 
 def _start_from_schedule(channel_id):
@@ -111,10 +120,9 @@ def _start_from_schedule(channel_id):
         return False, "Channel not found"
 
     if ch.get("type") == "resolved":
-        manifest_id, manifest_url = _pick_working_manifest(ch)
+        manifest_id, manifest_url, encoder_mode = _pick_working_manifest(ch)
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
-        encoder_mode = ch.get("encoder_mode", "proxy")
 
         # Proxy mode — download segments with auth, serve locally. No encode.
         if encoder_mode == "proxy":

@@ -59,6 +59,14 @@ class Channel(Base):
     # every existing code path that reads manifest_id is unaffected.
     fallback_manifest_ids = Column(JSONB, default=list, nullable=False)
 
+    # Optional {manifest_id: encoder_mode} override map for fallback
+    # candidates whose source needs a different serving mode than the
+    # channel's own `encoder_mode` (e.g. a remux-mode primary source with a
+    # plain-self-contained-TS fallback source that's happier under proxy).
+    # A candidate with no entry here inherits `encoder_mode` as before. The
+    # primary manifest_id is never looked up in this map.
+    fallback_encoder_modes = Column(JSONB, default=dict, nullable=False)
+
     # B6: when true on a resolved channel, the upstream HLS goes through a
     # full transcode pipeline (same as scheduled channels). Bumps from the
     # channel's bump_config get spliced into ad-break gaps detected via
