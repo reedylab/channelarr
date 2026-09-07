@@ -452,15 +452,34 @@ class HlsPlaylistSource(SegmentSource):
 # ("hit a token endpoint, build a CDN URL, read continuously"); these are the
 # only bits that differ per site. Keyed by Manifest.source_domain. A second
 # site with the same token-API shape is a new entry here, not a new class.
-RELAY_SOURCE_CONFIGS = {
-    "epicsports-tv.com": {
-        "decode_url_template": "https://epicsports-tv.com/decode.php?id={stream_id}",
-        "referer_template": "https://epicsports-tv.com/eu.php?id={stream_id}",
-        "cdn_url_template": "https://uv.dreamstream.cc/{token}/{code}/{stream_id}/webm/?t={ts_ms}",
-        # Player JS refreshes every 295s; reconnect a bit ahead of that.
-        "refresh_interval_seconds": 250.0,
-    },
-}
+#
+# Site-specific values live in the optional gitignored
+# scrapers/_relay_source_configs.py (same pattern as _native_resolvers.py in
+# manifest_resolver.py) so no target hosts live in tracked code. Loaded once,
+# cached; absent file just means no relay sources are configured.
+_relay_configs_mod = False  # False = not yet looked up; None = absent; else module
+
+
+def _relay_source_configs() -> dict:
+    global _relay_configs_mod
+    if _relay_configs_mod is False:
+        _relay_configs_mod = None
+        try:
+            import importlib.util
+            path = os.path.join(os.getenv("SCRAPERS_DIR", "/app/scrapers"),
+                                "_relay_source_configs.py")
+            if os.path.isfile(path):
+                spec = importlib.util.spec_from_file_location("_relay_source_configs", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _relay_configs_mod = mod
+        except Exception as e:
+            logging.warning("[RELAY] site config load failed: %s", e)
+    return getattr(_relay_configs_mod, "RELAY_SOURCE_CONFIGS", {}) if _relay_configs_mod else {}
+
+
+def get_relay_source_config(source_domain: str) -> Optional[dict]:
+    return _relay_source_configs().get(source_domain)
 
 
 # WebM Cluster element ID (EBML) — marks the start of the first Cluster,
@@ -469,14 +488,14 @@ _WEBM_CLUSTER_ID = bytes.fromhex("1F43B675")
 
 
 class ContinuousRelaySource(SegmentSource):
-    """Token-gated continuous WebM relay (e.g. epicsports-tv.com).
+    """Token-gated continuous WebM relay — for sources with no HLS playlist
+    at all.
 
-    No HLS playlist upstream at all: a decode endpoint hands out a
-    short-lived (token, code) pair, which plugs into a CDN URL template
-    serving one uninterrupted VP8/Opus WebM byte stream. The token expires
-    (~295s observed) well before any single HTTP connection would naturally
-    end, so this reconnects with a fresh token on its own clock, comfortably
-    inside that window.
+    A decode endpoint hands out a short-lived (token, code) pair, which
+    plugs into a CDN URL template serving one uninterrupted VP8/Opus WebM
+    byte stream. The token expires well before any single HTTP connection
+    would naturally end, so this reconnects with a fresh token on its own
+    clock, comfortably inside that window.
 
     WebM isn't self-synchronizing the way MPEG-TS is — an arbitrary byte
     slice mid-stream isn't independently parseable, only the EBML
@@ -486,9 +505,10 @@ class ContinuousRelaySource(SegmentSource):
     every chunk cut from the Cluster stream that follows.
 
     Config (decode-endpoint path, CDN URL template) is all field-driven —
-    not hardcoded to epicsports-tv.com specifically, so a second site with
-    the same "token API -> continuous stream" shape is a config difference,
-    not a new class.
+    not hardcoded to any one site, so a second site with the same "token
+    API -> continuous stream" shape is a config difference, not a new
+    class. See get_relay_source_config() above for where per-site values
+    live.
     """
 
     MIN_CHUNK_BYTES = 32_768       # don't even try cutting below this

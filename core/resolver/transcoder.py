@@ -67,7 +67,7 @@ BUMPER_WINDOW_SECONDS = 60
 # import QueueItem` call sites (if any) keep working.
 from core.resolver.segment_sources import (  # noqa: E402
     QueueItem, build_bump_sequence, SegmentSource, HlsPlaylistSource,
-    ContinuousRelaySource, RELAY_SOURCE_CONFIGS,
+    ContinuousRelaySource, get_relay_source_config,
 )
 
 # ── Resolved channel stream ─────────────────────────────────────────────────
@@ -169,11 +169,11 @@ class ResolvedChannelStream:
             )
         elif self.source_kind == "relay":
             # No HLS playlist involved — manifest_url IS the stable
-            # player-page URL (e.g. https://epicsports-tv.com/eu.php?id=N).
-            relay_cfg = RELAY_SOURCE_CONFIGS.get(self.source_domain)
+            # player-page URL for this source.
+            relay_cfg = get_relay_source_config(self.source_domain)
             if not relay_cfg:
                 raise ValueError(
-                    f"source_kind=relay but no RELAY_SOURCE_CONFIGS entry for "
+                    f"source_kind=relay but no relay source config for "
                     f"domain {self.source_domain!r}"
                 )
             self.source = ContinuousRelaySource(
