@@ -605,7 +605,16 @@ class ContinuousRelaySource(SegmentSource):
         feed into the same shared feeder/encoder every other QueueItem does.
         Not trying to hit final output params here — the feeder re-encodes
         everything (bumps included) to TARGET_* anyway; this just needs to
-        be decodable."""
+        be decodable.
+
+        This is a real-time-bound step (Python's doing a full libx264 encode
+        of live content, once, before the feeder does its own libx264 encode
+        of the same frames a second time) — measured at ~1.0x realtime under
+        normal load with "veryfast", meaning any extra contention on the box
+        pushes it over and the queue falls behind, which is what Jake saw as
+        periodic buffering. "ultrafast" + zerolatency + no B-frames buys
+        headroom; quality doesn't matter here since it's a throwaway
+        intermediate the feeder immediately re-encodes anyway."""
         in_path = os.path.join(self._download_dir, f"relay-in-{self.channel_id}-{seg_index}.webm")
         out_path = os.path.join(self._download_dir, f"relay-{self.channel_id}-{seg_index}.ts")
         try:
@@ -614,7 +623,8 @@ class ContinuousRelaySource(SegmentSource):
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "webm", "-i", in_path,
-                "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-bf", "0", "-x264-params", "threads=2",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-ar", "48000", "-ac", "2",
                 "-f", "mpegts", out_path,
