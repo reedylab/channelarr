@@ -15,6 +15,15 @@ HlsPlaylistSource is today's (and so far, only) mechanism — poll a variant
 playlist, classify segments via a StreamProfile, download+queue. Extracted
 here unchanged from transcoder.py's original ResolvedChannelStream so this
 commit is a pure refactor with no behavior change.
+
+ContinuousRelaySource is the second mechanism — for sources that aren't HLS
+at all: a token-gated endpoint hands out a short-lived CDN URL serving one
+continuous WebM (VP8/Opus) byte stream, no discrete segment URIs anywhere.
+Python does all the network I/O (token refresh, the continuous read) and
+self-segments at keyframe boundaries on-disk; ffmpeg only ever touches
+finite already-downloaded chunks, same "gentle mirror" rule HlsPlaylistSource
+and remux_stream.py both follow. No ad-break concept here — everything is
+CLASS_SHOW, so there's no StreamProfile involved.
 """
 
 import logging
@@ -23,6 +32,7 @@ import random
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urljoin
@@ -436,3 +446,265 @@ class HlsPlaylistSource(SegmentSource):
                     self._enqueue_upstream(seg, enqueue)
 
             stop_event.wait(POLL_INTERVAL_SECONDS)
+
+
+# Per-domain config for ContinuousRelaySource — the class itself is generic
+# ("hit a token endpoint, build a CDN URL, read continuously"); these are the
+# only bits that differ per site. Keyed by Manifest.source_domain. A second
+# site with the same token-API shape is a new entry here, not a new class.
+RELAY_SOURCE_CONFIGS = {
+    "epicsports-tv.com": {
+        "decode_url_template": "https://epicsports-tv.com/decode.php?id={stream_id}",
+        "referer_template": "https://epicsports-tv.com/eu.php?id={stream_id}",
+        "cdn_url_template": "https://uv.dreamstream.cc/{token}/{code}/{stream_id}/webm/?t={ts_ms}",
+        # Player JS refreshes every 295s; reconnect a bit ahead of that.
+        "refresh_interval_seconds": 250.0,
+    },
+}
+
+
+# WebM Cluster element ID (EBML) — marks the start of the first Cluster,
+# i.e. the end of the "init" prefix (EBML header + Segment/Info/Tracks).
+_WEBM_CLUSTER_ID = bytes.fromhex("1F43B675")
+
+
+class ContinuousRelaySource(SegmentSource):
+    """Token-gated continuous WebM relay (e.g. epicsports-tv.com).
+
+    No HLS playlist upstream at all: a decode endpoint hands out a
+    short-lived (token, code) pair, which plugs into a CDN URL template
+    serving one uninterrupted VP8/Opus WebM byte stream. The token expires
+    (~295s observed) well before any single HTTP connection would naturally
+    end, so this reconnects with a fresh token on its own clock, comfortably
+    inside that window.
+
+    WebM isn't self-synchronizing the way MPEG-TS is — an arbitrary byte
+    slice mid-stream isn't independently parseable, only the EBML
+    header+Segment+Tracks prefix followed by a run of Cluster elements is.
+    So the same init-prefix pattern remux_stream.py uses for fMP4/CMAF
+    applies here: capture that prefix once per connection, prepend it to
+    every chunk cut from the Cluster stream that follows.
+
+    Config (decode-endpoint path, CDN URL template) is all field-driven —
+    not hardcoded to epicsports-tv.com specifically, so a second site with
+    the same "token API -> continuous stream" shape is a config difference,
+    not a new class.
+    """
+
+    MIN_CHUNK_BYTES = 32_768       # don't even try cutting below this
+    MAX_PEND_BYTES = 24_000_000    # force-cut safety cap if no keyframe turns up
+    INIT_CAPTURE_CAP_BYTES = 262_144  # give up looking for the Cluster marker past this
+    READ_CHUNK_BYTES = 65_536
+
+    def __init__(self, *, channel_id: str, player_page_url: str,
+                 decode_url_template: str, referer_template: str,
+                 cdn_url_template: str, source_domain: str = "",
+                 refresh_interval_seconds: float = 250.0,
+                 chunk_target_seconds: float = 6.0,
+                 download_dir: str = "/tmp"):
+        self.channel_id = channel_id
+        self.player_page_url = player_page_url
+        self.decode_url_template = decode_url_template
+        self.referer_template = referer_template
+        self.cdn_url_template = cdn_url_template
+        self.source_domain = source_domain
+        self.refresh_interval_seconds = refresh_interval_seconds
+        self.chunk_target_seconds = chunk_target_seconds
+        self._download_dir = download_dir
+
+        m = re.search(r'[?&]id=(\d+)', player_page_url)
+        if not m:
+            raise ValueError(f"couldn't parse a stream id out of {player_page_url!r}")
+        self.stream_id = m.group(1)
+
+    def _headers(self) -> dict:
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+        h["Referer"] = self.referer_template.format(stream_id=self.stream_id)
+        if self.source_domain:
+            h["Origin"] = f"https://{self.source_domain}"
+        return h
+
+    def _fetch_token(self) -> Optional[tuple]:
+        """Hit the decode endpoint for a fresh (token, code) pair."""
+        url = self.decode_url_template.format(stream_id=self.stream_id)
+        try:
+            resp = http_requests.get(url, headers=self._headers(), timeout=15)
+            data = resp.json().get("parsed_data") or {}
+        except Exception as e:
+            logging.warning("[RELAY] %s decode endpoint failed: %s", self.channel_id, e)
+            return None
+        if data.get("status") != "OK" or not data.get("token") or not data.get("code"):
+            logging.warning("[RELAY] %s decode endpoint returned no usable token: %s",
+                            self.channel_id, data)
+            return None
+        return data["token"], data["code"]
+
+    def _build_stream_url(self, token: str, code: str) -> str:
+        return self.cdn_url_template.format(
+            token=token, code=code, stream_id=self.stream_id,
+            ts_ms=int(time.time() * 1000),
+        )
+
+    def _capture_init(self, chunks) -> Optional[tuple]:
+        """Read from the response's chunk iterator until the first Cluster
+        element shows up. Returns (init_bytes, leftover_bytes) — everything
+        before the Cluster marker, and whatever was already read past it.
+        None if the marker never turns up within INIT_CAPTURE_CAP_BYTES
+        (malformed/unexpected response — caller should give up and retry)."""
+        buf = bytearray()
+        for chunk in chunks:
+            buf.extend(chunk)
+            idx = bytes(buf).find(_WEBM_CLUSTER_ID)
+            if idx != -1:
+                return bytes(buf[:idx]), bytes(buf[idx:])
+            if len(buf) > self.INIT_CAPTURE_CAP_BYTES:
+                return None
+        return None
+
+    def _find_keyframe_cut(self, blob: bytes) -> Optional[int]:
+        """Byte offset of the LAST video keyframe packet in `blob` (a
+        complete init-prefix + Cluster-run WebM blob), or None if it has
+        none. Latest-not-first so each cut is as close to chunk_target as
+        the currently-buffered data allows, same spirit as remux_stream.py's
+        plain-TS keyframe cutting, just picking the far end of the window
+        instead of the near one since we're not racing arrival latency."""
+        probe_path = os.path.join(self._download_dir, f"relay-probe-{self.channel_id}.webm")
+        try:
+            with open(probe_path, "wb") as f:
+                f.write(blob)
+            r = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-f", "webm", "-select_streams", "v:0",
+                 "-show_entries", "packet=pos,flags", "-of", "csv=p=0", probe_path],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+            last_kf = None
+            for line in r.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) >= 2 and "K" in parts[1]:
+                    last_kf = int(parts[0])
+            return last_kf
+        except Exception:
+            return None
+        finally:
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
+
+    def _transcode_chunk(self, blob: bytes, seg_index: int) -> Optional[str]:
+        """VP8/Opus -> H.264/AAC in an MPEG-TS container so this chunk can
+        feed into the same shared feeder/encoder every other QueueItem does.
+        Not trying to hit final output params here — the feeder re-encodes
+        everything (bumps included) to TARGET_* anyway; this just needs to
+        be decodable."""
+        in_path = os.path.join(self._download_dir, f"relay-in-{self.channel_id}-{seg_index}.webm")
+        out_path = os.path.join(self._download_dir, f"relay-{self.channel_id}-{seg_index}.ts")
+        try:
+            with open(in_path, "wb") as f:
+                f.write(blob)
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "webm", "-i", in_path,
+                "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-f", "mpegts", out_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode != 0:
+                err = result.stderr.decode("utf-8", errors="replace")[-300:]
+                logging.warning("[RELAY] %s chunk %d transcode failed: %s",
+                                self.channel_id, seg_index, err)
+                return None
+            return out_path
+        finally:
+            try:
+                os.remove(in_path)
+            except OSError:
+                pass
+
+    def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
+        seg_index = 0
+
+        while not stop_event.is_set():
+            pair = self._fetch_token()
+            if not pair:
+                stop_event.wait(5.0)
+                continue
+            token, code = pair
+            stream_url = self._build_stream_url(token, code)
+
+            try:
+                resp = http_requests.get(stream_url, headers=self._headers(),
+                                         timeout=(10, self.refresh_interval_seconds + 30),
+                                         stream=True)
+                resp.raise_for_status()
+            except Exception as e:
+                logging.warning("[RELAY] %s couldn't open stream: %s", self.channel_id, e)
+                stop_event.wait(5.0)
+                continue
+
+            logging.info("[RELAY] %s connected: %s", self.channel_id, stream_url.split("?")[0])
+
+            try:
+                chunks = resp.iter_content(chunk_size=self.READ_CHUNK_BYTES)
+                captured = self._capture_init(chunks)
+                if not captured:
+                    logging.warning("[RELAY] %s never found a Cluster in the response — "
+                                    "reconnecting", self.channel_id)
+                    continue
+                init_bytes, pending = captured
+                pending = bytearray(pending)
+                deadline = time.time() + self.refresh_interval_seconds
+                last_cut = time.time()
+
+                while not stop_event.is_set() and time.time() < deadline:
+                    try:
+                        chunk = next(chunks)
+                    except StopIteration:
+                        logging.info("[RELAY] %s connection ended early", self.channel_id)
+                        break
+                    except Exception as e:
+                        logging.warning("[RELAY] %s read error: %s", self.channel_id, e)
+                        break
+                    pending.extend(chunk)
+
+                    due = (time.time() - last_cut) >= self.chunk_target_seconds
+                    forced = len(pending) > self.MAX_PEND_BYTES
+                    if not ((due and len(pending) > self.MIN_CHUNK_BYTES) or forced):
+                        continue
+
+                    cut = self._find_keyframe_cut(init_bytes + bytes(pending))
+                    cut_in_pending = (cut - len(init_bytes)) if cut is not None else None
+                    if cut_in_pending is None or cut_in_pending <= 0:
+                        if forced:
+                            logging.warning(
+                                "[RELAY] %s no keyframe found in %d buffered bytes — "
+                                "force-cutting", self.channel_id, len(pending),
+                            )
+                            cut_in_pending = len(pending)
+                        else:
+                            continue
+
+                    seg_bytes = bytes(pending[:cut_in_pending])
+                    pending = pending[cut_in_pending:]
+                    out_path = self._transcode_chunk(init_bytes + seg_bytes, seg_index)
+                    if out_path:
+                        from core.channels import ffprobe_duration
+                        duration = ffprobe_duration(out_path)
+                        enqueue(QueueItem(
+                            kind="upstream",
+                            source_path=out_path,
+                            duration=duration or self.chunk_target_seconds,
+                            label=f"relay:{seg_index}",
+                        ))
+                        seg_index += 1
+                    last_cut = time.time()
+
+                if pending:
+                    logging.debug("[RELAY] %s discarding %d trailing bytes at reconnect",
+                                 self.channel_id, len(pending))
+            finally:
+                resp.close()

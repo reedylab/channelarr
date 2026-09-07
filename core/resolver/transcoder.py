@@ -67,6 +67,7 @@ BUMPER_WINDOW_SECONDS = 60
 # import QueueItem` call sites (if any) keep working.
 from core.resolver.segment_sources import (  # noqa: E402
     QueueItem, build_bump_sequence, SegmentSource, HlsPlaylistSource,
+    ContinuousRelaySource, RELAY_SOURCE_CONFIGS,
 )
 
 # ── Resolved channel stream ─────────────────────────────────────────────────
@@ -165,6 +166,22 @@ class ResolvedChannelStream:
                 bump_durations=self.bump_durations,
                 source_domain=self.source_domain,
                 download_dir=self._download_dir,
+            )
+        elif self.source_kind == "relay":
+            # No HLS playlist involved — manifest_url IS the stable
+            # player-page URL (e.g. https://epicsports-tv.com/eu.php?id=N).
+            relay_cfg = RELAY_SOURCE_CONFIGS.get(self.source_domain)
+            if not relay_cfg:
+                raise ValueError(
+                    f"source_kind=relay but no RELAY_SOURCE_CONFIGS entry for "
+                    f"domain {self.source_domain!r}"
+                )
+            self.source = ContinuousRelaySource(
+                channel_id=channel_id,
+                player_page_url=manifest_url,
+                source_domain=self.source_domain,
+                download_dir=self._download_dir,
+                **relay_cfg,
             )
         else:
             raise ValueError(f"Unknown source_kind {source_kind!r} and no source given")
@@ -310,7 +327,10 @@ class ResolvedChannelStream:
                 try:
                     item = self._segment_queue.get(timeout=10)
                 except queue.Empty:
-                    if self._enc_proc.poll() is not None:
+                    # stop() (a different thread) can null this out between
+                    # our stop_event check above and here.
+                    enc_proc = self._enc_proc
+                    if enc_proc is None or enc_proc.poll() is not None:
                         logging.error("[RESOLVED-XCODE] %s encoder died unexpectedly",
                                       self.channel_id)
                         break

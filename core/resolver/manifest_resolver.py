@@ -174,12 +174,18 @@ def refresh_due_manifests():
         cooldown = now - timedelta(minutes=3)
         watching_window = now - timedelta(minutes=10)
         with get_session() as session:
+            relay_manifest_ids = session.query(Channel.manifest_id).filter(
+                Channel.source_kind == "relay", Channel.manifest_id.isnot(None),
+            )
             demand_rows = (
                 session.query(Manifest.id)
                 .filter(Manifest.tags.contains(["resolved"]))
                 .filter(Manifest.active == True)
                 .filter(Manifest.last_accessed_at.isnot(None))
                 .filter(Manifest.last_accessed_at > watching_window)
+                # see always_on_rows below — relay manifests have no playlist
+                # to refresh, ContinuousRelaySource handles its own tokens.
+                .filter(~Manifest.id.in_(relay_manifest_ids))
                 .filter(
                     (Manifest.expires_at.is_(None)) |
                     (Manifest.expires_at < soon)
@@ -199,6 +205,12 @@ def refresh_due_manifests():
                 .filter(Channel.type == "resolved")
                 .filter(Channel.event_start.is_(None))
                 .filter(Channel.event_end.is_(None))
+                # relay-sourced channels have no playlist to refresh — the
+                # manifest row is just a stable player-page URL, and its
+                # ContinuousRelaySource does its own token refresh live on
+                # every read. Sending it through here would just burn heavy-
+                # refresh budget on a sidecar capture that can never succeed.
+                .filter(Channel.source_kind != "relay")
                 .filter(
                     (Manifest.expires_at.is_(None)) |
                     (Manifest.expires_at < soon)
