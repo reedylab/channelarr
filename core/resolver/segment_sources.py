@@ -562,36 +562,43 @@ class ContinuousRelaySource(SegmentSource):
                 return None
         return None
 
-    def _find_keyframe_cut(self, blob: bytes) -> Optional[int]:
-        """Byte offset of the LAST video keyframe packet in `blob` (a
-        complete init-prefix + Cluster-run WebM blob), or None if it has
-        none. Latest-not-first so each cut is as close to chunk_target as
-        the currently-buffered data allows, same spirit as remux_stream.py's
-        plain-TS keyframe cutting, just picking the far end of the window
-        instead of the near one since we're not racing arrival latency."""
-        probe_path = os.path.join(self._download_dir, f"relay-probe-{self.channel_id}.webm")
-        try:
-            with open(probe_path, "wb") as f:
-                f.write(blob)
-            r = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-f", "webm", "-select_streams", "v:0",
-                 "-show_entries", "packet=pos,flags", "-of", "csv=p=0", probe_path],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode != 0:
-                return None
-            last_kf = None
-            for line in r.stdout.splitlines():
-                parts = line.split(",")
-                if len(parts) >= 2 and "K" in parts[1]:
-                    last_kf = int(parts[0])
-            return last_kf
-        except Exception:
+    def _find_cluster_cut(self, pending: bytes) -> Optional[int]:
+        """Byte offset within `pending` of the last Cluster boundary, or
+        None if pending doesn't contain at least two (nothing safe to cut
+        yet — see below).
+
+        Originally this cut at the exact video keyframe packet position
+        (via ffprobe), not the Cluster boundary — WRONG: verified live that
+        every Cluster here starts with a keyframe, ~26 bytes before the
+        keyframe's own packet position (Cluster ID + size + Timecode
+        elements). Cutting at the keyframe's byte offset instead of the
+        Cluster's sliced a Cluster element in half: the emitted segment's
+        trailing Cluster was left truncated (its declared size promising
+        block data that got cut off), and the next segment's leading bytes
+        were a bare block fragment with no enclosing Cluster at all —
+        broken EBML framing at every single cut, which is what was causing
+        the reported buffering/skipping. Cutting at the Cluster boundary
+        itself sidesteps needing any ffprobe call here — pure byte-offset
+        search, and correct by construction since Matroska/WebM elements
+        are self-delimiting at Cluster granularity (unlike MPEG-TS, which
+        is self-synchronizing at arbitrary packet offsets and doesn't have
+        this problem).
+
+        Cuts before the LAST marker found, never the last marker itself —
+        that final Cluster may still be mid-download, so leaving it whole
+        in `pending` for the next round is what guarantees `seg_bytes`
+        below only ever contains complete Clusters."""
+        markers = []
+        idx = 0
+        while True:
+            idx = pending.find(_WEBM_CLUSTER_ID, idx)
+            if idx == -1:
+                break
+            markers.append(idx)
+            idx += 1
+        if len(markers) < 2:
             return None
-        finally:
-            try:
-                os.remove(probe_path)
-            except OSError:
-                pass
+        return markers[-1]
 
     def _transcode_chunk(self, blob: bytes, seg_index: int) -> Optional[str]:
         """VP8/Opus -> H.264/AAC in an MPEG-TS container so this chunk can
@@ -676,13 +683,13 @@ class ContinuousRelaySource(SegmentSource):
                     if not ((due and len(pending) > self.MIN_CHUNK_BYTES) or forced):
                         continue
 
-                    cut = self._find_keyframe_cut(init_bytes + bytes(pending))
-                    cut_in_pending = (cut - len(init_bytes)) if cut is not None else None
-                    if cut_in_pending is None or cut_in_pending <= 0:
+                    cut_in_pending = self._find_cluster_cut(bytes(pending))
+                    if cut_in_pending is None:
                         if forced:
                             logging.warning(
-                                "[RELAY] %s no keyframe found in %d buffered bytes — "
-                                "force-cutting", self.channel_id, len(pending),
+                                "[RELAY] %s fewer than 2 Cluster boundaries in %d "
+                                "buffered bytes — force-cutting (will likely glitch)",
+                                self.channel_id, len(pending),
                             )
                             cut_in_pending = len(pending)
                         else:
