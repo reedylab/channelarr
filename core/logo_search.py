@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import re
+import time
 import urllib.parse
 from typing import Optional
 
@@ -25,6 +26,18 @@ logger = logging.getLogger(__name__)
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
 SEARCH_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 20
+
+# Wikimedia (by far the most common hit, via _DOMAIN_BONUS) rate-limits
+# generic/missing User-Agents much more aggressively than identified ones —
+# see https://meta.wikimedia.org/wiki/User-Agent_policy. A bare "Mozilla/5.0"
+# was hitting 429s routinely.
+_DOWNLOAD_HEADERS = {
+    "User-Agent": "channelarr/1.0 (self-hosted IPTV channel builder; "
+                  "https://github.com/reedylab/channelarr) requests",
+    "Accept": "image/*",
+}
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 2.0
 
 # Generic, source-agnostic domain hints. Encyclopedic + brand archives
 # tend to ship cleaner transparent PNG/SVG logos; stock-photo and
@@ -204,17 +217,33 @@ def download_to_logo(url: str, dest_path: str) -> tuple[bool, str]:
     rest of channelarr always sees a single canonical format."""
     if not url.lower().startswith(("http://", "https://")):
         return False, "invalid url scheme"
-    try:
-        r = requests.get(
-            url,
-            timeout=DOWNLOAD_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*"},
-            allow_redirects=True,
-        )
-        r.raise_for_status()
-        data = r.content
-    except Exception as e:
-        return False, f"download failed: {e}"
+    data = None
+    last_err = None
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            r = requests.get(
+                url,
+                timeout=DOWNLOAD_TIMEOUT,
+                headers=_DOWNLOAD_HEADERS,
+                allow_redirects=True,
+            )
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", 0)) or \
+                    DOWNLOAD_RETRY_BACKOFF_SECONDS * (attempt + 1)
+                last_err = f"429 rate-limited (retry {attempt + 1}/{DOWNLOAD_RETRIES})"
+                if attempt < DOWNLOAD_RETRIES - 1:
+                    logger.info("[LOGO] %s, waiting %.1fs", last_err, wait)
+                    time.sleep(wait)
+                    continue
+            r.raise_for_status()
+            data = r.content
+            break
+        except Exception as e:
+            last_err = str(e)
+            if attempt < DOWNLOAD_RETRIES - 1:
+                time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    if data is None:
+        return False, f"download failed: {last_err}"
 
     if not data:
         return False, "empty response"
