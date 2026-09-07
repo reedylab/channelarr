@@ -643,6 +643,51 @@ class ContinuousRelaySource(SegmentSource):
                 pass
 
     def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
+        """Reading (network-bound) and transcoding (CPU-bound) used to run
+        strictly sequentially in this loop — reading was fully blocked for
+        the whole ~0.6-1x-realtime duration of every transcode. That dead
+        time meant this source's actual production cadence was slower and
+        much burstier than its declared per-chunk durations, which is what
+        surfaced as periodic buffering even after the transcode itself got
+        fast enough to individually keep up with realtime. Transcoding one
+        chunk now happens on a background thread while reading immediately
+        continues accumulating the next one — a single-worker pool so
+        completions (and therefore enqueue() calls) stay strictly in
+        submission order without needing extra bookkeeping."""
+        import concurrent.futures
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"relay-xcode-{self.channel_id}")
+        # Caps how far reading can outrun transcoding — steady state should
+        # rarely touch this (transcode is faster than realtime, reading is
+        # network-paced), it's just a backstop against unbounded memory
+        # growth if the CDN ever bursts well ahead of real-time.
+        backpressure = threading.Semaphore(3)
+
+        def _on_transcoded(idx, fut):
+            backpressure.release()
+            try:
+                out_path = fut.result()
+            except Exception as e:
+                logging.warning("[RELAY] %s chunk %d transcode raised: %s",
+                                self.channel_id, idx, e)
+                return
+            if not out_path:
+                return
+            from core.channels import ffprobe_duration
+            duration = ffprobe_duration(out_path)
+            enqueue(QueueItem(
+                kind="upstream",
+                source_path=out_path,
+                duration=duration or self.chunk_target_seconds,
+                label=f"relay:{idx}",
+            ))
+
+        try:
+            self._run_connections(stop_event, pool, _on_transcoded, backpressure)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _run_connections(self, stop_event, pool, on_transcoded, backpressure):
         seg_index = 0
 
         while not stop_event.is_set():
@@ -707,17 +752,12 @@ class ContinuousRelaySource(SegmentSource):
 
                     seg_bytes = bytes(pending[:cut_in_pending])
                     pending = pending[cut_in_pending:]
-                    out_path = self._transcode_chunk(init_bytes + seg_bytes, seg_index)
-                    if out_path:
-                        from core.channels import ffprobe_duration
-                        duration = ffprobe_duration(out_path)
-                        enqueue(QueueItem(
-                            kind="upstream",
-                            source_path=out_path,
-                            duration=duration or self.chunk_target_seconds,
-                            label=f"relay:{seg_index}",
-                        ))
-                        seg_index += 1
+                    idx = seg_index
+                    seg_index += 1
+                    backpressure.acquire()
+                    future = pool.submit(self._transcode_chunk, init_bytes + seg_bytes, idx)
+                    future.add_done_callback(
+                        lambda fut, idx=idx: on_transcoded(idx, fut))
                     last_cut = time.time()
 
                 if pending:
