@@ -53,6 +53,7 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
         "transcode_mediated": bool(getattr(row, "transcode_mediated", False)),
         "profile_name": getattr(row, "profile_name", "auto") or "auto",
         "encoder_mode": getattr(row, "encoder_mode", "proxy") or "proxy",
+        "source_kind": getattr(row, "source_kind", "hls") or "hls",
         "branding_logo": getattr(row, "branding_logo", None),
         "tags": getattr(row, "tags", None) or [],
         "event_start": row.event_start.isoformat() if getattr(row, "event_start", None) else None,
@@ -462,6 +463,8 @@ class ChannelManager:
                     row.profile_name = data["profile_name"] or "auto"
                 if "encoder_mode" in data:
                     row.encoder_mode = data["encoder_mode"] or "proxy"
+                if "source_kind" in data:
+                    row.source_kind = data["source_kind"] or "hls"
                 if "branding_logo" in data:
                     row.branding_logo = data["branding_logo"] or None
                 if "tags" in data:

@@ -588,7 +588,8 @@ class StreamerManager:
                                 logo_dir: str = "/app/data/logos",
                                 profile_name: str = "auto",
                                 branding_logo_path: str = "",
-                                encoder_mode: str = "single") -> bool:
+                                encoder_mode: str = "single",
+                                source_kind: str = "hls") -> bool:
         """Start a transcode-mediated resolved channel.
 
         Builds a ResolvedChannelStream that polls the upstream playlist,
@@ -658,6 +659,7 @@ class StreamerManager:
             x264_threads=self._get("X264_THREADS", "4"),
             audio_bitrate=self._get("AUDIO_BITRATE", "192k"),
             encoder_mode=encoder_mode,
+            source_kind=source_kind or "hls",
         )
         stream.start()
         self._streams[channel_id] = stream

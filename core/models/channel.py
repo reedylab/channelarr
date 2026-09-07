@@ -85,6 +85,13 @@ class Channel(Base):
     # "multi" = per-item encoder + HLS segmenter (robust, best for Adult Swim)
     encoder_mode = Column(String, nullable=False, default="proxy")
 
+    # How content is discovered/pulled for this channel — orthogonal to
+    # encoder_mode (which is about how ffmpeg processes what's pulled).
+    # "hls" = poll a variant playlist for discrete segment URIs (everything
+    # before this field existed). "relay" = continuous token-gated stream,
+    # no HLS playlist upstream at all (see core/resolver/segment_sources.py).
+    source_kind = Column(String, nullable=False, default="hls")
+
     branding_logo = Column(String, nullable=True)
 
     # Channel tags for grouping and auto-cleanup behavior

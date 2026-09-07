@@ -156,6 +156,7 @@ def _start_from_schedule(channel_id):
                 profile_name=ch.get("profile_name", "auto"),
                 branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
                 encoder_mode=encoder_mode,
+                source_kind=ch.get("source_kind", "hls"),
             )
             return ok, "Started" if ok else "Already running"
 
