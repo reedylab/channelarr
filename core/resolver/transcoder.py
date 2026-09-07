@@ -27,7 +27,6 @@ the same MPEG-TS params, so the segmenter sees one continuous bitstream.
 import logging
 import os
 import queue
-import random
 import re
 import shutil
 import subprocess
@@ -39,15 +38,6 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests as http_requests
-
-from core.resolver.profiles import (
-    UpstreamSegment,
-    StreamProfile,
-    get_profile,
-    detect_profile,
-    CLASS_SHOW,
-    CLASS_REPLACE,
-)
 
 
 # ── Encoder target params ───────────────────────────────────────────────────
@@ -63,70 +53,21 @@ TARGET_AUDIO_BITRATE = "192k"
 TARGET_AUDIO_RATE = 48000
 TARGET_AUDIO_CHANNELS = 2
 
-# Polling cadence for the upstream playlist watcher
-POLL_INTERVAL_SECONDS = 2.0
-
-# How far back to look in the playlist on first poll (segments before this
-# already played and shouldn't be enqueued).
-INITIAL_BACKFILL_SEGMENTS = 3
+# Polling cadence / backfill depth for playlist-based sources now live in
+# segment_sources.py alongside HlsPlaylistSource, which is what uses them.
 
 # When a cue ends, treat bare discontinuities within this window as bumpers
 # (Adult Swim convention — see project memory).
 BUMPER_WINDOW_SECONDS = 60
 
 
-# ── Splice plan items ───────────────────────────────────────────────────────
-
-@dataclass
-class QueueItem:
-    """Something the encoder loop should encode and pipe through."""
-    kind: str            # "upstream" | "bump"
-    source_path: str     # local file path
-    duration: float      # seconds; for bumps may be shorter than file's actual length
-    label: str           # for logging
-    cue_remaining_at_start: Optional[float] = None  # for bumps: total seconds left in cue at this bump's start
-
-
-# ── Bump fitting ────────────────────────────────────────────────────────────
-
-def build_bump_sequence(bump_paths: list, bump_durations: dict, target_seconds: float) -> list:
-    """Fill `target_seconds` with bumps from `bump_paths`.
-
-    Strategy: shuffle, then cycle through. The last bump is truncated to hit
-    the exact target duration. Returns a list of (path, duration) tuples.
-
-    bump_durations: {path: duration_seconds}
-    """
-    if not bump_paths or target_seconds <= 0:
-        return []
-
-    pool = list(bump_paths)
-    random.shuffle(pool)
-    sequence = []
-    elapsed = 0.0
-    pool_idx = 0
-
-    while elapsed < target_seconds:
-        path = pool[pool_idx % len(pool)]
-        pool_idx += 1
-        full_dur = bump_durations.get(path, 0)
-        if full_dur <= 0:
-            continue  # skip bumps with unknown durations
-        remaining = target_seconds - elapsed
-        if full_dur <= remaining:
-            sequence.append((path, full_dur))
-            elapsed += full_dur
-        else:
-            # Truncate the last bump to fit exactly
-            sequence.append((path, remaining))
-            elapsed = target_seconds
-            break
-        # Defensive: avoid infinite loop if all bumps have 0 duration
-        if pool_idx > len(pool) * 1000:
-            break
-
-    return sequence
-
+# QueueItem and build_bump_sequence live in segment_sources.py now — a
+# SegmentSource is the thing that produces QueueItems, so that's where the
+# type belongs. Re-exported here so existing `from core.resolver.transcoder
+# import QueueItem` call sites (if any) keep working.
+from core.resolver.segment_sources import (  # noqa: E402
+    QueueItem, build_bump_sequence, SegmentSource, HlsPlaylistSource,
+)
 
 # ── Resolved channel stream ─────────────────────────────────────────────────
 
@@ -160,6 +101,8 @@ class ResolvedChannelStream:
         x264_threads: str = "4",
         audio_bitrate: str = TARGET_AUDIO_BITRATE,
         encoder_mode: str = "single",
+        source_kind: str = "hls",
+        source: Optional[SegmentSource] = None,
     ):
         self.channel_id = channel_id
         self.manifest_id = manifest_id
@@ -172,7 +115,7 @@ class ResolvedChannelStream:
         self.show_next = show_next
         self.profile_name = profile_name
         self.branding_logo_path = branding_logo_path
-        self.profile: Optional[StreamProfile] = None  # resolved on first poll
+        self.source_kind = source_kind
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
         self.loglevel = loglevel
@@ -204,16 +147,27 @@ class ResolvedChannelStream:
         self._started_at: Optional[float] = None
         self._last_access = time.time()
 
-    def _upstream_headers(self) -> dict:
-        """Build HTTP headers for upstream requests, including Referer if
-        the source domain is known. Some CDNs reject requests without a
-        valid Referer from the originating site."""
-        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
-        if self.source_domain:
-            h["Referer"] = f"https://{self.source_domain}/"
-            h["Origin"] = f"https://{self.source_domain}"
-        return h
+        # The SegmentSource does the actual content discovery/download; this
+        # class only knows about QueueItems from here on. `source_kind` picks
+        # which one — "hls" (the only kind that existed before this became
+        # pluggable) polls a playlist via a StreamProfile, same as always.
+        # A caller that already built a source (e.g. a relay-based channel)
+        # passes it directly instead.
+        if source is not None:
+            self.source = source
+        elif self.source_kind == "hls":
+            self.source = HlsPlaylistSource(
+                channel_id=channel_id,
+                manifest_id=manifest_id,
+                manifest_url=manifest_url,
+                profile_name=profile_name,
+                bump_paths=self.bump_paths,
+                bump_durations=self.bump_durations,
+                source_domain=self.source_domain,
+                download_dir=self._download_dir,
+            )
+        else:
+            raise ValueError(f"Unknown source_kind {source_kind!r} and no source given")
 
     # ── Public lifecycle ────────────────────────────────────────────────────
 
@@ -237,7 +191,8 @@ class ResolvedChannelStream:
         self._started_at = time.time()
         self._last_access = time.time()
         self._poller_thread = threading.Thread(
-            target=self._poller_loop, daemon=True, name=f"resolved-poller-{self.channel_id}",
+            target=self.source.run, args=(self._segment_queue.put, self._stop_event),
+            daemon=True, name=f"resolved-poller-{self.channel_id}",
         )
         self._feeder_thread = threading.Thread(
             target=self._feeder_loop, daemon=True, name=f"resolved-feeder-{self.channel_id}",
@@ -292,344 +247,9 @@ class ResolvedChannelStream:
                 except OSError:
                     pass
 
-    # ── Playlist poller ────────────────────────────────────────────────────
-
-    def _refresh_manifest_url(self) -> Optional[str]:
-        """Trigger a synchronous re-resolve of the manifest via selenium.
-        Used when the upstream variant URL 403s and the cached token has
-        expired. Returns the fresh manifest URL or None on failure."""
-        try:
-            from core.resolver.manifest_resolver import ManifestResolverService
-            from core.database import get_session
-            from core.models.manifest import Manifest
-
-            result = ManifestResolverService.refresh_manifest(self.manifest_id)
-            if not result.get("ok"):
-                logging.warning(
-                    "[RESOLVED-XCODE] %s manifest refresh failed: %s",
-                    self.channel_id, result.get("error"),
-                )
-                return None
-            with get_session() as session:
-                row = session.query(Manifest.url).filter(Manifest.id == self.manifest_id).first()
-            return row[0] if row else None
-        except Exception as e:
-            logging.warning("[RESOLVED-XCODE] %s manifest refresh error: %s",
-                            self.channel_id, e)
-            return None
-
-    def _poller_loop(self):
-        """Poll the upstream variant playlist, classify segments via the
-        profile, enqueue upstream segments or replacement bumps.
-
-        Profile-agnostic — the SCTE-35 details for Adult Swim and the
-        Anvato/Lura details for WSPA both flow through the same loop, just
-        with different profile.parse() / profile.classify() behavior.
-        """
-        seen_seqs: set[int] = set()
-        profile_state: dict = {}      # opaque per-profile classifier state
-        in_break: bool = False        # tracks whether we're currently replacing
-        # When a pod_hint queues a perfect-fit bump sequence, this tracks how
-        # many seconds of that pod we've already covered. Subsequent in-break
-        # segments arriving in the playlist decrement this; while it's > 0
-        # they're SKIPPED (not queued as additional continuous bumps).
-        # Prevents the "extra no-overlay bumps tail" pattern after pod_hint
-        # bumps finish playing.
-        break_coverage_remaining: float = 0.0
-        backfilled = False
-        consecutive_403s = 0
-
-        variant_url = self._resolve_variant_url(self.manifest_url)
-        logging.info("[RESOLVED-XCODE] %s polling variant: %s",
-                     self.channel_id, variant_url[:120])
-
-        while not self._stop_event.is_set():
-            try:
-                resp = http_requests.get(variant_url, headers=self._upstream_headers(), timeout=10)
-                if resp.status_code in (401, 403):
-                    consecutive_403s += 1
-                    if consecutive_403s > 3:
-                        logging.error(
-                            "[RESOLVED-XCODE] %s giving up after %d consecutive auth failures",
-                            self.channel_id, consecutive_403s,
-                        )
-                        self._stop_event.set()
-                        break
-                    logging.warning(
-                        "[RESOLVED-XCODE] %s variant HTTP %d (#%d) — refreshing manifest",
-                        self.channel_id, resp.status_code, consecutive_403s,
-                    )
-                    fresh_master = self._refresh_manifest_url()
-                    if fresh_master:
-                        self.manifest_url = fresh_master
-                        variant_url = self._resolve_variant_url(fresh_master)
-                        logging.info("[RESOLVED-XCODE] %s new variant: %s",
-                                     self.channel_id, variant_url[:120])
-                        consecutive_403s = 0
-                    else:
-                        # Backoff to avoid hammering selenium
-                        self._stop_event.wait(min(POLL_INTERVAL_SECONDS * 5, 30))
-                    continue
-                if resp.status_code != 200:
-                    logging.warning("[RESOLVED-XCODE] %s playlist HTTP %d",
-                                    self.channel_id, resp.status_code)
-                    self._stop_event.wait(POLL_INTERVAL_SECONDS)
-                    continue
-                consecutive_403s = 0
-                # Resolve the profile on first poll if set to "auto"
-                if self.profile is None:
-                    if self.profile_name and self.profile_name != "auto":
-                        self.profile = get_profile(self.profile_name)
-                    else:
-                        self.profile = detect_profile(resp.text)
-                    logging.info("[RESOLVED-XCODE] %s using profile: %s",
-                                 self.channel_id, self.profile.name)
-                _, segments = self.profile.parse(resp.text, variant_url)
-            except Exception as e:
-                logging.warning("[RESOLVED-XCODE] %s playlist fetch failed: %s",
-                                self.channel_id, e)
-                self._stop_event.wait(POLL_INTERVAL_SECONDS)
-                continue
-
-            # On first poll, mark every old segment as already-seen so we
-            # only process segments at the live edge. Prevents replaying
-            # the whole rolling window (which often includes historical
-            # ad breaks).
-            if not backfilled:
-                for old_seg in segments[:-INITIAL_BACKFILL_SEGMENTS]:
-                    seen_seqs.add(old_seg.seq)
-                # If we joined mid-break, set in_break so the first
-                # live-edge segment of the break gets replaced.
-                live_edge = (
-                    segments[-INITIAL_BACKFILL_SEGMENTS:]
-                    if len(segments) > INITIAL_BACKFILL_SEGMENTS
-                    else segments
-                )
-                for s in live_edge:
-                    cls, _ = self.profile.classify(s, profile_state)
-                    if cls == CLASS_REPLACE:
-                        in_break = True
-                        logging.info(
-                            "[RESOLVED-XCODE] %s joined mid-break", self.channel_id,
-                        )
-                        break
-                    # Reset profile state to avoid double-counting on the
-                    # real loop below
-                    profile_state = {}
-                backfilled = True
-
-            for seg in segments:
-                if seg.seq in seen_seqs:
-                    continue
-                seen_seqs.add(seg.seq)
-
-                cls, pod_hint = self.profile.classify(seg, profile_state)
-
-                if cls == CLASS_SHOW:
-                    if in_break:
-                        in_break = False
-                        break_coverage_remaining = 0.0
-                        logging.info("[RESOLVED-XCODE] %s break ended, master resumed",
-                                     self.channel_id)
-                    self._enqueue_upstream(seg)
-                    continue
-
-                # CLASS_REPLACE — break content, queue a bump (or skip if covered)
-                if not in_break:
-                    in_break = True
-                    logging.info("[RESOLVED-XCODE] %s break started (type=%s)",
-                                 self.channel_id, seg.anvato_type or "scte35")
-
-                # When the profile reports a pod_hint (Lura's pod-duration at
-                # ad-index=0, or Adult Swim's CUE-OUT duration), build a full
-                # perfect-fit bump sequence right now and mark coverage.
-                if pod_hint and pod_hint > 0:
-                    bump_seq = build_bump_sequence(
-                        self.bump_paths, self.bump_durations, pod_hint,
-                    )
-                    if bump_seq:
-                        cue_left = pod_hint
-                        for bump_path, bump_dur in bump_seq:
-                            self._segment_queue.put(QueueItem(
-                                kind="bump",
-                                source_path=bump_path,
-                                duration=bump_dur,
-                                label=os.path.basename(bump_path),
-                                cue_remaining_at_start=cue_left,
-                            ))
-                            cue_left -= bump_dur
-                        # Mark coverage so subsequent in-break segments (the
-                        # rest of the pod) get SKIPPED instead of queueing
-                        # additional no-overlay continuous bumps on top.
-                        break_coverage_remaining = pod_hint
-                        logging.info(
-                            "[RESOLVED-XCODE] %s queued %d bumps for %.1fs pod (coverage set)",
-                            self.channel_id, len(bump_seq), pod_hint,
-                        )
-                    else:
-                        logging.warning(
-                            "[RESOLVED-XCODE] %s no bumps configured — break content will pass through",
-                            self.channel_id,
-                        )
-                        self._enqueue_upstream(seg)
-                    continue
-
-                # Already covered by an earlier pod_hint sequence — skip this
-                # segment entirely (the perfect-fit bumps already queued cover
-                # the time this segment would occupy in the encoder).
-                if break_coverage_remaining > 0:
-                    break_coverage_remaining = max(0.0, break_coverage_remaining - seg.duration)
-                    continue
-
-                # Continuous mode: queue one bump per replaced segment. Used
-                # when there's no upfront pod duration (e.g. Lura SLATE before
-                # the ad pod starts, or joining mid-cue without continuation
-                # markers).
-                bump_seq = build_bump_sequence(
-                    self.bump_paths, self.bump_durations, seg.duration,
-                )
-                if bump_seq:
-                    for bump_path, bump_dur in bump_seq:
-                        self._segment_queue.put(QueueItem(
-                            kind="bump",
-                            source_path=bump_path,
-                            duration=bump_dur,
-                            label=os.path.basename(bump_path),
-                        ))
-                else:
-                    logging.warning(
-                        "[RESOLVED-XCODE] %s no bumps configured — passing through",
-                        self.channel_id,
-                    )
-                    self._enqueue_upstream(seg)
-
-            self._stop_event.wait(POLL_INTERVAL_SECONDS)
-
-    def _resolve_variant_url(self, url: str) -> str:
-        """If `url` is a master playlist, pick the highest-bandwidth variant.
-        If it's already a variant (no #EXT-X-STREAM-INF), return as-is."""
-        try:
-            resp = http_requests.get(url, headers=self._upstream_headers(), timeout=10)
-            text = resp.text
-        except Exception as e:
-            logging.warning("[RESOLVED-XCODE] couldn't fetch master, using as-is: %s", e)
-            return url
-        if "#EXT-X-STREAM-INF" not in text:
-            return url
-        # Parse master, pick highest bandwidth
-        best_bw = -1
-        best_uri = None
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                if bw_match and i + 1 < len(lines):
-                    bw = int(bw_match.group(1))
-                    uri = lines[i + 1].strip()
-                    if bw > best_bw and uri and not uri.startswith("#"):
-                        best_bw = bw
-                        best_uri = uri
-        if best_uri:
-            return urljoin(url, best_uri)
-        return url
-
-    def _enqueue_upstream(self, seg: UpstreamSegment):
-        """Download (and decrypt) one upstream segment, queue it for the encoder."""
-        try:
-            local_path = self._download_segment(seg)
-            self._segment_queue.put(QueueItem(
-                kind="upstream",
-                source_path=local_path,
-                duration=seg.duration,
-                label=f"upstream:{seg.seq}",
-            ))
-        except Exception as e:
-            logging.warning("[RESOLVED-XCODE] %s enqueue failed for seg %d: %s",
-                            self.channel_id, seg.seq, e)
-
-    def _download_segment(self, seg: UpstreamSegment) -> str:
-        """Download a segment to local disk via ffmpeg.
-
-        Both AES-encrypted and plain segments are routed through ffmpeg with
-        `-c copy -f mpegts`. This serves two purposes:
-
-          1. AES-128 segments need decryption — ffmpeg handles the key fetch
-             via a synthesized one-segment playlist with the EXT-X-KEY tag.
-          2. Plain segments get a remux pass that normalizes their MPEG-TS
-             container structure to ffmpeg's defaults (PMT pid 4096, single
-             video + single audio stream, dropping any extras like alternate
-             audio tracks or closed-caption streams). This makes WSPA's
-             Lura-native segments look the same as ffmpeg-produced bump
-             segments so a downstream long-running encoder can concatenate
-             them cleanly without seeing them as separate streams.
-
-        Returns the local file path. Caller is responsible for cleanup
-        (the encoder loop deletes after encoding).
-        """
-        local_path = os.path.join(self._download_dir, f"seg_{seg.seq}.ts")
-
-        # Build ffmpeg -headers string for Referer if source_domain is set
-        ffmpeg_headers = []
-        if self.source_domain:
-            ffmpeg_headers = [
-                "-headers",
-                f"Referer: https://{self.source_domain}/\r\n"
-                f"Origin: https://{self.source_domain}\r\n",
-            ]
-
-        if seg.key_method == "AES-128" and seg.key_uri:
-            # Build a tiny one-segment playlist so ffmpeg's HLS demuxer
-            # picks up the key URI and decrypts the segment.
-            mini = (
-                "#EXTM3U\n"
-                "#EXT-X-VERSION:3\n"
-                "#EXT-X-TARGETDURATION:11\n"
-                f"#EXT-X-KEY:METHOD=AES-128,URI=\"{seg.key_uri}\""
-                + (f",IV={seg.key_iv}" if seg.key_iv else "") + "\n"
-                f"#EXTINF:{seg.duration:.3f},\n"
-                f"{seg.uri}\n"
-                "#EXT-X-ENDLIST\n"
-            )
-            mini_path = os.path.join(self._download_dir, f"seg_{seg.seq}.m3u8")
-            with open(mini_path, "w") as f:
-                f.write(mini)
-            cmd = [
-                "ffmpeg", "-y",
-                "-loglevel", "error",
-                "-allowed_extensions", "ALL",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-                "-i", mini_path,
-                "-c", "copy",
-                "-f", "mpegts",
-                local_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            try:
-                os.remove(mini_path)
-            except OSError:
-                pass
-            if result.returncode != 0:
-                err = result.stderr.decode("utf-8", errors="replace")[-300:]
-                raise RuntimeError(f"decrypt failed: {err}")
-        else:
-            # Plain segment — fetch + remux through ffmpeg to normalize the
-            # mpegts container. The video/audio bytes themselves are copied
-            # (no re-encode), only the container metadata is rewritten.
-            cmd = [
-                "ffmpeg", "-y",
-                "-loglevel", "error",
-                *ffmpeg_headers,
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-                "-i", seg.uri,
-                "-c", "copy",
-                "-f", "mpegts",
-                local_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode != 0:
-                err = result.stderr.decode("utf-8", errors="replace")[-300:]
-                raise RuntimeError(f"download failed: {err}")
-        return local_path
+    # Playlist-polling logic (poll variant, classify via StreamProfile,
+    # download+decrypt segments) moved to segment_sources.py::HlsPlaylistSource
+    # — this class only deals with QueueItems from here on.
 
     # ── Feeder loop ─────────────────────────────────────────────────────────
     # ONE long-running encoder reads MPEG-TS from stdin, decodes, re-encodes
