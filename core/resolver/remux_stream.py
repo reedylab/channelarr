@@ -40,6 +40,17 @@ _UA = (
 
 
 class RemuxStream:
+    # Give up after this many consecutive playlist-fetch failures (auth
+    # expiry, network errors, empty playlists — anything that isn't a clean
+    # segment fetch) instead of retrying forever. Without this, a genuinely
+    # dead upstream left the loop hammering the heavy sidecar refresh every
+    # couple seconds indefinitely, while the thread stayed alive the whole
+    # time — status() had no way to tell "stuck" from "working", so
+    # /live never re-triggered _start_from_schedule (and therefore never
+    # tried the fallback chain) until someone noticed and force-restarted
+    # it by hand.
+    MAX_CONSECUTIVE_FAILURES = 5
+
     def __init__(self, channel_id, manifest_id, manifest_url, hls_dir, *,
                  hls_time=6, hls_list_size=10, loglevel="warning"):
         self.channel_id = channel_id
@@ -55,6 +66,7 @@ class RemuxStream:
         self._started_at: Optional[float] = None
         self._last_access = time.time()
         self._producing = False
+        self._died = False  # set True on give-up; distinct from a clean stop()
 
         self.session = _requests.Session()
         self.source_domain = ""
@@ -394,6 +406,27 @@ class RemuxStream:
             return 200
 
         last_bless = time.time()
+        consecutive_failures = 0
+
+        def _give_up(reason: str) -> bool:
+            """True if the caller should stop the loop — logs once and sets
+            _stop_event so status() correctly reports not-running, letting
+            the next /live request retry _start_from_schedule (and its
+            fallback chain) fresh instead of finding this thread still
+            "alive" and never calling it again."""
+            nonlocal consecutive_failures
+            consecutive_failures += 1
+            if consecutive_failures < self.MAX_CONSECUTIVE_FAILURES:
+                return False
+            logging.error(
+                "[REMUX] %s giving up after %d consecutive failures (%s) — "
+                "stopping so the next request retries fresh",
+                self.channel_id, consecutive_failures, reason,
+            )
+            self._died = True
+            self._stop_event.set()
+            return True
+
         while not self._stop_event.is_set():
             cycle_start = time.time()
 
@@ -411,6 +444,8 @@ class RemuxStream:
             sv, vbase, vmsq, vinit_u, vsegs, reload_int = self._get_playlist(vurl)
             if sv in (403, 404, 410):
                 logging.info("[REMUX] %s token expired — refreshing", self.channel_id)
+                if _give_up(f"video playlist {sv}"):
+                    break
                 self._refresh_manifest()
                 vurl, aurl = self._resolve_inputs()
                 v_init = a_init = None
@@ -419,6 +454,8 @@ class RemuxStream:
                     break
                 continue
             if sv != 200 or not vsegs:
+                if _give_up(f"video playlist status={sv}"):
+                    break
                 if self._stop_event.wait(3):
                     break
                 continue
@@ -461,6 +498,8 @@ class RemuxStream:
             if aurl:
                 sta = _download_new(aurl, abuf, None, is_video=False)
                 if sta in (403, 404, 410):
+                    if _give_up(f"audio playlist {sta}"):
+                        break
                     self._refresh_manifest()
                     vurl, aurl = self._resolve_inputs()
                     v_init = a_init = None
@@ -468,6 +507,13 @@ class RemuxStream:
                     if self._stop_event.wait(2):
                         break
                     continue
+
+            # Reached here only if video (and audio, if present) both fetched
+            # cleanly this cycle — a real one-sided-failure scenario (e.g.
+            # only the audio rendition's token expiring while video keeps
+            # working) must not get masked by resetting on video success
+            # alone.
+            consecutive_failures = 0
 
             # Emit every buffered sequence whose (video, audio) pair is ready.
             while emit in vbuf and (aurl is None or emit in abuf) and not self._stop_event.is_set():
