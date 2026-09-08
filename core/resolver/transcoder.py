@@ -101,7 +101,7 @@ class ResolvedChannelStream:
         ffmpeg_threads: str = "1",
         x264_threads: str = "4",
         audio_bitrate: str = TARGET_AUDIO_BITRATE,
-        encoder_mode: str = "single",
+        encoder_mode: str = "single",  # "single" | "multi" | "copy"
         source_kind: str = "hls",
         source: Optional[SegmentSource] = None,
     ):
@@ -125,7 +125,7 @@ class ResolvedChannelStream:
         self.ffmpeg_threads = ffmpeg_threads
         self.x264_threads = x264_threads
         self.audio_bitrate = audio_bitrate
-        self.encoder_mode = encoder_mode  # "single" or "multi"
+        self.encoder_mode = encoder_mode
 
         # Look up source_domain for Referer headers on upstream requests
         self.source_domain = ""
@@ -295,7 +295,8 @@ class ResolvedChannelStream:
         if self._stop_event.is_set() or not first_item:
             return
 
-        enc_cmd = self._build_combined_encoder_cmd()
+        enc_cmd = (self._build_copy_encoder_cmd() if self.encoder_mode == "copy"
+                   else self._build_combined_encoder_cmd())
         logging.info("[RESOLVED-XCODE] %s combined encoder: %s",
                      self.channel_id, " ".join(enc_cmd))
         self._enc_proc = subprocess.Popen(
@@ -610,6 +611,40 @@ class ResolvedChannelStream:
             cmd.insert(idx, self.crf)
             cmd.insert(idx, "-crf")
         return cmd
+
+    def _build_copy_encoder_cmd(self) -> list:
+        """"copy" mode — same combined single-process shape as
+        _build_combined_encoder_cmd (one long-running ffmpeg fed via
+        stdin), but does no re-encoding at all. For sources whose
+        SegmentSource already normalized content to a directly-HLS-
+        compatible codec before enqueueing it (relay sources transcode
+        VP8/Opus -> H.264/AAC themselves, since that conversion is
+        mandatory and can't happen anywhere else) — re-encoding it AGAIN
+        here would just be redundant CPU cost and a second lossy
+        generation for no benefit.
+
+        No watermark/scale/framerate-forcing support: all of those need a
+        decode+filter+re-encode pass, which is exactly what this mode
+        exists to skip. Video comes through at whatever resolution/fps the
+        upstream SegmentSource already produced. Fine for today's only
+        caller (relay channels, no bump/show-next UI to overlay anyway);
+        a source needing those would use "single" or "multi" instead."""
+        playlist = os.path.join(self.hls_dir, "stream.m3u8")
+        segment_pattern = os.path.join(self.hls_dir, "seg_%05d.ts")
+        return [
+            "ffmpeg", "-y",
+            "-loglevel", self.loglevel,
+            "-fflags", "+genpts+discardcorrupt",
+            "-f", "mpegts",
+            "-i", "pipe:0",
+            "-c", "copy",
+            "-f", "hls",
+            "-hls_time", str(self.hls_time),
+            "-hls_list_size", str(self.hls_list_size),
+            "-hls_flags", "delete_segments+omit_endlist",
+            "-hls_segment_filename", segment_pattern,
+            playlist,
+        ]
 
     def _build_hls_cmd(self) -> list:
         """HLS segmenter for multi mode — reads MPEG-TS from stdin, copies

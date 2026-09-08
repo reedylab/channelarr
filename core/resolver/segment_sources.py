@@ -620,21 +620,49 @@ class ContinuousRelaySource(SegmentSource):
             return None
         return markers[-1]
 
-    def _transcode_chunk(self, blob: bytes, seg_index: int) -> Optional[str]:
+    def _probe_source_duration(self, blob: bytes) -> float:
+        """Duration of a raw WebM blob per its own Cluster timecodes —
+        cheap (container metadata, no decode) and used to keep
+        `_transcode_chunk`'s output_ts_offset accurate against the
+        source's real timing rather than our chunk_target_seconds
+        estimate, which would drift over a long-running connection."""
+        probe_path = os.path.join(self._download_dir, f"relay-durprobe-{self.channel_id}.webm")
+        try:
+            with open(probe_path, "wb") as f:
+                f.write(blob)
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-f", "webm",
+                 "-show_entries", "format=duration", "-of",
+                 "default=noprint_wrappers=1:nokey=1", probe_path],
+                capture_output=True, text=True, timeout=10)
+            return float(r.stdout.strip())
+        except Exception:
+            return self.chunk_target_seconds
+        finally:
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
+
+    def _transcode_chunk(self, blob: bytes, seg_index: int, ts_offset: float) -> Optional[str]:
         """VP8/Opus -> H.264/AAC in an MPEG-TS container so this chunk can
         feed into the same shared feeder/encoder every other QueueItem does.
-        Not trying to hit final output params here — the feeder re-encodes
-        everything (bumps included) to TARGET_* anyway; this just needs to
-        be decodable.
+        Quality doesn't matter for "single"/"multi"-mode channels (the
+        feeder re-encodes again to TARGET_* anyway) but for "copy" mode
+        this IS the final encode — the feeder just repackages it untouched.
 
-        This is a real-time-bound step (Python's doing a full libx264 encode
-        of live content, once, before the feeder does its own libx264 encode
-        of the same frames a second time) — measured at ~1.0x realtime under
-        normal load with "veryfast", meaning any extra contention on the box
-        pushes it over and the queue falls behind, which is what Jake saw as
-        periodic buffering. "ultrafast" + zerolatency + no B-frames buys
-        headroom; quality doesn't matter here since it's a throwaway
-        intermediate the feeder immediately re-encodes anyway."""
+        Each invocation is a separate ffmpeg process demuxing its own WebM
+        blob, so PTS/DTS naturally restart near zero every time regardless
+        of the source's real (ever-increasing) Cluster timecodes — fine
+        for "single"/"multi" mode, whose second re-encode pass regenerates
+        clean continuous timestamps from scratch anyway, but fatal for
+        "copy" mode: concatenating chunks whose timestamps all restart at
+        ~0 produces "non-monotonically increasing dts" at every boundary,
+        since -c copy has no re-encode pass to paper over it.
+        `-output_ts_offset` fixes this at the source — each chunk's
+        written timestamps are shifted to continue exactly where the
+        previous one left off, using the accumulated real source duration
+        (see run()'s cumulative_offset), not a guessed constant."""
         in_path = os.path.join(self._download_dir, f"relay-in-{self.channel_id}-{seg_index}.webm")
         out_path = os.path.join(self._download_dir, f"relay-{self.channel_id}-{seg_index}.ts")
         try:
@@ -646,7 +674,8 @@ class ContinuousRelaySource(SegmentSource):
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-bf", "0", "-x264-params", "threads=2",
                 "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-async", "1",
+                "-output_ts_offset", f"{ts_offset:.3f}",
                 "-f", "mpegts", out_path,
             ]
             result = subprocess.run(cmd, capture_output=True, timeout=30)
@@ -709,6 +738,10 @@ class ContinuousRelaySource(SegmentSource):
 
     def _run_connections(self, stop_event, pool, on_transcoded, backpressure):
         seg_index = 0
+        # Persists across reconnects (not per-connection) — the output HLS
+        # timeline must stay continuous across a token-refresh reconnect,
+        # same as it already does content-wise.
+        cumulative_offset = 0.0
 
         while not stop_event.is_set():
             pair = self._fetch_token()
@@ -774,8 +807,11 @@ class ContinuousRelaySource(SegmentSource):
                     pending = pending[cut_in_pending:]
                     idx = seg_index
                     seg_index += 1
+                    blob = init_bytes + seg_bytes
+                    ts_offset = cumulative_offset
+                    cumulative_offset += self._probe_source_duration(blob)
                     backpressure.acquire()
-                    future = pool.submit(self._transcode_chunk, init_bytes + seg_bytes, idx)
+                    future = pool.submit(self._transcode_chunk, blob, idx, ts_offset)
                     future.add_done_callback(
                         lambda fut, idx=idx: on_transcoded(idx, fut))
                     last_cut = time.time()
