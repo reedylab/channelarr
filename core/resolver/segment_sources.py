@@ -670,6 +670,7 @@ class ContinuousRelaySource(SegmentSource):
                 f.write(blob)
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
+                "-fflags", "+genpts",
                 "-f", "webm", "-i", in_path,
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-bf", "0", "-x264-params", "threads=2",
@@ -681,7 +682,14 @@ class ContinuousRelaySource(SegmentSource):
                 # a keyframe every 2s gives it real intermediate cut points,
                 # so segment cadence tracks hls_time instead of chunk size.
                 "-force_key_frames", "expr:gte(t,n_forced*2)",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-async", "1",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                # "-async 1" (the legacy global flag) turned out to be a
+                # near no-op — "1" there is a mode selector, not a
+                # correction magnitude. This is the actual audio-timestamp-
+                # discontinuity-smoothing filter ffmpeg docs point at for
+                # exactly the "non monotonically increasing dts" class of
+                # warning this per-chunk encoder flush was producing.
+                "-af", "aresample=async=1:min_hard_comp=0.100000:first_pts=0",
                 "-output_ts_offset", f"{ts_offset:.3f}",
                 "-f", "mpegts", out_path,
             ]
