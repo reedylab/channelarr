@@ -674,6 +674,13 @@ class ContinuousRelaySource(SegmentSource):
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-bf", "0", "-x264-params", "threads=2",
                 "-pix_fmt", "yuv420p",
+                # One keyframe per whole chunk (libx264's default GOP under
+                # "ultrafast" is ~250 frames, i.e. the entire chunk) left the
+                # downstream "copy" mode's HLS muxer with nowhere to cut but
+                # the chunk's own irregular boundary (4-13s swings) - forcing
+                # a keyframe every 2s gives it real intermediate cut points,
+                # so segment cadence tracks hls_time instead of chunk size.
+                "-force_key_frames", "expr:gte(t,n_forced*2)",
                 "-c:a", "aac", "-ar", "48000", "-ac", "2", "-async", "1",
                 "-output_ts_offset", f"{ts_offset:.3f}",
                 "-f", "mpegts", out_path,
