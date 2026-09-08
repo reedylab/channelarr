@@ -582,11 +582,22 @@ class ContinuousRelaySource(SegmentSource):
             ts_ms=int(time.time() * 1000),
         )
 
-    def _build_transcode_cmd(self) -> list:
+    def _build_transcode_cmd(self, ts_offset: float) -> list:
         """One of these runs for the lifetime of a single CDN connection
         (restarted only at the next reconnect, never per-chunk). Reads a
         continuous raw WebM byte stream via stdin, transcodes VP8/Opus ->
-        H.264/AAC, writes continuous MPEG-TS to stdout."""
+        H.264/AAC, writes continuous MPEG-TS to stdout.
+
+        `ts_offset`: each fresh connection's encoder starts its own
+        PTS/DTS numbering back near zero (independent -i pipe:0 demux
+        session) — harmless within a connection (nothing to be
+        discontinuous against), but the downstream "copy" mode stitches
+        every connection's output into one continuous HLS timeline, so
+        without this, connection 2 starting back at ~0 right after
+        connection 1 ended around ~250s is a huge backward jump — players
+        see that as the stream rewinding, not a tiny per-chunk artifact.
+        Shifts this connection's output to continue exactly where the
+        previous one left off."""
         return [
             "ffmpeg", "-y", "-loglevel", "error",
             "-fflags", "+genpts",
@@ -599,11 +610,18 @@ class ContinuousRelaySource(SegmentSource):
             # boundary happens to be.
             "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-output_ts_offset", f"{ts_offset:.3f}",
             "-f", "mpegts", "pipe:1",
         ]
 
     def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
         seg_index = 0
+        # Persists across reconnects — see _build_transcode_cmd's
+        # ts_offset docstring. Incremented after each connection by the
+        # real total duration it actually produced (summed from
+        # ffprobe'd QueueItem durations in _read_stdout below), not a
+        # guessed constant.
+        cumulative_offset = 0.0
 
         while not stop_event.is_set():
             pair = self._fetch_token()
@@ -627,7 +645,7 @@ class ContinuousRelaySource(SegmentSource):
 
             try:
                 enc_proc = subprocess.Popen(
-                    self._build_transcode_cmd(),
+                    self._build_transcode_cmd(cumulative_offset),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
             except Exception as e:
@@ -647,6 +665,8 @@ class ContinuousRelaySource(SegmentSource):
                             logging.warning("[RELAY] %s encoder: %s", self.channel_id, text[-200:])
                 except Exception:
                     pass
+
+            connection_duration = [0.0]  # summed real duration this connection produced
 
             def _read_stdout(proc=enc_proc):
                 """Chunk the encoder's continuous MPEG-TS output into
@@ -676,16 +696,21 @@ class ContinuousRelaySource(SegmentSource):
                         last_flush = time.time()
                         from core.channels import ffprobe_duration
                         duration = ffprobe_duration(out_path)
+                        duration = duration or self.chunk_target_seconds
+                        connection_duration[0] += duration
                         enqueue(QueueItem(
                             kind="upstream", source_path=out_path,
-                            duration=duration or self.chunk_target_seconds,
+                            duration=duration,
                             label=f"relay:{idx}",
                         ))
                 except Exception as e:
                     logging.warning("[RELAY] %s stdout reader failed: %s", self.channel_id, e)
                 # Trailing partial buffer at connection end is small and
                 # discarded, same as the old design's boundary behavior —
-                # not worth emitting a short QueueItem for.
+                # not worth emitting a short QueueItem for (its bit of
+                # duration is lost from cumulative_offset too, but that's
+                # the same small, bounded loss the old design already had
+                # at every reconnect).
 
             threading.Thread(target=_drain_stderr, daemon=True,
                              name=f"relay-stderr-{self.channel_id}").start()
@@ -724,3 +749,4 @@ class ContinuousRelaySource(SegmentSource):
                     except Exception:
                         pass
                 stdout_thread.join(timeout=5)
+                cumulative_offset += connection_duration[0]
