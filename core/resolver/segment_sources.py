@@ -614,6 +614,28 @@ class ContinuousRelaySource(SegmentSource):
             "-f", "mpegts", "pipe:1",
         ]
 
+    def _open_connection(self):
+        """Fetch a fresh token and open the CDN stream. Used both for a
+        connection's normal startup and for background-prefetching the
+        next one ahead of the current one's deadline (see run()) — pure
+        w.r.t. instance state, safe to call from either the main loop or
+        a prefetch thread."""
+        pair = self._fetch_token()
+        if not pair:
+            return None
+        token, code = pair
+        stream_url = self._build_stream_url(token, code)
+        try:
+            resp = http_requests.get(stream_url, headers=self._headers(),
+                                     timeout=(10, self.refresh_interval_seconds + 30),
+                                     stream=True)
+            resp.raise_for_status()
+        except Exception as e:
+            logging.warning("[RELAY] %s couldn't open stream: %s", self.channel_id, e)
+            return None
+        resp._relay_log_url = stream_url.split("?")[0]  # stash for the connect log line
+        return resp
+
     def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
         seg_index = 0
         # Persists across reconnects — see _build_transcode_cmd's
@@ -622,26 +644,23 @@ class ContinuousRelaySource(SegmentSource):
         # ffprobe'd QueueItem durations in _read_stdout below), not a
         # guessed constant.
         cumulative_offset = 0.0
+        # Set at the end of a connection's finally-block if a background
+        # prefetch (below) had already opened the next one — lets the next
+        # loop iteration skip straight to encoder startup instead of
+        # paying for token-fetch + CDN-connect on the critical path.
+        prefetched_resp = None
 
         while not stop_event.is_set():
-            pair = self._fetch_token()
-            if not pair:
-                stop_event.wait(5.0)
-                continue
-            token, code = pair
-            stream_url = self._build_stream_url(token, code)
+            if prefetched_resp is not None:
+                resp = prefetched_resp
+                prefetched_resp = None
+            else:
+                resp = self._open_connection()
+                if resp is None:
+                    stop_event.wait(5.0)
+                    continue
 
-            try:
-                resp = http_requests.get(stream_url, headers=self._headers(),
-                                         timeout=(10, self.refresh_interval_seconds + 30),
-                                         stream=True)
-                resp.raise_for_status()
-            except Exception as e:
-                logging.warning("[RELAY] %s couldn't open stream: %s", self.channel_id, e)
-                stop_event.wait(5.0)
-                continue
-
-            logging.info("[RELAY] %s connected: %s", self.channel_id, stream_url.split("?")[0])
+            logging.info("[RELAY] %s connected: %s", self.channel_id, resp._relay_log_url)
 
             try:
                 enc_proc = subprocess.Popen(
@@ -719,9 +738,34 @@ class ContinuousRelaySource(SegmentSource):
             stdout_thread.start()
 
             deadline = time.time() + self.refresh_interval_seconds
+            # Opening the next connection was entirely sequential with
+            # tearing down this one — every reconnect paused output for
+            # token-fetch + CDN-connect on top of the new encoder spawn,
+            # a real multi-second stall every ~250s. Starting the next
+            # connection in the background well before this one's
+            # scheduled deadline means it's already sitting open by the
+            # time we need it — the only gap left at handoff is spawning
+            # the new encoder process, not two more network round trips.
+            # Doesn't help a connection the CDN cuts early with no
+            # warning (nothing to prefetch ahead of), only the scheduled,
+            # predictable reconnect — but that's the one firing every
+            # ~250s like clockwork.
+            PREFETCH_LEAD_SECONDS = 12.0
+            prefetch_thread: Optional[threading.Thread] = None
+            prefetch_holder: dict = {}
+
+            def _prefetch_next():
+                prefetch_holder["resp"] = self._open_connection()
+
             try:
                 chunks = resp.iter_content(chunk_size=self.READ_CHUNK_BYTES)
                 while not stop_event.is_set() and time.time() < deadline:
+                    if (prefetch_thread is None
+                            and (deadline - time.time()) <= PREFETCH_LEAD_SECONDS):
+                        prefetch_thread = threading.Thread(
+                            target=_prefetch_next, daemon=True,
+                            name=f"relay-prefetch-{self.channel_id}")
+                        prefetch_thread.start()
                     try:
                         chunk = next(chunks)
                     except StopIteration:
@@ -750,3 +794,12 @@ class ContinuousRelaySource(SegmentSource):
                         pass
                 stdout_thread.join(timeout=5)
                 cumulative_offset += connection_duration[0]
+                if prefetch_thread is not None:
+                    prefetch_thread.join(timeout=10)
+                    prefetched_resp = prefetch_holder.get("resp")
+
+        # stop_event fired between connections — if a prefetch had already
+        # opened the next one, it never gets used; close it rather than
+        # leaking the socket.
+        if prefetched_resp is not None:
+            prefetched_resp.close()
