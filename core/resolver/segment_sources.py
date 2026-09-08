@@ -662,10 +662,40 @@ class ContinuousRelaySource(SegmentSource):
 
             logging.info("[RELAY] %s connected: %s", self.channel_id, resp._relay_log_url)
 
+            def _raise_priority():
+                # This is the one piece of the relay pipeline with real,
+                # continuous CPU cost (proxy/remux modes are pure I/O,
+                # which is why they don't have this problem). Measured
+                # this box at load average ~16 on 6 cores — under that
+                # contention the transcode was structurally losing to the
+                # OS scheduler and running below realtime (measured
+                # ~91.5% over a 6min window), which is what surfaces as
+                # persistent buffering distinct from the reconnect stalls
+                # fixed separately. Raising its scheduling priority means
+                # it wins contention against lower-priority background
+                # work (YT downloads, scraper ticks) instead of being
+                # treated the same as them.
+                #
+                # Best-effort: swallow the failure instead of raising —
+                # os.nice(negative) needs CAP_SYS_NICE, which this
+                # container doesn't have by default even running as root
+                # (Docker drops it unless granted via cap_add). Letting
+                # this raise inside preexec_fn kills the whole Popen call,
+                # which would silently break every relay channel start if
+                # the capability isn't (or stops being) granted — the
+                # actual priority boost is a real but separate ask (see
+                # docker-compose.yml's cap_add), this must never be a
+                # hard dependency for the encoder to start at all.
+                try:
+                    os.nice(-10)
+                except OSError:
+                    pass
+
             try:
                 enc_proc = subprocess.Popen(
                     self._build_transcode_cmd(cumulative_offset),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    preexec_fn=_raise_priority,
                 )
             except Exception as e:
                 logging.warning("[RELAY] %s couldn't start encoder: %s", self.channel_id, e)
