@@ -482,11 +482,6 @@ def get_relay_source_config(source_domain: str) -> Optional[dict]:
     return _relay_source_configs().get(source_domain)
 
 
-# WebM Cluster element ID (EBML) — marks the start of the first Cluster,
-# i.e. the end of the "init" prefix (EBML header + Segment/Info/Tracks).
-_WEBM_CLUSTER_ID = bytes.fromhex("1F43B675")
-
-
 class ContinuousRelaySource(SegmentSource):
     """Token-gated continuous WebM relay — for sources with no HLS playlist
     at all.
@@ -497,12 +492,34 @@ class ContinuousRelaySource(SegmentSource):
     would naturally end, so this reconnects with a fresh token on its own
     clock, comfortably inside that window.
 
-    WebM isn't self-synchronizing the way MPEG-TS is — an arbitrary byte
-    slice mid-stream isn't independently parseable, only the EBML
-    header+Segment+Tracks prefix followed by a run of Cluster elements is.
-    So the same init-prefix pattern remux_stream.py uses for fMP4/CMAF
-    applies here: capture that prefix once per connection, prepend it to
-    every chunk cut from the Cluster stream that follows.
+    ONE persistent ffmpeg transcodes the whole connection's worth of
+    content (VP8/Opus -> H.264/AAC), restarted only on reconnects — not
+    per-chunk. This used to run a fresh short-lived ffmpeg process every
+    ~6-8s; every restart forced an encoder flush, and that flush boundary
+    was the source of a small but persistent audio/video corruption
+    artifact that no amount of downstream timestamp massaging
+    (output_ts_offset, resampling filters, forced CFR, pre-roll priming)
+    fully eliminated — the restart itself was the cause, not anything
+    those were aimed at. A persistent process removes the restart
+    entirely: one real encoder flush per ~250s connection instead of one
+    every ~6-8s.
+
+    Still fully "gentle mirror": Python owns 100% of the network I/O
+    (token refresh, the continuous CDN read) and explicitly controls every
+    byte handed to ffmpeg's stdin; ffmpeg never touches the network,
+    only a local pipe Python is feeding pre-downloaded bytes into — the
+    same pattern transcoder.py's own feeder already uses for every other
+    source. The only thing that changed here is the encoder process's
+    lifetime: per-connection instead of per-chunk.
+
+    That also makes WebM's non-self-synchronizing framing a non-issue —
+    ffmpeg's own WebM demuxer sees one genuinely continuous stream (same
+    as it would over a real network connection) and handles Cluster
+    boundaries internally, no cut-finding needed on this end anymore.
+    Output-side chunking (for QueueItem compatibility with the shared
+    feeder) is a plain byte-count/time cut of already-encoded MPEG-TS,
+    which unlike WebM *is* self-synchronizing at arbitrary offsets — no
+    boundary-finding logic needed there either.
 
     Config (decode-endpoint path, CDN URL template) is all field-driven —
     not hardcoded to any one site, so a second site with the same "token
@@ -511,9 +528,8 @@ class ContinuousRelaySource(SegmentSource):
     live.
     """
 
-    MIN_CHUNK_BYTES = 32_768       # don't even try cutting below this
-    MAX_PEND_BYTES = 24_000_000    # force-cut safety cap if no keyframe turns up
-    INIT_CAPTURE_CAP_BYTES = 262_144  # give up looking for the Cluster marker past this
+    MIN_CHUNK_BYTES = 32_768       # don't flush an output slice below this
+    MAX_PEND_BYTES = 24_000_000    # force-flush safety cap
     READ_CHUNK_BYTES = 65_536
 
     def __init__(self, *, channel_id: str, player_page_url: str,
@@ -566,197 +582,28 @@ class ContinuousRelaySource(SegmentSource):
             ts_ms=int(time.time() * 1000),
         )
 
-    def _capture_init(self, chunks) -> Optional[tuple]:
-        """Read from the response's chunk iterator until the first Cluster
-        element shows up. Returns (init_bytes, leftover_bytes) — everything
-        before the Cluster marker, and whatever was already read past it.
-        None if the marker never turns up within INIT_CAPTURE_CAP_BYTES
-        (malformed/unexpected response — caller should give up and retry)."""
-        buf = bytearray()
-        for chunk in chunks:
-            buf.extend(chunk)
-            idx = bytes(buf).find(_WEBM_CLUSTER_ID)
-            if idx != -1:
-                return bytes(buf[:idx]), bytes(buf[idx:])
-            if len(buf) > self.INIT_CAPTURE_CAP_BYTES:
-                return None
-        return None
-
-    def _find_cluster_cut(self, pending: bytes) -> Optional[int]:
-        """Byte offset within `pending` of the last Cluster boundary, or
-        None if pending doesn't contain at least two (nothing safe to cut
-        yet — see below).
-
-        Originally this cut at the exact video keyframe packet position
-        (via ffprobe), not the Cluster boundary — WRONG: verified live that
-        every Cluster here starts with a keyframe, ~26 bytes before the
-        keyframe's own packet position (Cluster ID + size + Timecode
-        elements). Cutting at the keyframe's byte offset instead of the
-        Cluster's sliced a Cluster element in half: the emitted segment's
-        trailing Cluster was left truncated (its declared size promising
-        block data that got cut off), and the next segment's leading bytes
-        were a bare block fragment with no enclosing Cluster at all —
-        broken EBML framing at every single cut, which is what was causing
-        the reported buffering/skipping. Cutting at the Cluster boundary
-        itself sidesteps needing any ffprobe call here — pure byte-offset
-        search, and correct by construction since Matroska/WebM elements
-        are self-delimiting at Cluster granularity (unlike MPEG-TS, which
-        is self-synchronizing at arbitrary packet offsets and doesn't have
-        this problem).
-
-        Cuts before the LAST marker found, never the last marker itself —
-        that final Cluster may still be mid-download, so leaving it whole
-        in `pending` for the next round is what guarantees `seg_bytes`
-        below only ever contains complete Clusters."""
-        markers = []
-        idx = 0
-        while True:
-            idx = pending.find(_WEBM_CLUSTER_ID, idx)
-            if idx == -1:
-                break
-            markers.append(idx)
-            idx += 1
-        if len(markers) < 2:
-            return None
-        return markers[-1]
-
-    def _probe_source_duration(self, blob: bytes) -> float:
-        """Duration of a raw WebM blob per its own Cluster timecodes —
-        cheap (container metadata, no decode) and used to keep
-        `_transcode_chunk`'s output_ts_offset accurate against the
-        source's real timing rather than our chunk_target_seconds
-        estimate, which would drift over a long-running connection."""
-        probe_path = os.path.join(self._download_dir, f"relay-durprobe-{self.channel_id}.webm")
-        try:
-            with open(probe_path, "wb") as f:
-                f.write(blob)
-            r = subprocess.run(
-                ["ffprobe", "-v", "error", "-f", "webm",
-                 "-show_entries", "format=duration", "-of",
-                 "default=noprint_wrappers=1:nokey=1", probe_path],
-                capture_output=True, text=True, timeout=10)
-            return float(r.stdout.strip())
-        except Exception:
-            return self.chunk_target_seconds
-        finally:
-            try:
-                os.remove(probe_path)
-            except OSError:
-                pass
-
-    def _transcode_chunk(self, blob: bytes, seg_index: int, ts_offset: float) -> Optional[str]:
-        """VP8/Opus -> H.264/AAC in an MPEG-TS container so this chunk can
-        feed into the same shared feeder/encoder every other QueueItem does.
-        Quality doesn't matter for "single"/"multi"-mode channels (the
-        feeder re-encodes again to TARGET_* anyway) but for "copy" mode
-        this IS the final encode — the feeder just repackages it untouched.
-
-        Each invocation is a separate ffmpeg process demuxing its own WebM
-        blob, so PTS/DTS naturally restart near zero every time regardless
-        of the source's real (ever-increasing) Cluster timecodes — fine
-        for "single"/"multi" mode, whose second re-encode pass regenerates
-        clean continuous timestamps from scratch anyway, but fatal for
-        "copy" mode: concatenating chunks whose timestamps all restart at
-        ~0 produces "non-monotonically increasing dts" at every boundary,
-        since -c copy has no re-encode pass to paper over it.
-        `-output_ts_offset` fixes this at the source — each chunk's
-        written timestamps are shifted to continue exactly where the
-        previous one left off, using the accumulated real source duration
-        (see run()'s cumulative_offset), not a guessed constant."""
-        in_path = os.path.join(self._download_dir, f"relay-in-{self.channel_id}-{seg_index}.webm")
-        out_path = os.path.join(self._download_dir, f"relay-{self.channel_id}-{seg_index}.ts")
-        try:
-            with open(in_path, "wb") as f:
-                f.write(blob)
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-fflags", "+genpts",
-                "-f", "webm", "-i", in_path,
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-bf", "0", "-x264-params", "threads=2",
-                "-pix_fmt", "yuv420p",
-                # One keyframe per whole chunk (libx264's default GOP under
-                # "ultrafast" is ~250 frames, i.e. the entire chunk) left the
-                # downstream "copy" mode's HLS muxer with nowhere to cut but
-                # the chunk's own irregular boundary (4-13s swings) - forcing
-                # a keyframe every 2s gives it real intermediate cut points,
-                # so segment cadence tracks hls_time instead of chunk size.
-                "-force_key_frames", "expr:gte(t,n_forced*2)",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2",
-                # "-async 1" (the legacy global flag) turned out to be a
-                # near no-op — "1" there is a mode selector, not a
-                # correction magnitude. This is the actual audio-timestamp-
-                # discontinuity-smoothing filter ffmpeg docs point at for
-                # exactly the "non monotonically increasing dts" class of
-                # warning this per-chunk encoder flush was producing.
-                "-af", "aresample=async=1:min_hard_comp=0.100000:first_pts=0",
-                "-output_ts_offset", f"{ts_offset:.3f}",
-                "-f", "mpegts", out_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode != 0:
-                err = result.stderr.decode("utf-8", errors="replace")[-300:]
-                logging.warning("[RELAY] %s chunk %d transcode failed: %s",
-                                self.channel_id, seg_index, err)
-                return None
-            return out_path
-        finally:
-            try:
-                os.remove(in_path)
-            except OSError:
-                pass
+    def _build_transcode_cmd(self) -> list:
+        """One of these runs for the lifetime of a single CDN connection
+        (restarted only at the next reconnect, never per-chunk). Reads a
+        continuous raw WebM byte stream via stdin, transcodes VP8/Opus ->
+        H.264/AAC, writes continuous MPEG-TS to stdout."""
+        return [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-fflags", "+genpts",
+            "-f", "webm", "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-bf", "0", "-x264-params", "threads=2", "-pix_fmt", "yuv420p",
+            # Real cut points for the downstream "copy" mode's HLS muxer
+            # every 2s of output — otherwise it's stuck waiting for
+            # whatever the encoder's own (long, variable) natural GOP
+            # boundary happens to be.
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-f", "mpegts", "pipe:1",
+        ]
 
     def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
-        """Reading (network-bound) and transcoding (CPU-bound) used to run
-        strictly sequentially in this loop — reading was fully blocked for
-        the whole ~0.6-1x-realtime duration of every transcode. That dead
-        time meant this source's actual production cadence was slower and
-        much burstier than its declared per-chunk durations, which is what
-        surfaced as periodic buffering even after the transcode itself got
-        fast enough to individually keep up with realtime. Transcoding one
-        chunk now happens on a background thread while reading immediately
-        continues accumulating the next one — a single-worker pool so
-        completions (and therefore enqueue() calls) stay strictly in
-        submission order without needing extra bookkeeping."""
-        import concurrent.futures
-        pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"relay-xcode-{self.channel_id}")
-        # Caps how far reading can outrun transcoding — steady state should
-        # rarely touch this (transcode is faster than realtime, reading is
-        # network-paced), it's just a backstop against unbounded memory
-        # growth if the CDN ever bursts well ahead of real-time.
-        backpressure = threading.Semaphore(3)
-
-        def _on_transcoded(idx, fut):
-            backpressure.release()
-            try:
-                out_path = fut.result()
-            except Exception as e:
-                logging.warning("[RELAY] %s chunk %d transcode raised: %s",
-                                self.channel_id, idx, e)
-                return
-            if not out_path:
-                return
-            from core.channels import ffprobe_duration
-            duration = ffprobe_duration(out_path)
-            enqueue(QueueItem(
-                kind="upstream",
-                source_path=out_path,
-                duration=duration or self.chunk_target_seconds,
-                label=f"relay:{idx}",
-            ))
-
-        try:
-            self._run_connections(stop_event, pool, _on_transcoded, backpressure)
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-    def _run_connections(self, stop_event, pool, on_transcoded, backpressure):
         seg_index = 0
-        # Persists across reconnects (not per-connection) — the output HLS
-        # timeline must stay continuous across a token-refresh reconnect,
-        # same as it already does content-wise.
-        cumulative_offset = 0.0
 
         while not stop_event.is_set():
             pair = self._fetch_token()
@@ -779,17 +626,76 @@ class ContinuousRelaySource(SegmentSource):
             logging.info("[RELAY] %s connected: %s", self.channel_id, stream_url.split("?")[0])
 
             try:
-                chunks = resp.iter_content(chunk_size=self.READ_CHUNK_BYTES)
-                captured = self._capture_init(chunks)
-                if not captured:
-                    logging.warning("[RELAY] %s never found a Cluster in the response — "
-                                    "reconnecting", self.channel_id)
-                    continue
-                init_bytes, pending = captured
-                pending = bytearray(pending)
-                deadline = time.time() + self.refresh_interval_seconds
-                last_cut = time.time()
+                enc_proc = subprocess.Popen(
+                    self._build_transcode_cmd(),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+            except Exception as e:
+                logging.warning("[RELAY] %s couldn't start encoder: %s", self.channel_id, e)
+                resp.close()
+                stop_event.wait(5.0)
+                continue
 
+            def _drain_stderr(proc=enc_proc):
+                try:
+                    while True:
+                        line = proc.stderr.readline()
+                        if not line:
+                            break
+                        text = line.decode("utf-8", errors="replace").rstrip()
+                        if text:
+                            logging.warning("[RELAY] %s encoder: %s", self.channel_id, text[-200:])
+                except Exception:
+                    pass
+
+            def _read_stdout(proc=enc_proc):
+                """Chunk the encoder's continuous MPEG-TS output into
+                QueueItem files. Plain byte/time cuts — MPEG-TS is
+                self-synchronizing at arbitrary offsets, no boundary-
+                finding needed the way WebM required on the input side."""
+                nonlocal seg_index
+                buf = bytearray()
+                last_flush = time.time()
+                try:
+                    while True:
+                        chunk = proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        due = (time.time() - last_flush) >= self.chunk_target_seconds
+                        forced = len(buf) > self.MAX_PEND_BYTES
+                        if not ((due and len(buf) > self.MIN_CHUNK_BYTES) or forced):
+                            continue
+                        idx = seg_index
+                        seg_index += 1
+                        out_path = os.path.join(self._download_dir,
+                                                f"relay-{self.channel_id}-{idx}.ts")
+                        with open(out_path, "wb") as f:
+                            f.write(bytes(buf))
+                        buf = bytearray()
+                        last_flush = time.time()
+                        from core.channels import ffprobe_duration
+                        duration = ffprobe_duration(out_path)
+                        enqueue(QueueItem(
+                            kind="upstream", source_path=out_path,
+                            duration=duration or self.chunk_target_seconds,
+                            label=f"relay:{idx}",
+                        ))
+                except Exception as e:
+                    logging.warning("[RELAY] %s stdout reader failed: %s", self.channel_id, e)
+                # Trailing partial buffer at connection end is small and
+                # discarded, same as the old design's boundary behavior —
+                # not worth emitting a short QueueItem for.
+
+            threading.Thread(target=_drain_stderr, daemon=True,
+                             name=f"relay-stderr-{self.channel_id}").start()
+            stdout_thread = threading.Thread(target=_read_stdout, daemon=True,
+                                             name=f"relay-stdout-{self.channel_id}")
+            stdout_thread.start()
+
+            deadline = time.time() + self.refresh_interval_seconds
+            try:
+                chunks = resp.iter_content(chunk_size=self.READ_CHUNK_BYTES)
                 while not stop_event.is_set() and time.time() < deadline:
                     try:
                         chunk = next(chunks)
@@ -799,40 +705,22 @@ class ContinuousRelaySource(SegmentSource):
                     except Exception as e:
                         logging.warning("[RELAY] %s read error: %s", self.channel_id, e)
                         break
-                    pending.extend(chunk)
-
-                    due = (time.time() - last_cut) >= self.chunk_target_seconds
-                    forced = len(pending) > self.MAX_PEND_BYTES
-                    if not ((due and len(pending) > self.MIN_CHUNK_BYTES) or forced):
-                        continue
-
-                    cut_in_pending = self._find_cluster_cut(bytes(pending))
-                    if cut_in_pending is None:
-                        if forced:
-                            logging.warning(
-                                "[RELAY] %s fewer than 2 Cluster boundaries in %d "
-                                "buffered bytes — force-cutting (will likely glitch)",
-                                self.channel_id, len(pending),
-                            )
-                            cut_in_pending = len(pending)
-                        else:
-                            continue
-
-                    seg_bytes = bytes(pending[:cut_in_pending])
-                    pending = pending[cut_in_pending:]
-                    idx = seg_index
-                    seg_index += 1
-                    blob = init_bytes + seg_bytes
-                    ts_offset = cumulative_offset
-                    cumulative_offset += self._probe_source_duration(blob)
-                    backpressure.acquire()
-                    future = pool.submit(self._transcode_chunk, blob, idx, ts_offset)
-                    future.add_done_callback(
-                        lambda fut, idx=idx: on_transcoded(idx, fut))
-                    last_cut = time.time()
-
-                if pending:
-                    logging.debug("[RELAY] %s discarding %d trailing bytes at reconnect",
-                                 self.channel_id, len(pending))
+                    try:
+                        enc_proc.stdin.write(chunk)
+                    except (BrokenPipeError, OSError) as e:
+                        logging.warning("[RELAY] %s encoder pipe broke: %s", self.channel_id, e)
+                        break
             finally:
                 resp.close()
+                try:
+                    enc_proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    enc_proc.wait(timeout=10)
+                except Exception:
+                    try:
+                        enc_proc.kill()
+                    except Exception:
+                        pass
+                stdout_thread.join(timeout=5)
