@@ -67,6 +67,12 @@ class Channel(Base):
     # primary manifest_id is never looked up in this map.
     fallback_encoder_modes = Column(JSONB, default=dict, nullable=False)
 
+    # Same idea as fallback_encoder_modes, but for source_kind — a fallback
+    # candidate can come from a genuinely different kind of source than the
+    # primary (e.g. an hls-sourced primary with a relay-sourced fallback).
+    # A candidate with no entry here inherits the channel's own source_kind.
+    fallback_source_kinds = Column(JSONB, default=dict, nullable=False)
+
     # B6: when true on a resolved channel, the upstream HLS goes through a
     # full transcode pipeline (same as scheduled channels). Bumps from the
     # channel's bump_config get spliced into ad-break gaps detected via

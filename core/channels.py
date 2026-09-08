@@ -80,6 +80,8 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
         base["fallback_manifest_ids"] = fb_ids
         fb_modes = dict(getattr(row, "fallback_encoder_modes", None) or {})
         base["fallback_encoder_modes"] = fb_modes
+        fb_kinds = dict(getattr(row, "fallback_source_kinds", None) or {})
+        base["fallback_source_kinds"] = fb_kinds
         fb_map = fallback_manifests or {}
         base["fallback_sources"] = [
             {
@@ -89,8 +91,9 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
                 "title": fb_map[mid].title if mid in fb_map else None,
                 "expires_at": (fb_map[mid].expires_at.isoformat()
                                if mid in fb_map and fb_map[mid].expires_at else None),
-                # None = inherits the channel's own encoder_mode
+                # None = inherits the channel's own encoder_mode/source_kind
                 "encoder_mode": fb_modes.get(mid),
+                "source_kind": fb_kinds.get(mid),
             }
             for mid in fb_ids
         ]
@@ -491,12 +494,18 @@ class ChannelManager:
         return self.get_channel(channel_id)
 
     def add_fallback_source(self, channel_id: str, manifest_id: str,
-                            encoder_mode: str | None = None) -> dict | None:
+                            encoder_mode: str | None = None,
+                            source_kind: str | None = None) -> dict | None:
         """Append a manifest to a resolved channel's fallback chain.
 
         `encoder_mode`, if given, overrides the channel's own encoder_mode
         for ONLY this candidate (e.g. a proxy-mode fallback source on an
         otherwise remux-mode channel) — pass None/omit to inherit.
+
+        `source_kind`, if given, likewise overrides the channel's own
+        source_kind for ONLY this candidate — e.g. a relay-sourced fallback
+        (ContinuousRelaySource) on an otherwise hls-sourced channel. Pass
+        None/omit to inherit.
 
         No-op (not an error) if the manifest is already the primary or
         already in the chain — keeps the endpoint idempotent. Returns the
@@ -521,8 +530,13 @@ class ChannelManager:
                 modes = dict(row.fallback_encoder_modes or {})
                 modes[manifest_id] = encoder_mode
                 row.fallback_encoder_modes = modes
-        logging.info("[CHANNELS] Added fallback source %s to channel %s%s", manifest_id, channel_id,
-                     f" (encoder_mode={encoder_mode})" if encoder_mode else "")
+            if source_kind:
+                kinds = dict(row.fallback_source_kinds or {})
+                kinds[manifest_id] = source_kind
+                row.fallback_source_kinds = kinds
+        logging.info("[CHANNELS] Added fallback source %s to channel %s%s%s", manifest_id, channel_id,
+                     f" (encoder_mode={encoder_mode})" if encoder_mode else "",
+                     f" (source_kind={source_kind})" if source_kind else "")
         return self.get_channel(channel_id)
 
     def remove_fallback_source(self, channel_id: str, manifest_id: str) -> dict | None:
@@ -544,6 +558,10 @@ class ChannelManager:
                 modes = dict(row.fallback_encoder_modes or {})
                 modes.pop(manifest_id, None)
                 row.fallback_encoder_modes = modes
+            if manifest_id in (row.fallback_source_kinds or {}):
+                kinds = dict(row.fallback_source_kinds or {})
+                kinds.pop(manifest_id, None)
+                row.fallback_source_kinds = kinds
         logging.info("[CHANNELS] Removed fallback source %s from channel %s", manifest_id, channel_id)
         return self.get_channel(channel_id)
 
@@ -570,10 +588,14 @@ class ChannelManager:
                     chain.append(mid)
                     seen.add(mid)
             row.fallback_manifest_ids = chain
-            # Prune encoder_mode overrides for anything no longer in the chain.
+            # Prune encoder_mode/source_kind overrides for anything no
+            # longer in the chain.
             modes = {mid: mode for mid, mode in (row.fallback_encoder_modes or {}).items()
                      if mid in seen}
             row.fallback_encoder_modes = modes
+            kinds = {mid: kind for mid, kind in (row.fallback_source_kinds or {}).items()
+                     if mid in seen}
+            row.fallback_source_kinds = kinds
         logging.info("[CHANNELS] Set fallback chain for channel %s: %s", channel_id, chain)
         return self.get_channel(channel_id)
 

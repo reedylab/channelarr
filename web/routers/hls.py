@@ -48,18 +48,23 @@ def _reload_manifest_url(manifest_id):
 def _pick_working_manifest(ch):
     """Walk [primary] + fallback_sources in order, returning the first
     candidate that looks usable as (manifest_id, manifest_url,
-    encoder_mode), or (None, None, None) if the channel has no primary
-    manifest at all. `encoder_mode` is the channel's own mode for the
-    primary, or a fallback's override from fallback_encoder_modes if it has
-    one (a source needing different serving behavior than the primary —
-    e.g. a plain-TS fallback source under an otherwise remux-mode primary),
-    else it also inherits the channel's mode.
+    encoder_mode, source_kind), or (None, None, None, None) if the channel
+    has no primary manifest at all. `encoder_mode`/`source_kind` are the
+    channel's own values for the primary, or a fallback's override from
+    fallback_encoder_modes/fallback_source_kinds if it has one (a source
+    needing different serving behavior or discovery mechanism than the
+    primary — e.g. a plain-TS fallback under an otherwise remux-mode
+    primary, or a relay-sourced fallback under an otherwise hls-sourced
+    primary), else each inherits the channel's own value.
 
     A candidate whose stored expires_at hasn't passed is trusted as-is —
     same as everywhere else expiry is checked in this app — costing nothing
     extra on the common healthy-primary path. An expired candidate gets one
     cheap light_refresh_manifest attempt (HTTP-only, no browser) before
-    being skipped for the next candidate in the chain.
+    being skipped for the next candidate in the chain. (A relay-sourced
+    candidate's expires_at is always None by design — ContinuousRelaySource
+    does its own token refresh live on every connection — so it's always
+    trusted-as-is here, never light-refreshed.)
 
     If every candidate is exhausted, falls back to today's exact pre-chain
     behavior: heavy-refresh the primary via the sidecar and use it
@@ -70,7 +75,9 @@ def _pick_working_manifest(ch):
 
     primary_id = ch.get("manifest_id")
     default_mode = ch.get("encoder_mode", "proxy")
+    default_kind = ch.get("source_kind", "hls")
     fb_modes = ch.get("fallback_encoder_modes") or {}
+    fb_kinds = ch.get("fallback_source_kinds") or {}
     candidates = []
     if primary_id:
         candidates.append({"manifest_id": primary_id, "manifest_url": ch.get("manifest_url"),
@@ -82,23 +89,24 @@ def _pick_working_manifest(ch):
         if not mid or not murl:
             continue
         mode = fb_modes.get(mid, default_mode) if i > 0 else default_mode
+        kind = fb_kinds.get(mid, default_kind) if i > 0 else default_kind
         if not _is_expired(cand.get("expires_at")):
             if i > 0:
-                logging.info("[HLS] %s: using fallback source #%d (%s, encoder_mode=%s)",
-                             ch.get("id"), i, mid, mode)
-            return mid, murl, mode
+                logging.info("[HLS] %s: using fallback source #%d (%s, encoder_mode=%s, source_kind=%s)",
+                             ch.get("id"), i, mid, mode, kind)
+            return mid, murl, mode, kind
         try:
             if ManifestResolverService.light_refresh_manifest(mid).get("ok"):
                 fresh = _reload_manifest_url(mid)
                 if fresh:
                     logging.info("[HLS] %s: light-refreshed %s candidate #%d",
                                  ch.get("id"), "primary" if i == 0 else "fallback", i)
-                    return mid, fresh, mode
+                    return mid, fresh, mode, kind
         except Exception as e:
             logging.warning("[HLS] light refresh failed for candidate %s: %s", mid, e)
 
     if not primary_id:
-        return None, None, None
+        return None, None, None, None
 
     # Whole chain exhausted — heavy-refresh the primary (sidecar/browser) and
     # use it best-effort, matching pre-chain behavior exactly.
@@ -108,10 +116,10 @@ def _pick_working_manifest(ch):
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
         if fresh:
-            return primary_id, fresh, default_mode
+            return primary_id, fresh, default_mode, default_kind
     except Exception as e:
         logging.warning("[HLS] Refresh before start failed for %s: %s", primary_id, e)
-    return primary_id, ch.get("manifest_url"), default_mode
+    return primary_id, ch.get("manifest_url"), default_mode, default_kind
 
 
 def _start_from_schedule(channel_id):
@@ -120,7 +128,7 @@ def _start_from_schedule(channel_id):
         return False, "Channel not found"
 
     if ch.get("type") == "resolved":
-        manifest_id, manifest_url, encoder_mode = _pick_working_manifest(ch)
+        manifest_id, manifest_url, encoder_mode, source_kind = _pick_working_manifest(ch)
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
 
@@ -143,8 +151,14 @@ def _start_from_schedule(channel_id):
             )
             return ok, "Started" if ok else "Already running"
 
-        # Transcode mode — full re-encode with bump insertion.
-        if ch.get("transcode_mediated"):
+        # Transcode mode — full re-encode (or, for "copy", just repackaging
+        # an already-compatible source) with bump insertion where relevant.
+        # Gated on the RESOLVED candidate's own encoder_mode, not just the
+        # channel's own transcode_mediated flag — a fallback can need the
+        # transcode pipeline (e.g. a relay-sourced fallback under an
+        # otherwise proxy/remux-mode primary) even when the channel itself
+        # isn't transcode-mediated by default.
+        if encoder_mode in ("single", "multi", "copy") or ch.get("transcode_mediated"):
             ok = shared_state.streamer_mgr.start_resolved_channel(
                 channel_id,
                 manifest_id=manifest_id,
@@ -156,7 +170,7 @@ def _start_from_schedule(channel_id):
                 profile_name=ch.get("profile_name", "auto"),
                 branding_logo_path=shared_state.streamer_mgr._resolve_branding_path(ch.get("branding_logo")),
                 encoder_mode=encoder_mode,
-                source_kind=ch.get("source_kind", "hls"),
+                source_kind=source_kind,
             )
             return ok, "Started" if ok else "Already running"
 
