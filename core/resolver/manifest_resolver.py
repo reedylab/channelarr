@@ -162,11 +162,19 @@ def refresh_due_manifests():
 
     Acquires the module-level pipeline_lock non-blocking so it can't
     overlap with the JIT event resolver — both pump work into the single
-    selenium sidecar and must take turns.
+    selenium sidecar and must take turns. Held only around each individual
+    sidecar call in the heavy-refresh loop below, not the whole tick — a
+    batch of 5 heavy refreshes at ~30-100s each used to hold the lock
+    continuously for minutes, which starved the JIT event resolver (its own
+    acquire is non-blocking, so it just backs off every 2 min tick and never
+    gets a turn during a refresh storm, e.g. an upstream source going down
+    for several always-on channels at once). Releasing between items gives
+    JIT real windows to grab the lock in between.
     """
     if not pipeline_lock.acquire(blocking=False):
         logger.info("[RESOLVER] Refresh tick skipped — pipeline busy (JIT or prior tick)")
         return
+    needs_heavy: list[str] = []
     try:
         from core.models.channel import Channel
         now = datetime.now(timezone.utc)
@@ -230,7 +238,6 @@ def refresh_due_manifests():
 
         logger.info("[RESOLVER] Refresh tick: %d manifests due (demand=%d always-on=%d)",
                     len(ids), len(demand_rows), len(always_on_rows))
-        needs_heavy: list[str] = []
         for mid in ids:
             try:
                 light = ManifestResolverService.light_refresh_manifest(mid)
@@ -243,22 +250,31 @@ def refresh_due_manifests():
                 needs_heavy.append(mid)
             except Exception as e:
                 logger.warning("[RESOLVER] light refresh %s errored: %s", mid, e)
-
-        if not needs_heavy:
-            return
-
-        budget = HEAVY_REFRESH_BUDGET_PER_TICK
-        logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
-                    len(needs_heavy), budget)
-        for mid in needs_heavy[:budget]:
-            try:
-                ManifestResolverService.refresh_manifest(mid)
-            except Exception as e:
-                logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
     except Exception as e:
         logger.exception("[RESOLVER] refresh tick error: %s", e)
     finally:
         pipeline_lock.release()
+
+    if not needs_heavy:
+        return
+
+    budget = HEAVY_REFRESH_BUDGET_PER_TICK
+    logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
+                len(needs_heavy), budget)
+    for i, mid in enumerate(needs_heavy[:budget]):
+        # Non-blocking, per-item — see refresh_due_manifests' docstring for
+        # why this isn't just one acquire around the whole loop.
+        if not pipeline_lock.acquire(blocking=False):
+            logger.info("[RESOLVER] Heavy refresh yielding lock (JIT or another tick got it) "
+                        "— %d/%d remaining will retry next tick",
+                        len(needs_heavy[:budget]) - i, len(needs_heavy[:budget]))
+            break
+        try:
+            ManifestResolverService.refresh_manifest(mid)
+        except Exception as e:
+            logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
+        finally:
+            pipeline_lock.release()
 
 
 _native_mod = False  # False = not yet looked up; None = absent; else module

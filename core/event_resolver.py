@@ -150,16 +150,29 @@ def resolve_due_events():
     them to `ManifestResolverService.resolve_batch`. Reconcile statuses from
     the batch result.
 
-    Acquires the resolver pipeline_lock non-blocking — if the manifest
-    refresh tick (or another JIT tick) is already pumping work into the
-    single-threaded sidecar, skip this tick. The next interval will retry.
+    Acquires the resolver pipeline_lock — if the manifest refresh tick (or
+    another JIT tick) is already pumping work into the single-threaded
+    sidecar, wait up to LOCK_WAIT_SECONDS for it to free up rather than
+    bailing instantly. The refresh tick releases the lock between each
+    heavy-refresh item (see refresh_due_manifests), but a single item's
+    sidecar capture can itself take ~60-90s during a real outage, with the
+    next item starting almost immediately after — measured live during a
+    real upstream outage: items ~78s apart, essentially no gap. An 8s wait
+    (first attempt at this fix) was nowhere close to covering that and JIT
+    stayed starved. Since threading.Lock.acquire(timeout=N) blocks and wakes
+    the instant the lock is released (not polling in coarse steps), a wait
+    just under this job's own 120s tick interval reliably catches the very
+    next release — whatever's currently in flight when JIT ticks, not just
+    whatever happens to be free at that exact instant.
     """
     from core.database import get_session
     from core.models import ScrapedEvent
     from core.resolver.manifest_resolver import pipeline_lock
 
-    if not pipeline_lock.acquire(blocking=False):
-        logger.info("[QUEUE] JIT tick skipped — resolver pipeline busy")
+    LOCK_WAIT_SECONDS = 100  # under the 120s JIT tick interval, above a single item's worst case
+    if not pipeline_lock.acquire(timeout=LOCK_WAIT_SECONDS):
+        logger.info("[QUEUE] JIT tick skipped — resolver pipeline busy (waited %ds)",
+                    LOCK_WAIT_SECONDS)
         return
     try:
         _resolve_due_events_inner()
