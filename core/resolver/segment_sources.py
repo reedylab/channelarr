@@ -532,6 +532,19 @@ class ContinuousRelaySource(SegmentSource):
     MAX_PEND_BYTES = 24_000_000    # force-flush safety cap
     READ_CHUNK_BYTES = 65_536
 
+    # If the token/decode endpoint (or the CDN itself) is down upstream,
+    # _open_connection() keeps returning None and run() used to retry
+    # forever with a 5s backoff — the poller thread never exits, so
+    # ResolvedChannelStream.status() (which only checks the feeder
+    # thread) kept reporting running:true indefinitely, and the fallback
+    # chain in web/routers/hls.py never got a chance to re-pick and try
+    # the next candidate. Same bug class RemuxStream had (see
+    # MAX_CONSECUTIVE_FAILURES there) — found via a real upstream outage
+    # (a relay source's decode endpoint returning a broken result
+    # site-wide) that left a fallback stuck "running" for 20+ minutes
+    # while its own working fallback sat unused behind it.
+    MAX_CONSECUTIVE_CONNECT_FAILURES = 5
+
     def __init__(self, *, channel_id: str, player_page_url: str,
                  decode_url_template: str, referer_template: str,
                  cdn_url_template: str, source_domain: str = "",
@@ -649,6 +662,7 @@ class ContinuousRelaySource(SegmentSource):
         # loop iteration skip straight to encoder startup instead of
         # paying for token-fetch + CDN-connect on the critical path.
         prefetched_resp = None
+        consecutive_failures = 0
 
         while not stop_event.is_set():
             if prefetched_resp is not None:
@@ -657,9 +671,18 @@ class ContinuousRelaySource(SegmentSource):
             else:
                 resp = self._open_connection()
                 if resp is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_CONNECT_FAILURES:
+                        logging.error(
+                            "[RELAY] %s giving up after %d consecutive connect "
+                            "failures — upstream token/CDN endpoint looks down",
+                            self.channel_id, consecutive_failures)
+                        stop_event.set()
+                        return
                     stop_event.wait(5.0)
                     continue
 
+            consecutive_failures = 0
             logging.info("[RELAY] %s connected: %s", self.channel_id, resp._relay_log_url)
 
             def _raise_priority():
