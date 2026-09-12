@@ -144,12 +144,17 @@ def refresh_due_manifests():
     through the same sidecar pipeline used by user-driven resolves and the
     JIT event resolver.
 
-    Two pools per tick:
+    Three pools per tick:
       1. Demand-driven — manifests whose channel was accessed in the last
          10 min. Standard live-stream freshness window.
       2. 24/7 channels — resolved channels with no event_start/event_end
          (always-on intent). Refreshed regardless of access because the
          user expects them to be tunable at any time.
+      3. Always-on channels' FALLBACK chain — same always-on channels as
+         #2, but their fallback_manifest_ids too, not just the primary.
+         Without this, a fallback that isn't the active source just rots
+         until the one moment the chain actually reaches for it — which
+         defeats the point of having a fallback at all.
 
     Each manifest is first tried via light_refresh_manifest() (HTTP only,
     cheap, uncapped). Light refreshes that fail get queued for the heavy
@@ -231,13 +236,59 @@ def refresh_due_manifests():
                 .limit(10)
                 .all()
             )
-            ids = list({r[0] for r in (demand_rows + always_on_rows)})
+
+            # Fallback-chain manifests get ZERO proactive refreshing above —
+            # the join is Channel.manifest_id == Manifest.id, primary only.
+            # A fallback that hasn't been the active source recently just
+            # silently rots until the one moment it's actually needed, which
+            # defeats the point of having a fallback chain at all (found
+            # while investigating a channel whose fallback manifest had been
+            # expired for days and failed even a light refresh the one time
+            # the chain reached for it). Sweep always-on channels' fallback
+            # lists into the same warm-keeping pool, skipping any candidate
+            # explicitly overridden to source_kind=relay for that channel
+            # (same reasoning as the primary-side relay exclusion above).
+            always_on_channels = (
+                session.query(Channel.fallback_manifest_ids, Channel.fallback_source_kinds)
+                .filter(Channel.type == "resolved")
+                .filter(Channel.event_start.is_(None))
+                .filter(Channel.event_end.is_(None))
+                .all()
+            )
+            fallback_ids = set()
+            for fb_ids, fb_kinds in always_on_channels:
+                fb_kinds = fb_kinds or {}
+                for fid in (fb_ids or []):
+                    if fb_kinds.get(fid) != "relay":
+                        fallback_ids.add(fid)
+            fallback_ids -= {r[0] for r in always_on_rows}  # already covered above
+
+            always_on_fallback_rows = []
+            if fallback_ids:
+                always_on_fallback_rows = (
+                    session.query(Manifest.id)
+                    .filter(Manifest.id.in_(fallback_ids))
+                    .filter(Manifest.active == True)
+                    .filter(
+                        (Manifest.expires_at.is_(None)) |
+                        (Manifest.expires_at < soon)
+                    )
+                    .filter(
+                        (Manifest.last_refreshed_at.is_(None)) |
+                        (Manifest.last_refreshed_at < cooldown)
+                    )
+                    .order_by(Manifest.last_refreshed_at.asc().nulls_first())
+                    .limit(10)
+                    .all()
+                )
+
+            ids = list({r[0] for r in (demand_rows + always_on_rows + always_on_fallback_rows)})
 
         if not ids:
             return
 
-        logger.info("[RESOLVER] Refresh tick: %d manifests due (demand=%d always-on=%d)",
-                    len(ids), len(demand_rows), len(always_on_rows))
+        logger.info("[RESOLVER] Refresh tick: %d manifests due (demand=%d always-on=%d always-on-fallback=%d)",
+                    len(ids), len(demand_rows), len(always_on_rows), len(always_on_fallback_rows))
         for mid in ids:
             try:
                 light = ManifestResolverService.light_refresh_manifest(mid)
