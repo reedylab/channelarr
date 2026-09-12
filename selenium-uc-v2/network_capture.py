@@ -324,37 +324,83 @@ async def scan_for_skip_phrase(connection) -> str | None:
     return None
 
 
-async def get_cookies(connection) -> list[dict]:
-    """CDP Network.getAllCookies — not per-domain get_cookies() — deliberately,
-    per app.py's own reasoning: segment/key auth often lives on a different
-    subdomain than the page, and per-domain lookups miss it.
+def _raw_cmd(method: str, params: dict | None = None):
+    """A minimal CDP-command generator mimicking the shape nodriver's own
+    typed cdp.* functions use (yield the command dict once, receive the raw
+    response dict back via .send()) but WITHOUT any typed response parsing.
 
-    Timeout-wrapped: nodriver's real Connection._listener (confirmed via its
-    own source) does `self.mapper.pop(message["id"])` for command responses
-    with NO exception guard at all. A KeyError there (a real risk under the
-    burst of concurrent get_response_body sends a busy real page's matched
-    responses trigger -- confirmed as the actual root cause of a hang-to-
-    full-deadline regression that looked like a capture-logic bug but wasn't)
-    propagates out of the listener's while-loop and kills that task silently
-    -- asyncio just logs an orphaned-task-exception and moves on. Every
-    subsequent .send() on that connection then hangs forever, since nothing
-    is left reading the websocket to resolve its Transaction future. This
-    call runs AFTER the manifest is already found, so a timeout here just
-    means slightly less-complete metadata, never a lost capture."""
+    Exists to work around a real, confirmed nodriver bug: Transaction.__call__
+    (nodriver/core/connection.py) does
+        try: self.__cdp_obj__.send(response["result"])
+        except KeyError as e: raise KeyError(...)
+    -- it catches KeyError but only re-raises it, NEVER calls
+    self.set_exception(...). nodriver's typed Cookie.from_json() accesses a
+    `sameParty` field real Chrome (152/153, as run here) no longer sends,
+    raising exactly this KeyError on every single Network.getAllCookies /
+    Storage.getCookies response. Since the Transaction's future never gets
+    marked done either way, and this KeyError propagates fully unguarded out
+    of Connection._listener's `tx(**message)` call (no try/except there
+    either -- confirmed via that method's own source), the ENTIRE listener
+    task dies silently on the very first cookie extraction attempt.  Every
+    subsequent .send() on that connection then hangs forever. This was a
+    real, live bug: get_cookies() was silently returning [] on every single
+    real capture (masked by its own timeout-and-swallow except clause) --
+    not "no cookies present," but "nodriver's own typed parser crashed
+    before ever handing back real data."
+
+    Feeding a plain dict-returning generator into the SAME unmodified
+    Transaction/Connection.send() machinery sidesteps Cookie.from_json()
+    entirely -- we parse the handful of fields we need ourselves, via plain
+    dict access below, immune to whatever fields nodriver's stubs expect
+    that current Chrome may or may not still send."""
+    response = yield {"method": method, "params": params or {}}
+    return response
+
+
+async def get_cookies(connection, scoped: bool = False) -> list[dict]:
+    """Two modes, both via _raw_cmd (see its docstring for why):
+
+    scoped=False (default, /capture's use case): Storage.getCookies --
+    ALL cookies in the whole browser profile, not just the current page's
+    origin. Deliberate, per app.py's own reasoning: segment/key auth often
+    lives on a different subdomain than the page, and a per-page-scoped
+    lookup would miss it.
+
+    scoped=True (/cookies/youtube's use case): Network.getCookies with no
+    `urls` param, which CDP itself defines as "the URLs of the page and all
+    of its subframes" -- i.e. scoped to whatever this specific tab is
+    currently on. Needed because unscoped Storage.getCookies against a
+    long-lived, shared, persistent Chrome profile returns EVERY cookie
+    accumulated from every site ever visited in that profile (confirmed:
+    234 cookies from unrelated domains on a real run), not just youtube.com's
+    -- v1 avoids this for free via Selenium's browser.get_cookies(), which
+    is naturally page-scoped by the browser itself; nodriver's raw CDP calls
+    have no such default, so the scoping has to be explicit here.
+
+    Timeout-wrapped for defense-in-depth even though _raw_cmd already fixes
+    the specific listener-killing bug this call used to hit (see _raw_cmd's
+    docstring) -- a separate, different failure (e.g. the mapper.pop()
+    KeyError documented elsewhere in this file) could still wedge the
+    connection for unrelated reasons. This call runs AFTER the manifest is
+    already found (/capture) or after settling on the target page
+    (/cookies/youtube), so a timeout here just means slightly less-complete
+    metadata, never a lost capture."""
+    method = "Network.getCookies" if scoped else "Storage.getCookies"
     try:
-        result = await asyncio.wait_for(connection.send(uc.cdp.network.get_all_cookies()), timeout=5.0)
-        raw = result if isinstance(result, list) else getattr(result, "cookies", []) or []
+        result = await asyncio.wait_for(connection.send(_raw_cmd(method)), timeout=5.0)
+        raw = (result or {}).get("cookies") or []
         out = []
         for c in raw:
+            expires = c.get("expires")
             out.append({
-                "name": getattr(c, "name", None),
-                "value": getattr(c, "value", None),
-                "domain": getattr(c, "domain", None),
-                "path": getattr(c, "path", None) or "/",
-                "secure": bool(getattr(c, "secure", False)),
-                "httpOnly": bool(getattr(c, "http_only", False)),
-                "expiry": int(getattr(c, "expires", -1)) if getattr(c, "expires", -1) and getattr(c, "expires", -1) > 0 else None,
-                "sameSite": str(getattr(c, "same_site", None)) if getattr(c, "same_site", None) else None,
+                "name": c.get("name"),
+                "value": c.get("value"),
+                "domain": c.get("domain"),
+                "path": c.get("path") or "/",
+                "secure": bool(c.get("secure")),
+                "httpOnly": bool(c.get("httpOnly")),
+                "expiry": int(expires) if expires and expires > 0 else None,
+                "sameSite": c.get("sameSite"),
             })
         return out
     except Exception:

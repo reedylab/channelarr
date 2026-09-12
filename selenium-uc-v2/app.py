@@ -286,7 +286,7 @@ async def cookies_youtube():
         browser = await _get_browser()
         tab = await browser.get("https://youtube.com", new_tab=True)
         await asyncio.sleep(2)
-        cookies = await nc.get_cookies(tab)
+        cookies = await nc.get_cookies(tab, scoped=True)
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -303,4 +303,11 @@ async def cookies_youtube():
         secure = "TRUE" if c.get("secure") else "FALSE"
         expiry = c.get("expiry") or 0
         lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{c['name']}\t{c['value']}")
-    return {"ok": True, "cookies_txt": "\n".join(lines)}
+    # Field names (netscape/count) match v1's exact contract -- confirmed
+    # via core/youtube.py, which reads data.get("netscape") and
+    # data.get("count", 0) specifically. A prior version of this endpoint
+    # used "cookies_txt" instead of "netscape" -- a real contract bug that
+    # would have made every response silently useless downstream (always
+    # read as empty via `data.get("netscape") or ""`) regardless of
+    # whether cookie extraction itself worked.
+    return {"ok": True, "netscape": "\n".join(lines), "count": len(cookies)}
