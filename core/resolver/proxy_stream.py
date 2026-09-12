@@ -24,6 +24,8 @@ from urllib.parse import urljoin
 
 import requests as http_requests
 
+from core.diagnostics import record_sample, record_event, incr_counter
+
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 2  # seconds between playlist polls
@@ -285,7 +287,11 @@ class ProxyStream:
                 )
                 if resp.status_code in (401, 403, 404):
                     consecutive_errors += 1
+                    incr_counter(self.channel_id, "playlist_errors")
                     if consecutive_errors > 3:
+                        record_event(self.channel_id, "give_up",
+                                    {"reason": "consecutive_playlist_errors",
+                                     "count": consecutive_errors})
                         logging.error("[PROXY] %s giving up after %d consecutive errors",
                                       self.channel_id, consecutive_errors)
                         self._stop_event.set()
@@ -387,13 +393,17 @@ class ProxyStream:
                 try:
                     local_filename = f"seg_{local_seq:05d}.ts"
                     local_path = os.path.join(self.hls_dir, local_filename)
+                    _fetch_start = time.time()
                     self._download_segment(seg, local_path)
+                    record_sample(self.channel_id, "fetch_latency_ms",
+                                 (time.time() - _fetch_start) * 1000)
                     segment_files.append((local_seq, local_filename, seg["duration"], seg.get("discontinuity", False)))
                     local_seq += 1
                     new_count += 1
                     self._consecutive_decrypt_failures = 0
                 except _DecryptError as e:
                     self._consecutive_decrypt_failures += 1
+                    incr_counter(self.channel_id, "decrypt_failures")
                     logging.warning("[PROXY] %s decrypt failed for %s: %s (#%d consecutive)",
                                     self.channel_id, uri[:80], e,
                                     self._consecutive_decrypt_failures)
@@ -409,6 +419,9 @@ class ProxyStream:
                 now_mono = time.monotonic()
                 since_last = now_mono - self._last_decrypt_refresh_at
                 if since_last >= DECRYPT_REFRESH_DEBOUNCE_SECONDS:
+                    record_event(self.channel_id, "session_refresh",
+                                {"reason": "consecutive_decrypt_failures",
+                                 "count": self._consecutive_decrypt_failures})
                     logging.warning("[PROXY] %s triggering manifest refresh after %d "
                                     "consecutive decrypt failures (stale session?)",
                                     self.channel_id, self._consecutive_decrypt_failures)

@@ -433,6 +433,19 @@ class ChannelStream:
                         ts_offset += file_elapsed
                         logging.info("[STREAM] Finished [%s] in %.1fs, next offset=%.1fs",
                                      self._current_title, file_elapsed, ts_offset)
+                        # -re paces the encoder's input read to realtime, so
+                        # a file that took longer than its own duration to
+                        # encode means the encoder fell behind under CPU
+                        # contention — same signal ContinuousRelaySource
+                        # tracks, just derived from wall-clock instead of a
+                        # -progress read since -re already gives us realtime
+                        # pacing for free.
+                        expected = (bump_duration if is_bump
+                                   else max(0.0, entry.get("duration", 0) - seek))
+                        if expected > 0 and file_elapsed > 0:
+                            from core.diagnostics import record_sample
+                            record_sample(self.channel_id, "encode_speed_ratio",
+                                         expected / file_elapsed)
                         # Clean up YouTube file after successful encoding
                         if is_youtube:
                             yt_id = entry.get("yt_id", "")
@@ -556,6 +569,10 @@ class StreamerManager:
             if self._streams[channel_id].status()["running"]:
                 return False
 
+        from core.diagnostics import clear_channel, set_meta
+        clear_channel(channel_id)
+        set_meta(channel_id, source_kind="local", encoder_mode="schedule", fallback_active=False)
+
         hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
         hls_dir = os.path.join(hls_base, channel_id)
 
@@ -613,6 +630,11 @@ class StreamerManager:
             except Exception:
                 pass
             del self._streams[channel_id]
+
+        from core.diagnostics import clear_channel, set_meta
+        clear_channel(channel_id)
+        set_meta(channel_id, source_kind=source_kind or "hls", encoder_mode=encoder_mode,
+                  fallback_active=False)
 
         # Resolve bump folders into a flat list of files with durations
         folders = (bump_config or {}).get("folders") or []
@@ -684,6 +706,10 @@ class StreamerManager:
                 pass
             del self._streams[channel_id]
 
+        from core.diagnostics import clear_channel, set_meta
+        clear_channel(channel_id)
+        set_meta(channel_id, source_kind="hls", encoder_mode="proxy", fallback_active=False)
+
         hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
         hls_dir = os.path.join(hls_base, channel_id)
 
@@ -720,6 +746,10 @@ class StreamerManager:
                 pass
             del self._streams[channel_id]
 
+        from core.diagnostics import clear_channel, set_meta
+        clear_channel(channel_id)
+        set_meta(channel_id, source_kind="hls", encoder_mode="remux", fallback_active=False)
+
         hls_base = self._get("HLS_OUTPUT_PATH", "/app/data/hls")
         hls_dir = os.path.join(hls_base, channel_id)
 
@@ -729,7 +759,15 @@ class StreamerManager:
             manifest_url=manifest_url,
             hls_dir=hls_dir,
             hls_time=int(self._get("HLS_TIME", "6")),
-            hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+            # Separate from the shared HLS_LIST_SIZE (used by every other
+            # mode) — remux-mode's output window is a hand-written playlist
+            # (core/resolver/remux_stream.py's _write_output_playlist), not
+            # ffmpeg's own HLS segmenter, so it can be tuned independently.
+            # Testing a deeper window (20 vs the global default of 10) to
+            # absorb the multi-second upstream fetch stalls diagnostics
+            # surfaced on remux channels — trades live-edge latency for
+            # stall resistance, see project memory for the tradeoff.
+            hls_list_size=int(self._get("HLS_LIST_SIZE_REMUX", "20")),
             loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
         )
         stream.start()

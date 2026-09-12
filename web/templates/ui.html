@@ -56,6 +56,9 @@
         <button class="nav-item" data-view="resolver" title="Resolver">
           <span class="nav-ic">&#9906;</span> <span>Resolver</span>
         </button>
+        <button class="nav-item" data-view="diagnostics" title="Diagnostics">
+          <span class="nav-ic">&#9889;</span> <span>Diagnostics</span>
+        </button>
         <button class="nav-item" data-view="scrapers" title="Scrapers">
           <span class="nav-ic">&#9830;</span> <span>Scrapers</span>
         </button>
@@ -220,6 +223,24 @@
               <div class="resolver-player-wrap">
                 <video id="resolver-video" controls autoplay></video>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- DIAGNOSTICS -->
+      <section id="view-diagnostics" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Live Diagnostics</h3>
+            <div class="panel-actions">
+              <span class="text-muted" style="font-size:12px">Every currently-playing stream, live (pushed as new data lands)</span>
+              <button id="diag-wall-btn" class="btn btn-sm btn-primary">Open Multi-View</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div class="diagnostics-grid" id="diagnostics-grid">
+              <div class="empty-state"><div class="empty-icon">&#9889;</div>No streams currently playing.</div>
             </div>
           </div>
         </div>
@@ -401,8 +422,10 @@
             <h3 id="chart-modal-title">CPU</h3>
             <button class="btn-close" id="chart-modal-close">&times;</button>
           </div>
+          <div class="chart-modal-live-summary hidden" id="chart-modal-live-summary"></div>
           <div class="chart-modal-ranges" id="chart-modal-ranges"></div>
           <div class="chart-modal-chart" id="chart-modal-chart"></div>
+          <div class="chart-modal-events hidden" id="chart-modal-events"></div>
         </div>
       </div>
 

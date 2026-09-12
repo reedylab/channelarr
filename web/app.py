@@ -20,7 +20,7 @@ from core.channels import ChannelManager, materialize_schedule
 from core.streamer import StreamerManager
 
 from web import shared_state
-from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube, resolve, resolved_stream, scrapers, scraped_events, integrations, logo_search
+from web.routers import channels, epg, media, bumps, settings, system, hls, hdhr, youtube, resolve, resolved_stream, scrapers, scraped_events, integrations, logo_search, diagnostics
 
 
 def _clean_stale_hls():
@@ -189,6 +189,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     add_job("vpn_sampler", sample_latency, seconds=60)
+
+    # Per-stream diagnostics rollup — periodic Postgres snapshot of the
+    # in-memory ring buffers in core/diagnostics.py, so history survives a
+    # stream restarting/idling out.
+    from core.diagnostics import rollup_tick
+
+    def _diagnostics_rollup_tick():
+        rollup_tick(streamer_mgr.get_all_status())
+
+    add_job("diagnostics_rollup", _diagnostics_rollup_tick, seconds=60)
     if get_setting("GLUETUN_CONTROL_URL", ""):
         # Auto-rotate "checker" runs every 60s and self-skips unless the
         # vpn_auto_rotate_minutes setting > 0 AND enough time has elapsed.
@@ -280,6 +290,7 @@ app.include_router(scrapers.router, prefix="/api")
 app.include_router(scraped_events.router, prefix="/api")
 app.include_router(integrations.router, prefix="/api")
 app.include_router(logo_search.router, prefix="/api")
+app.include_router(diagnostics.router, prefix="/api")
 app.include_router(resolved_stream.router)
 
 
@@ -291,3 +302,8 @@ def health():
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     return _templates.TemplateResponse("ui.html", {"request": request, "api_base": "/api"})
+
+
+@app.get("/diagnostics-wall", response_class=HTMLResponse)
+def diagnostics_wall(request: Request):
+    return _templates.TemplateResponse("diagnostics_wall.html", {"request": request, "api_base": "/api"})

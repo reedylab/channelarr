@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from web import shared_state
 from core.config import get_setting
 from core.channels import find_schedule_position
+from core.diagnostics import record_sample, record_event, set_meta
 
 router = APIRouter()
 
@@ -94,6 +95,9 @@ def _pick_working_manifest(ch):
             if i > 0:
                 logging.info("[HLS] %s: using fallback source #%d (%s, encoder_mode=%s, source_kind=%s)",
                              ch.get("id"), i, mid, mode, kind)
+                record_event(ch.get("id"), "fallback_activated",
+                            {"index": i, "manifest_id": mid, "reason": "primary_expired_or_exhausted"})
+            set_meta(ch.get("id"), fallback_active=(i > 0))
             return mid, murl, mode, kind
         try:
             if ManifestResolverService.light_refresh_manifest(mid).get("ok"):
@@ -101,6 +105,10 @@ def _pick_working_manifest(ch):
                 if fresh:
                     logging.info("[HLS] %s: light-refreshed %s candidate #%d",
                                  ch.get("id"), "primary" if i == 0 else "fallback", i)
+                    record_event(ch.get("id"),
+                                "fallback_activated" if i > 0 else "manifest_light_refreshed",
+                                {"index": i, "manifest_id": mid})
+                    set_meta(ch.get("id"), fallback_active=(i > 0))
                     return mid, fresh, mode, kind
         except Exception as e:
             logging.warning("[HLS] light refresh failed for candidate %s: %s", mid, e)
@@ -112,6 +120,8 @@ def _pick_working_manifest(ch):
     # use it best-effort, matching pre-chain behavior exactly.
     logging.info("[HLS] %s: all %d candidate(s) failed light refresh, heavy-refreshing primary %s",
                  ch.get("id"), len(candidates), primary_id)
+    record_event(ch.get("id"), "fallback_chain_exhausted", {"candidates_tried": len(candidates)})
+    set_meta(ch.get("id"), fallback_active=False)
     try:
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
@@ -222,25 +232,32 @@ def hls_playlist(channel_id: str):
                 if not ok:
                     logging.warning("[HLS] Auto-start failed for %s: %s", channel_id, msg)
                     raise HTTPException(status_code=404)
-            deadline = time.time() + 90
+            _wait_start = time.time()
+            deadline = _wait_start + 90
             while time.time() < deadline:
                 if os.path.isfile(playlist):
                     break
                 time.sleep(0.3)
             else:
+                record_sample(channel_id, "playlist_cold_wait_ms", (time.time() - _wait_start) * 1000)
+                record_event(channel_id, "playlist_wait_timeout", {"waited_s": 90})
                 logging.error("[HLS] Timed out waiting for playlist: %s", channel_id)
                 raise HTTPException(status_code=503)
+            record_sample(channel_id, "playlist_cold_wait_ms", (time.time() - _wait_start) * 1000)
         finally:
             lock.release()
 
     if not os.path.isfile(playlist):
-        deadline = time.time() + 10
+        _warm_wait_start = time.time()
+        deadline = _warm_wait_start + 10
         while time.time() < deadline:
             if os.path.isfile(playlist):
                 break
             time.sleep(0.3)
         else:
+            record_sample(channel_id, "playlist_warm_wait_ms", (time.time() - _warm_wait_start) * 1000)
             raise HTTPException(status_code=503, detail="Stream not ready")
+        record_sample(channel_id, "playlist_warm_wait_ms", (time.time() - _warm_wait_start) * 1000)
 
     return FileResponse(
         playlist,

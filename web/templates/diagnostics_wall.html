@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Channelarr — Multi-View</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css?v=36" />
+</head>
+<body class="theme-dark wall-body">
+  <div class="wall-controls">
+    <span class="wall-controls-label">Streams:</span>
+    <div class="wall-slot-toggle">
+      <button data-slots-btn="1" class="active">1</button>
+      <button data-slots-btn="2">2</button>
+      <button data-slots-btn="3">3</button>
+      <button data-slots-btn="4">4</button>
+    </div>
+  </div>
+  <div class="wall-grid" id="wall-grid" data-slots="1"></div>
+
+  <script>
+    window.API_BASE = "{{ api_base | default('/api') }}";
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="/static/wall.js?v=1"></script>
+</body>
+</html>

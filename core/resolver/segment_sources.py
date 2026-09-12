@@ -39,6 +39,7 @@ from urllib.parse import urljoin
 
 import requests as http_requests
 
+from core.diagnostics import record_sample, record_event, incr_counter
 from core.resolver.profiles import (
     StreamProfile,
     UpstreamSegment,
@@ -219,6 +220,7 @@ class HlsPlaylistSource(SegmentSource):
         (the encoder loop deletes after encoding).
         """
         local_path = os.path.join(self._download_dir, f"seg_{seg.seq}.ts")
+        _fetch_start = time.time()
 
         ffmpeg_headers = []
         if self.source_domain:
@@ -275,6 +277,7 @@ class HlsPlaylistSource(SegmentSource):
             if result.returncode != 0:
                 err = result.stderr.decode("utf-8", errors="replace")[-300:]
                 raise RuntimeError(f"download failed: {err}")
+        record_sample(self.channel_id, "fetch_latency_ms", (time.time() - _fetch_start) * 1000)
         return local_path
 
     def _enqueue_upstream(self, seg: UpstreamSegment, enqueue: Callable[[QueueItem], None]):
@@ -314,7 +317,11 @@ class HlsPlaylistSource(SegmentSource):
                 resp = http_requests.get(variant_url, headers=self._upstream_headers(), timeout=10)
                 if resp.status_code in (401, 403):
                     consecutive_403s += 1
+                    incr_counter(self.channel_id, "auth_failures")
                     if consecutive_403s > 3:
+                        record_event(self.channel_id, "give_up",
+                                    {"reason": "consecutive_auth_failures",
+                                     "count": consecutive_403s})
                         logging.error(
                             "[RESOLVED-XCODE] %s giving up after %d consecutive auth failures",
                             self.channel_id, consecutive_403s,
@@ -663,8 +670,14 @@ class ContinuousRelaySource(SegmentSource):
         # paying for token-fetch + CDN-connect on the critical path.
         prefetched_resp = None
         consecutive_failures = 0
+        # Set at the end of a connection's finally-block (below); read at the
+        # next connection's first emitted chunk to turn "how long between
+        # connections" into a measured, chartable blip instead of something
+        # only visible by eyeballing docker logs.
+        last_disconnect_ts = None
 
         while not stop_event.is_set():
+            used_prefetch = prefetched_resp is not None
             if prefetched_resp is not None:
                 resp = prefetched_resp
                 prefetched_resp = None
@@ -672,7 +685,11 @@ class ContinuousRelaySource(SegmentSource):
                 resp = self._open_connection()
                 if resp is None:
                     consecutive_failures += 1
+                    incr_counter(self.channel_id, "connect_failures")
                     if consecutive_failures >= self.MAX_CONSECUTIVE_CONNECT_FAILURES:
+                        record_event(self.channel_id, "give_up",
+                                    {"reason": "consecutive_connect_failures",
+                                     "count": consecutive_failures})
                         logging.error(
                             "[RELAY] %s giving up after %d consecutive connect "
                             "failures — upstream token/CDN endpoint looks down",
@@ -745,9 +762,11 @@ class ContinuousRelaySource(SegmentSource):
                 QueueItem files. Plain byte/time cuts — MPEG-TS is
                 self-synchronizing at arbitrary offsets, no boundary-
                 finding needed the way WebM required on the input side."""
-                nonlocal seg_index
+                nonlocal seg_index, last_disconnect_ts
                 buf = bytearray()
                 last_flush = time.time()
+                buf_wall_start = last_flush
+                first_chunk = True
                 try:
                     while True:
                         chunk = proc.stdout.read(65536)
@@ -765,11 +784,23 @@ class ContinuousRelaySource(SegmentSource):
                         with open(out_path, "wb") as f:
                             f.write(bytes(buf))
                         buf = bytearray()
+                        wall_elapsed = time.time() - buf_wall_start
                         last_flush = time.time()
+                        buf_wall_start = last_flush
                         from core.channels import ffprobe_duration
                         duration = ffprobe_duration(out_path)
                         duration = duration or self.chunk_target_seconds
                         connection_duration[0] += duration
+                        if wall_elapsed > 0:
+                            record_sample(self.channel_id, "encode_speed_ratio",
+                                         duration / wall_elapsed)
+                        if first_chunk:
+                            first_chunk = False
+                            if last_disconnect_ts is not None:
+                                gap_ms = (time.time() - last_disconnect_ts) * 1000
+                                record_sample(self.channel_id, "reconnect_gap_ms", gap_ms)
+                                record_event(self.channel_id, "relay_reconnect",
+                                            {"gap_ms": round(gap_ms, 1), "prefetched": used_prefetch})
                         enqueue(QueueItem(
                             kind="upstream", source_path=out_path,
                             duration=duration,
@@ -820,7 +851,18 @@ class ContinuousRelaySource(SegmentSource):
                             name=f"relay-prefetch-{self.channel_id}")
                         prefetch_thread.start()
                     try:
+                        _read_start = time.time()
                         chunk = next(chunks)
+                        _read_ms = (time.time() - _read_start) * 1000
+                        if _read_ms > 50:
+                            # A plain read under normal conditions is
+                            # sub-millisecond — anything over this floor is
+                            # the CDN read stalling, likely the first
+                            # symptom of a "micro timing delay" before it
+                            # becomes a visible stall. Filtering below the
+                            # floor keeps the ring buffer from filling with
+                            # noise on every single 64KB read.
+                            record_sample(self.channel_id, "relay_read_latency_ms", _read_ms)
                     except StopIteration:
                         logging.info("[RELAY] %s connection ended early", self.channel_id)
                         break
@@ -833,6 +875,7 @@ class ContinuousRelaySource(SegmentSource):
                         logging.warning("[RELAY] %s encoder pipe broke: %s", self.channel_id, e)
                         break
             finally:
+                last_disconnect_ts = time.time()
                 resp.close()
                 try:
                     enc_proc.stdin.close()

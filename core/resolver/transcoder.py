@@ -437,6 +437,10 @@ class ResolvedChannelStream:
                     # Use content duration for offset (not wall-clock, since
                     # -re is removed and encoding is faster than realtime)
                     ts_offset += item.duration if item.duration > 0 else file_elapsed
+                    if item.duration > 0 and file_elapsed > 0:
+                        from core.diagnostics import record_sample
+                        record_sample(self.channel_id, "encode_speed_ratio",
+                                     item.duration / file_elapsed)
                 if self._enc_proc and self._enc_proc.stderr:
                     self._enc_proc.stderr.close()
             except Exception as e:

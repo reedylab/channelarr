@@ -88,6 +88,7 @@ function switchView(view) {
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
   if (view === "resolver") loadResolver();
+  if (view === "diagnostics") loadDiagnostics();
   if (view === "settings") {
     // Auto-expand subnav and load active sub-tab
     const parentBtn = document.querySelector('[data-view="settings"]');
@@ -109,6 +110,10 @@ function switchView(view) {
     scraperTimer = null;
     clearInterval(eqTimer);
     eqTimer = null;
+  }
+  if (view !== "diagnostics" && diagEventSource) {
+    diagEventSource.close();
+    diagEventSource = null;
   }
 }
 
@@ -261,6 +266,7 @@ function renderChannels() {
               <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
               <button class="btn btn-sm" onclick="channelarr.editChannel('${ch.id}')">Edit</button>
               <button class="btn btn-sm" onclick="channelarr.generateLogo('${ch.id}')">Logo</button>
+              <button class="btn btn-sm" onclick="channelarr.showDiagnostics('${ch.id}', '${esc(ch.name)}')">Diagnostics</button>
               <button class="btn btn-sm btn-danger" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
             </div>
           </div>
@@ -324,7 +330,8 @@ function renderChannels() {
           <div class="channel-card-actions">
             <button class="btn btn-sm" onclick="channelarr.watchChannel('${ch.id}', '${esc(ch.name)}')">Watch</button>
             <button class="btn btn-sm" onclick="channelarr.editChannel('${ch.id}')">Edit</button>
-            <button class="btn btn-sm" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
+            <button class="btn btn-sm" onclick="channelarr.showDiagnostics('${ch.id}', '${esc(ch.name)}')">Diagnostics</button>
+            <button class="btn btn-sm btn-danger" onclick="channelarr.deleteChannel('${ch.id}')">Delete</button>
           </div>
         </div>
       </div>`;
@@ -2400,10 +2407,54 @@ document.getElementById("branding-upload")?.addEventListener("change", async (e)
   e.target.value = "";
 });
 
+// ─── Client-reported playback diagnostics ───
+// The video element itself telling the server it stalled or jumped — the
+// most direct "is the viewer actually seeing a problem" signal there is,
+// vs. every other diagnostics metric inferring it server-side. Listeners
+// are attached ONCE per video element (not re-attached per watch, which
+// would stack duplicate handlers) — the mutable `state` object is what
+// changes per channel/watch session.
+function postClientPlaybackEvent(channelId, eventType, detail) {
+  if (!channelId) return;
+  fetch(`${API}/diagnostics/${encodeURIComponent(channelId)}/client-event`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({event_type: eventType, detail}),
+  }).catch(() => {});
+}
+
+function attachPlaybackDiagnostics(video, state) {
+  video.addEventListener("timeupdate", () => { state.lastKnownTime = video.currentTime; });
+  video.addEventListener("waiting", () => {
+    if (state.stallStartWall == null) state.stallStartWall = performance.now();
+  });
+  video.addEventListener("playing", () => {
+    if (state.stallStartWall != null) {
+      const durationMs = performance.now() - state.stallStartWall;
+      state.stallStartWall = null;
+      // Filter out sub-500ms blips (normal codec/buffer housekeeping) —
+      // only report stalls long enough to actually be felt.
+      if (durationMs > 500) {
+        postClientPlaybackEvent(state.channelId, "client_stall", {duration_ms: Math.round(durationMs)});
+      }
+    }
+  });
+  video.addEventListener("seeking", () => {
+    const delta = video.currentTime - state.lastKnownTime;
+    // A normal live-edge micro-adjustment is sub-second; Hls.js forcing a
+    // catch-up-to-live jump (the "rapid fast forward" symptom) is several
+    // seconds — 2s is comfortably above normal jitter, well below a real jump.
+    if (Math.abs(delta) > 2) {
+      postClientPlaybackEvent(state.channelId, "client_seek_jump", {delta_s: Math.round(delta * 100) / 100});
+    }
+  });
+}
+
 // ─── Web Player ───
 let activeHls = null;
 const playerOverlay = $("#player-overlay");
 const playerVideo = $("#player-video");
+const playerDiagState = {channelId: null, stallStartWall: null, lastKnownTime: 0};
+attachPlaybackDiagnostics(playerVideo, playerDiagState);
 
 $("#player-close").addEventListener("click", closePlayer);
 playerOverlay.addEventListener("click", (e) => {
@@ -2411,6 +2462,9 @@ playerOverlay.addEventListener("click", (e) => {
 });
 
 channelarr.watchChannel = function(id, name) {
+  playerDiagState.channelId = id;
+  playerDiagState.stallStartWall = null;
+  playerDiagState.lastKnownTime = 0;
   // Use the API-provided stream_url so the frontend doesn't have to know
   // which endpoint each channel type maps to. The backend stamps:
   //   - scheduled: /live/{id}/stream.m3u8
@@ -2433,7 +2487,15 @@ channelarr.watchChannel = function(id, name) {
   if (Hls.isSupported()) {
     const hls = new Hls({
       liveSyncDurationCount: 3,
-      liveMaxLatencyDurationCount: 10,
+      // Loosened from 10 — diagnostics showed the server's small (1-3
+      // segment) resync_skip recoveries were tripping Hls.js's own
+      // catch-up-to-live logic, which then force-seeks tens of seconds
+      // forward and stalls hard finding no buffered data at the new
+      // position. Tolerating more segments behind live before Hls.js
+      // decides to force a jump directly targets that jump-then-stall
+      // pattern, at the cost of sitting further behind live on sources
+      // that need frequent resyncs. See project memory (2026-09-12).
+      liveMaxLatencyDurationCount: 30,
       liveDurationInfinity: true,
       enableWorker: true,
       lowLatencyMode: false,
@@ -2472,6 +2534,8 @@ function closePlayer() {
   playerVideo.pause();
   playerVideo.removeAttribute("src");
   playerVideo.load();
+  playerDiagState.channelId = null;
+  playerDiagState.stallStartWall = null;
 }
 
 // ─── Helpers ───
@@ -2646,13 +2710,22 @@ function openChartModal() {
       renderModalChart();
     });
   });
+  $("#chart-modal-events").classList.add("hidden");
+  $("#chart-modal-live-summary").classList.add("hidden");
+  closeDiagnosticsModal();
   overlay.classList.remove("hidden");
   renderModalChart();
 }
 
-$("#chart-modal-close").addEventListener("click", () => { $("#chart-modal-overlay").classList.add("hidden"); });
+$("#chart-modal-close").addEventListener("click", () => {
+  $("#chart-modal-overlay").classList.add("hidden");
+  closeDiagnosticsModal();
+});
 $("#chart-modal-overlay").addEventListener("click", (e) => {
-  if (e.target === $("#chart-modal-overlay")) $("#chart-modal-overlay").classList.add("hidden");
+  if (e.target === $("#chart-modal-overlay")) {
+    $("#chart-modal-overlay").classList.add("hidden");
+    closeDiagnosticsModal();
+  }
 });
 
 function renderModalChart() {
@@ -2989,7 +3062,15 @@ function resolverPlay(manifestId, title, pageUrl) {
   if (typeof Hls !== "undefined" && Hls.isSupported()) {
     const hls = new Hls({
       liveSyncDurationCount: 3,
-      liveMaxLatencyDurationCount: 10,
+      // Loosened from 10 — diagnostics showed the server's small (1-3
+      // segment) resync_skip recoveries were tripping Hls.js's own
+      // catch-up-to-live logic, which then force-seeks tens of seconds
+      // forward and stalls hard finding no buffered data at the new
+      // position. Tolerating more segments behind live before Hls.js
+      // decides to force a jump directly targets that jump-then-stall
+      // pattern, at the cost of sitting further behind live on sources
+      // that need frequent resyncs. See project memory (2026-09-12).
+      liveMaxLatencyDurationCount: 30,
       liveDurationInfinity: true,
       enableWorker: true,
       maxBufferLength: 30,
@@ -3870,5 +3951,323 @@ channelarr.scraperFilterQueue = function(name) {
   const panel = $("#event-queue-panel");
   if (panel) panel.scrollIntoView({behavior: "smooth", block: "start"});
 };
+
+// ─── Live Diagnostics ───
+let diagEventSource = null;
+let diagModalEventSource = null;
+let diagModalChannelId = null;
+let diagModalChannelName = "";
+let diagModalRange = "1h";
+let diagModalMetric = "encode_speed_ratio";
+
+const DIAG_METRICS = [
+  {key: "encode_speed_ratio", label: "Encode Speed", kind: "ratio"},
+  {key: "production_speed_ratio", label: "Production Speed", kind: "ratio"},
+  {key: "fetch_latency_ms", label: "Fetch Latency", kind: "ms"},
+  {key: "reconnect_gap_ms", label: "Reconnect Gap", kind: "ms"},
+  {key: "relay_read_latency_ms", label: "Relay Read Latency", kind: "ms"},
+  {key: "playlist_cold_wait_ms", label: "Playlist Cold Wait", kind: "ms"},
+  {key: "playlist_warm_wait_ms", label: "Playlist Warm Wait", kind: "ms"},
+];
+
+function diagQualityClass(q) {
+  return ["excellent", "good", "bad"].includes(q) ? q : "unknown";
+}
+
+function diagSourceLabel(row) {
+  const parts = [];
+  if (row.source_kind) parts.push(row.source_kind);
+  if (row.encoder_mode) parts.push(row.encoder_mode);
+  return parts.join(" / ") || "local";
+}
+
+const DIAG_METRIC_LABELS = Object.fromEntries(DIAG_METRICS.map(m => [m.key, m.label]));
+
+// Small self-contained sparkline — no axes/labels/tooltip, just the shape.
+// renderLineChart's grid+tooltip apparatus is built for full-size charts;
+// a 48px dashboard-card strip reads better as a plain trend line.
+function renderMiniSparkline(values, color) {
+  if (!values || values.length < 2) {
+    // A stream can genuinely have zero applicable metrics yet (just
+    // started) — this is the ONE legitimate "still collecting" case, since
+    // the caller already picked the best available metric server-side.
+    return '<div class="empty-state" style="padding:8px;font-size:11px">Collecting data...</div>';
+  }
+  const W = 280, H = 48, pad = 3;
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = (max - min) || 1;
+  const n = values.length;
+  const pts = values.map((v, i) => {
+    const x = pad + (i / Math.max(1, n - 1)) * (W - pad * 2);
+    const y = pad + (H - pad * 2) * (1 - (v - min) / range);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:100%">
+    <polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="1.5"/>
+  </svg>`;
+}
+
+const diagWallBtn = $("#diag-wall-btn");
+if (diagWallBtn) {
+  diagWallBtn.addEventListener("click", () => {
+    window.open("/diagnostics-wall", "channelarr-diag-wall", "width=1600,height=900");
+  });
+}
+
+function loadDiagnostics() {
+  if (diagEventSource) return; // already streaming
+  // One-shot initial paint so the grid isn't empty while the SSE connection
+  // opens (EventSource itself doesn't guarantee an immediate first frame).
+  fetch(`${API}/diagnostics`).then(r => r.json()).then(d => renderDiagnosticsGrid(d.streams || [])).catch(() => {});
+  diagEventSource = new EventSource(`${API}/diagnostics/stream`);
+  diagEventSource.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      renderDiagnosticsGrid(d.streams || []);
+    } catch (err) {}
+  };
+  // EventSource auto-reconnects on drop — nothing to do on error beyond
+  // letting the browser retry, same as it already does for us.
+}
+
+function renderDiagnosticsGrid(streams) {
+  const grid = $("#diagnostics-grid");
+  if (!streams.length) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">&#9889;</div>No streams currently playing.</div>';
+    return;
+  }
+  const byId = {};
+  channels.forEach(ch => { byId[ch.id] = ch; });
+
+  grid.innerHTML = streams.map(row => {
+    const ch = byId[row.channel_id];
+    const name = ch ? ch.name : row.channel_id;
+    const q = diagQualityClass(row.quality);
+    const speedPct = row.encode_speed_ratio != null ? `${Math.round(row.encode_speed_ratio * 100)}%` : "--";
+    const sparkColor = q === "bad" ? "var(--danger)" : q === "good" ? "var(--warn)" : "var(--ok)";
+    const sparkLabel = row.spark_metric ? (DIAG_METRIC_LABELS[row.spark_metric] || row.spark_metric) : "";
+    return `
+      <div class="diag-card" onclick="channelarr.showDiagnostics('${row.channel_id}', '${esc(name)}')">
+        <div class="diag-card-head">
+          <h4>${esc(name)}</h4>
+          <span class="diag-badge diag-badge-${q}">${q}</span>
+        </div>
+        <div class="diag-card-meta">
+          <span>${esc(diagSourceLabel(row))}</span>
+          <span>up ${formatUptime(row.uptime || 0)}</span>
+          ${row.encode_speed_ratio != null ? `<span>speed ${speedPct}</span>` : ""}
+          ${row.production_speed_ratio != null ? `<span>production ${Math.round(row.production_speed_ratio * 100)}%</span>` : ""}
+          <span>${row.reconnects_last_5m || 0} reconnect${row.reconnects_last_5m === 1 ? "" : "s"}/5m</span>
+          ${row.client_stalls_last_5m ? `<span style="color:var(--danger)">${row.client_stalls_last_5m} stall${row.client_stalls_last_5m === 1 ? "" : "s"}/5m</span>` : ""}
+          ${row.client_seeks_last_5m ? `<span style="color:var(--danger)">${row.client_seeks_last_5m} jump${row.client_seeks_last_5m === 1 ? "" : "s"}/5m</span>` : ""}
+          <span>${row.errors_last_5m || 0} error${row.errors_last_5m === 1 ? "" : "s"}/5m</span>
+          ${row.fallback_active ? '<span style="color:var(--danger);font-weight:600">on fallback</span>' : ""}
+        </div>
+        <div class="diag-sparkline-label text-muted" style="font-size:10px;margin-bottom:2px">${esc(sparkLabel)}</div>
+        <div class="diag-sparkline">${renderMiniSparkline(row.spark_values, sparkColor)}</div>
+      </div>`;
+  }).join("");
+}
+
+channelarr.showDiagnostics = function(id, name) {
+  diagModalChannelId = id;
+  diagModalChannelName = name;
+  diagModalRange = "1h";
+  // null = "not chosen yet" — loadDiagModalData() auto-picks whichever
+  // metric actually has data for THIS stream's mode once it knows. Not
+  // every metric applies to every mode (encode_speed_ratio doesn't exist
+  // for proxy/remux, which are pure -c copy) — hardcoding a default here
+  // is what caused those streams to show "collecting data" forever.
+  diagModalMetric = null;
+  openDiagnosticsModal();
+};
+
+function openDiagnosticsModal() {
+  const overlay = $("#chart-modal-overlay");
+  $("#chart-modal-title").textContent = `${diagModalChannelName} — Diagnostics`;
+  $("#chart-modal-events").classList.remove("hidden");
+  $("#chart-modal-live-summary").classList.remove("hidden");
+  overlay.classList.remove("hidden");
+  loadDiagModalData();
+
+  // Live badge/numbers while the modal just sits open — this is what makes
+  // it stop being a static snapshot frozen at whatever it looked like when
+  // you clicked in. The full chart/events stay driven by range/metric
+  // picks (loadDiagModalData), not re-fetched on every tick.
+  if (diagModalEventSource) diagModalEventSource.close();
+  diagModalEventSource = new EventSource(`${API}/diagnostics/${encodeURIComponent(diagModalChannelId)}/stream`);
+  diagModalEventSource.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      renderDiagModalLiveSummary(d.summary || {});
+    } catch (err) {}
+  };
+}
+
+function closeDiagnosticsModal() {
+  if (diagModalEventSource) { diagModalEventSource.close(); diagModalEventSource = null; }
+}
+
+function renderDiagModalLiveSummary(s) {
+  const el = $("#chart-modal-live-summary");
+  const q = diagQualityClass(s.quality);
+  const bits = [];
+  if (s.encode_speed_ratio != null) bits.push(`speed ${Math.round(s.encode_speed_ratio * 100)}%`);
+  if (s.production_speed_ratio != null) bits.push(`production ${Math.round(s.production_speed_ratio * 100)}%`);
+  if (s.fetch_latency_ms_avg != null) bits.push(`fetch ${Math.round(s.fetch_latency_ms_avg)}ms avg`);
+  if (s.reconnect_gap_ms_max != null) bits.push(`reconnect gap ${Math.round(s.reconnect_gap_ms_max)}ms`);
+  bits.push(`${s.reconnects_last_5m || 0} reconnects/5m`);
+  if (s.resyncs_last_5m) bits.push(`<span style="color:var(--warn)">${s.resyncs_last_5m} resync${s.resyncs_last_5m === 1 ? "" : "s"}/5m</span>`);
+  if (s.client_stalls_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_stalls_last_5m} player stall${s.client_stalls_last_5m === 1 ? "" : "s"}/5m</span>`);
+  if (s.client_seeks_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_seeks_last_5m} player jump${s.client_seeks_last_5m === 1 ? "" : "s"}/5m</span>`);
+  bits.push(`${s.errors_last_5m || 0} errors/5m`);
+  if (s.fallback_active) bits.push(`<span style="color:var(--danger);font-weight:600">on fallback</span>`);
+  el.innerHTML = `<span class="diag-badge diag-badge-${q}">${q}</span> ${bits.join(" &middot; ")}`;
+}
+
+async function loadDiagModalData() {
+  if (!diagModalChannelId) return;
+  const minutes = {"1h": 60, "2h": 120, "6h": 360, "12h": 720, "24h": 1440}[diagModalRange] || 60;
+  try {
+    const r = await fetch(`${API}/diagnostics/${encodeURIComponent(diagModalChannelId)}?minutes=${minutes}`);
+    const d = await r.json();
+    const samples = d.samples || {};
+    if (!diagModalMetric || !(samples[diagModalMetric] || []).length) {
+      diagModalMetric = DIAG_METRICS.map(m => m.key).find(k => (samples[k] || []).length) || DIAG_METRICS[0].key;
+    }
+    renderDiagModalControls(samples);
+    renderDiagModalChart(samples);
+    renderDiagEvents(d.events || []);
+    renderDiagModalLiveSummary(d.summary || {});
+  } catch (e) {
+    $("#chart-modal-chart").innerHTML = '<div class="empty-state">Failed to load diagnostics.</div>';
+  }
+}
+
+function renderDiagModalControls(samples) {
+  const ranges = $("#chart-modal-ranges");
+  const metricButtons = DIAG_METRICS.map(m => {
+    const hasData = (samples[m.key] || []).length > 0;
+    const active = m.key === diagModalMetric ? "active" : "";
+    return `<button data-metric="${m.key}" class="${active}" ${hasData ? "" : "disabled"}
+      title="${hasData ? "" : "This stream's mode doesn't produce this metric"}">${m.label}</button>`;
+  }).join("");
+  const rangeButtons = ["1h", "2h", "6h", "12h", "24h"].map(r =>
+    `<button data-range="${r}" class="${r === diagModalRange ? "active" : ""}">${r}</button>`
+  ).join("");
+  ranges.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:8px;width:100%">
+    <div style="display:flex;gap:8px;flex-wrap:wrap">${metricButtons}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-left:auto">${rangeButtons}</div>
+  </div>`;
+  ranges.querySelectorAll("[data-metric]:not([disabled])").forEach(btn => {
+    btn.addEventListener("click", () => {
+      diagModalMetric = btn.dataset.metric;
+      loadDiagModalData();
+    });
+  });
+  ranges.querySelectorAll("[data-range]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      diagModalRange = btn.dataset.range;
+      loadDiagModalData();
+    });
+  });
+}
+
+function renderDiagModalChart(samples) {
+  const metric = DIAG_METRICS.find(m => m.key === diagModalMetric) || DIAG_METRICS[0];
+  const series = samples[metric.key] || [];
+  const container = $("#chart-modal-chart");
+  if (!series.length) {
+    const anyData = Object.values(samples).some(v => (v || []).length);
+    container.innerHTML = anyData
+      ? '<div class="empty-state">No data for this metric in the selected range.</div>'
+      : '<div class="empty-state">No diagnostics data yet — this stream may not be running, or hasn\'t produced any samples yet.</div>';
+    return;
+  }
+  const timestamps = series.map(s => s.ts);
+  if (metric.kind === "ratio") {
+    // encode_speed_ratio is naturally ~0-1 (100% = keeping up with
+    // realtime) — express as a percentage so renderLineChart's fixed
+    // 0-100 axis fits directly.
+    const pctValues = series.map(s => Math.min(150, s.value * 100));
+    renderLineChart("chart-modal-chart", timestamps, pctValues, {
+      color: "var(--accent)", label: metric.label,
+      formatTip: (val, idx) => `${(series[idx].value * 100).toFixed(1)}% of realtime`,
+    });
+  } else {
+    const values = series.map(s => s.value);
+    const maxVal = Math.max(...values, 100) * 1.2;
+    renderMsChart(container, timestamps, values, maxVal, metric.label);
+  }
+}
+
+// ms-based diagnostics metrics (fetch/reconnect/playlist-wait latency) need
+// an auto-scaled axis, not the 0-100% one renderLineChart is built for —
+// same auto-scale-to-observed-max approach renderVpnChart already uses.
+function renderMsChart(container, timestamps, values, maxVal, label) {
+  const W = 900, H = 380;
+  const pad = {l: 50, r: 10, t: 10, b: 28};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const n = values.length;
+  const color = "var(--accent)";
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:100%">`;
+  for (let g = 0; g <= 4; g++) {
+    const y = pad.t + (ch * (1 - g / 4));
+    const label_ = Math.round(maxVal * g / 4);
+    svg += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" class="chart-grid"/>`;
+    svg += `<text x="${pad.l - 4}" y="${y + 3}" class="chart-label" text-anchor="end">${label_}ms</text>`;
+  }
+  const pts = values.map((v, i) => {
+    const x = pad.l + (i / Math.max(1, n - 1)) * cw;
+    const y = pad.t + ch * (1 - Math.min(v, maxVal) / maxVal);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const firstX = pad.l;
+  const lastX = (pad.l + ((n - 1) / Math.max(1, n - 1)) * cw).toFixed(1);
+  const bottom = (pad.t + ch).toFixed(1);
+  svg += `<polygon class="chart-area" fill="${color}" points="${firstX},${bottom} ${pts.join(" ")} ${lastX},${bottom}"/>`;
+  svg += `<polyline class="chart-line" stroke="${color}" points="${pts.join(" ")}"/>`;
+  svg += "</svg>";
+  svg += `<div class="chart-tooltip" style="display:none" id="ms-chart-tip"></div>`;
+  container.innerHTML = svg;
+
+  const svgEl = container.querySelector("svg");
+  const tip = container.querySelector("#ms-chart-tip");
+  svgEl.addEventListener("mousemove", (e) => {
+    const rect = svgEl.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / rect.width;
+    const adjFrac = (frac * W - pad.l) / cw;
+    const idx = Math.max(0, Math.min(n - 1, Math.round(adjFrac * (n - 1))));
+    const d = new Date(timestamps[idx] * 1000);
+    const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+    tip.textContent = `${label}: ${values[idx].toFixed(1)}ms at ${time}`;
+    tip.style.display = "block";
+    tip.style.left = `${e.clientX - rect.left + 12}px`;
+    tip.style.top = `${e.clientY - rect.top - 30}px`;
+  });
+  svgEl.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+}
+
+function renderDiagEvents(events) {
+  const el = $("#chart-modal-events");
+  if (!events.length) {
+    el.innerHTML = '<div class="empty-state" style="padding:8px">No events in this range — reconnects, fallback activations, and give-ups will show up here.</div>';
+    return;
+  }
+  const sorted = [...events].sort((a, b) => b.ts - a.ts);
+  el.innerHTML = sorted.map(ev => {
+    const d = new Date(ev.ts * 1000);
+    const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
+    const detail = Object.entries(ev.detail || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+    return `<div class="diag-event-row">
+      <span class="diag-event-time">${time}</span>
+      <span class="diag-event-type">${esc(ev.type)}</span>
+      <span class="diag-event-detail">${esc(detail)}</span>
+    </div>`;
+  }).join("");
+}
 
 })();

@@ -33,6 +33,8 @@ from urllib.parse import urljoin
 
 import requests as _requests
 
+from core.diagnostics import record_sample, record_event, incr_counter
+
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -288,7 +290,10 @@ class RemuxStream:
         return 200, base, msq, init, segs, targetdur
 
     def _dl(self, url) -> bytes:
-        return self.session.get(url, headers=self._headers(), timeout=15).content
+        _start = time.time()
+        data = self.session.get(url, headers=self._headers(), timeout=15).content
+        record_sample(self.channel_id, "fetch_latency_ms", (time.time() - _start) * 1000)
+        return data
 
     def _write_output_playlist(self, out_segs, seq0, target):
         lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{int(target) + 1}",
@@ -373,6 +378,15 @@ class RemuxStream:
         pend_a = bytearray()
         pend_dur = 0.0
         MAX_PEND_DUR = 30.0                   # safety cap if a keyframe never turns up
+        # production_speed_ratio window state — accumulated over a rolling
+        # ~3s wall-clock window rather than per-flush, since flushes land in
+        # bursts (several near-simultaneous, then a gap): an instantaneous
+        # dur/wall_elapsed on a near-zero elapsed burst flush produces a
+        # meaningless huge ratio. sum(duration)/sum(wall_time) over a real
+        # window is the mathematically sound version of the same question.
+        PRODUCTION_WINDOW_SECONDS = 3.0
+        prod_window_start = [time.time()]
+        prod_window_dur = [0.0]
 
         def _download_new(url, buf, dur_map, is_video):
             """Reload one rendition's playlist and download every NEW segment in
@@ -416,8 +430,11 @@ class RemuxStream:
             "alive" and never calling it again."""
             nonlocal consecutive_failures
             consecutive_failures += 1
+            incr_counter(self.channel_id, "consecutive_failures")
             if consecutive_failures < self.MAX_CONSECUTIVE_FAILURES:
                 return False
+            record_event(self.channel_id, "give_up",
+                        {"reason": reason, "count": consecutive_failures})
             logging.error(
                 "[REMUX] %s giving up after %d consecutive failures (%s) — "
                 "stopping so the next request retries fresh",
@@ -476,6 +493,17 @@ class RemuxStream:
                 edge = vmsq + max(0, len(vsegs) - 4)
                 logging.info("[REMUX] %s resync emit %d -> %d (live edge)",
                              self.channel_id, emit, edge)
+                # This is a real discontinuity in the local output's media
+                # sequence — a lenient client (a native TV app with a deep
+                # buffer) can absorb it, but Hls.js in a browser can read
+                # the jump as "we're behind, catch up" and force a seek,
+                # which is exactly the fast-forward-then-stall pattern
+                # reported against the web player. Surfacing it as an event
+                # (not just a log line) is what lets that be correlated
+                # against client-reported seeks/stalls after the fact.
+                record_event(self.channel_id, "resync_skip",
+                            {"skipped_segments": edge - emit})
+                incr_counter(self.channel_id, "resync_skips")
                 emit = edge
                 vbuf.clear(); abuf.clear(); adur.clear()
 
@@ -534,6 +562,21 @@ class RemuxStream:
                                         a_bytes, out_path)
                     if not ok:
                         return
+                    # Covers the mux step itself PLUS any wait for source
+                    # data, i.e. exactly "is new content reaching the output
+                    # at least as fast as realtime." Neither fetch_latency_ms
+                    # (one HTTP GET) nor anything else measures this — a
+                    # stream can show clean per-request latency while still
+                    # falling behind here, which is what FS1 showed: fast
+                    # individual fetches, but segments arriving in bursts
+                    # with growing gaps between bursts.
+                    prod_window_dur[0] += dur
+                    window_elapsed = time.time() - prod_window_start[0]
+                    if window_elapsed >= PRODUCTION_WINDOW_SECONDS:
+                        record_sample(self.channel_id, "production_speed_ratio",
+                                     prod_window_dur[0] / window_elapsed)
+                        prod_window_dur[0] = 0.0
+                        prod_window_start[0] = time.time()
                     out_segs.append((out_name, dur))
                     out_seq += 1
                     seq0 = out_seq - len(out_segs)
