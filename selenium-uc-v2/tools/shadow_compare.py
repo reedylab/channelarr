@@ -96,16 +96,27 @@ print(json.dumps(results))
     return {"results": json.loads(result.stdout.strip()), "wall_clock": wall_clock}
 
 
-def _run_v2(container: str, port: int, urls: list[str], timeout: int) -> dict:
+def _run_v2(container: str, port: int, urls: list[str], timeout: int, tab_cap: int = 3) -> dict:
     """Concurrent -- this is the actual point of Phase 2's design, so the
-    harness exercises it that way rather than artificially serializing."""
+    harness exercises it that way rather than artificially serializing.
+
+    Client-side per-request timeout is scaled by expected queue depth
+    (len(urls) / tab_cap waves, each up to timeout+60s) -- a batch larger
+    than tab_cap WILL queue some requests behind others (correct, intended
+    behavior of a bounded-concurrency system, not a bug), and a client
+    timeout sized for a single wave would misreport "queued a while, then
+    genuinely succeeded" as a failure. Real, observed regression in an
+    earlier run of this harness before this fix."""
+    import math
+    queue_waves = max(1, math.ceil(len(urls) / max(1, tab_cap)))
+    client_timeout = queue_waves * (timeout + 60)
     script = f"""
 import concurrent.futures, requests, time, json
 urls = {json.dumps(urls)}
 def one(url):
     t0 = time.time()
     try:
-        r = requests.post("http://localhost:{port}/capture", json={{"url": url, "timeout": {timeout}, "priority": "high"}}, timeout={timeout + 60})
+        r = requests.post("http://localhost:{port}/capture", json={{"url": url, "timeout": {timeout}, "priority": "high"}}, timeout={client_timeout})
         d = r.json()
         body = d.get("body") or ""
         return {{"url": url, "elapsed": time.time()-t0, "ok": d.get("ok"), "has_extm3u": "#EXTM3U" in body, "error": d.get("error")}}
@@ -118,7 +129,7 @@ print(json.dumps(results))
     t0 = time.time()
     result = subprocess.run(
         ["docker", "exec", container, "python3", "-c", script],
-        capture_output=True, text=True, timeout=(timeout + 60) + 60,
+        capture_output=True, text=True, timeout=client_timeout + 60,
     )
     wall_clock = time.time() - t0
     if result.returncode != 0:
@@ -146,6 +157,7 @@ def main():
     ap.add_argument("--v1-only", action="store_true")
     ap.add_argument("--v2-only", action="store_true")
     ap.add_argument("--urls", type=str, default=None, help="comma-separated URLs instead of sampling from the DB")
+    ap.add_argument("--tab-cap", type=int, default=3, help="expected SIDECAR_MAX_TABS on the v2 side, for client-timeout scaling (default 3)")
     args = ap.parse_args()
 
     if args.urls:
@@ -168,7 +180,7 @@ def main():
         time.sleep(args.stagger)
 
     if not args.v1_only:
-        run = _run_v2(V2_CONTAINER, V2_PORT, urls, args.timeout)
+        run = _run_v2(V2_CONTAINER, V2_PORT, urls, args.timeout, tab_cap=args.tab_cap)
         v2_ok, v2_total = _report("v2 (concurrent)", run)
 
     print("\n=== SUMMARY ===")
