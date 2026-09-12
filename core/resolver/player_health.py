@@ -176,6 +176,44 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
     return results
 
 
+def get_primary_player_path(primary_manifest_id: str) -> str:
+    """The player_path the channel's CURRENT primary manifest corresponds
+    to. Manifests get a "(player: X)" suffix in their title once they've
+    passed through _tag_manifest_player_path (called on both sides of every
+    promotion) — an untagged primary is, by construction, the original
+    "stream" path every channel starts on before its first-ever promotion,
+    since that's the only way an untagged manifest could have become
+    primary in the first place."""
+    from core.database import get_session as _get_session
+    from core.models import Manifest
+
+    with _get_session() as session:
+        row = session.query(Manifest.title).filter_by(id=primary_manifest_id).first()
+    title = row[0] if row else ""
+    if title and "(player: " in title:
+        return title.rsplit("(player: ", 1)[1].rstrip(")")
+    return "stream"
+
+
+def _tag_manifest_player_path(manifest_id: str, path: str) -> None:
+    """Best-effort: append a "(player: X)" suffix to a manifest's title if
+    it doesn't already carry one, so get_primary_player_path can recover
+    which path it corresponds to after it stops (or starts) being primary.
+    Failure here is non-fatal — promotion itself already succeeded either
+    way, this is just bookkeeping for the next promotion decision."""
+    from core.database import get_session as _get_session
+    from core.models import Manifest
+
+    try:
+        with _get_session() as session:
+            row = session.query(Manifest).filter_by(id=manifest_id).first()
+            if row and row.title and "(player: " not in row.title:
+                row.title = f"{row.title} (player: {path})"
+    except Exception as e:
+        logger.warning("[PLAYER-HEALTH] failed to tag manifest %s as player %r: %s",
+                       manifest_id, path, e)
+
+
 def maybe_promote_best_player(channel_id: str) -> bool:
     """After discover_and_record has run for this channel, check whether a
     tracked fallback is now clearly outperforming the current primary and
@@ -195,8 +233,10 @@ def maybe_promote_best_player(channel_id: str) -> bool:
     if not ch or ch.get("type") != "resolved":
         return False
 
+    primary_manifest_id = ch.get("manifest_id")
+    primary_path = get_primary_player_path(primary_manifest_id)
     scores = get_scores(channel_id)
-    primary_score = score_of(scores.get("stream"))
+    primary_score = score_of(scores.get(primary_path))
 
     # Map each stored fallback manifest back to its player_path via the
     # title convention discover_and_store_fallbacks uses ("... (player: X)").
@@ -217,8 +257,10 @@ def maybe_promote_best_player(channel_id: str) -> bool:
         return False
 
     logger.info("[PLAYER-HEALTH] channel %s: promoting player %r (score %.2f) over current "
-                "primary (score %.2f)", channel_id, best_path, best_score, primary_score)
+                "primary %r (score %.2f)", channel_id, best_path, best_score, primary_path, primary_score)
     shared_state.channel_mgr.set_primary_manifest(channel_id, best_manifest_id)
+    _tag_manifest_player_path(best_manifest_id, best_path)
+    _tag_manifest_player_path(primary_manifest_id, primary_path)
     return True
 
 

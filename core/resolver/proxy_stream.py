@@ -137,6 +137,87 @@ class _DecryptError(Exception):
     poller loop can react with a manifest refresh instead of just retrying."""
 
 
+def _pick_best_variant(text: str, base_url: str) -> str:
+    """Given a fetched playlist's text, return the highest-bandwidth media
+    playlist URL if `text` is a master playlist (#EXT-X-STREAM-INF present),
+    or `base_url` unchanged if it's already a media playlist. Pure parsing,
+    no network — factored out of ProxyStream._resolve_variant_url so
+    core/resolver/segment_sampler.py can resolve a master playlist it
+    already has the body for without re-fetching it."""
+    if "#EXT-X-STREAM-INF" not in text:
+        return base_url
+    best_bw = -1
+    best_uri = None
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+            if bw_match and i + 1 < len(lines):
+                bw = int(bw_match.group(1))
+                uri = lines[i + 1].strip()
+                if bw > best_bw and uri and not uri.startswith("#"):
+                    best_bw = bw
+                    best_uri = uri
+    if best_uri:
+        return urljoin(base_url, best_uri)
+    return base_url
+
+
+def _fetch_segment_bytes(session, seg: dict, headers: dict, get_key_fn, label: str) -> bytes:
+    """Fetch (and, if AES-128 encrypted, decrypt) one segment's raw bytes,
+    with the decoy-header strip already applied — everything
+    ProxyStream._download_segment needs before it writes to disk, factored
+    out as a module-level function so core/resolver/segment_sampler.py can
+    run the exact same fetch/decrypt/decoy-strip logic without a live
+    ProxyStream instance (it just measures whether this succeeds and
+    discards the result).
+
+    get_key_fn(key_url) -> bytes|None is injected rather than assuming a
+    ProxyStream instance — the live stream passes its own cached
+    self._get_key; the sampler passes a throwaway one-off lookup. `label`
+    is only used for the decoy-strip log line (channel_id for a live
+    stream, something generic for a sample).
+    """
+    info = seg.get("key_info")
+    # Encrypted: must buffer the full segment, then AES-CBC decrypt.
+    # AES-CBC isn't streamable across an unknown total length without
+    # also tracking padding; the segment is small enough (~2 MB) that
+    # buffering is fine and avoids partial-write corruption.
+    if info and info.get("method") == "AES-128" and info.get("uri"):
+        resp = session.get(seg["uri"], headers=headers, timeout=15)
+        resp.raise_for_status()
+        ciphertext = resp.content
+        key = get_key_fn(info["uri"])
+        if key is None:
+            raise RuntimeError(f"key fetch failed for {info['uri']}")
+        iv = info.get("iv")
+        if iv is None:
+            # Fallback per HLS spec: media-sequence number padded to 128b
+            iv = seg["seq"].to_bytes(16, "big", signed=False)
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        try:
+            plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
+        except (ValueError, Exception) as e:
+            # Padding / unpad errors here mean the ciphertext didn't
+            # match this key — almost always a stale session (VPN
+            # rotation invalidated the IP-bound key endpoint while
+            # we were mid-stream). Surface as a typed error so the
+            # poller loop can trigger a manifest refresh.
+            raise _DecryptError(str(e)) from e
+        return _strip_ts_decoy_prefix(label, plaintext)
+
+    # Plaintext (or unknown method we'd rather pass through). Buffered
+    # rather than streamed straight to disk — needs the full segment in
+    # hand to check for a decoy header prefix (see _strip_ts_decoy_prefix),
+    # and segments are small enough (~2-4 MB) that this costs nothing
+    # meaningful.
+    resp = session.get(seg["uri"], headers=headers, timeout=15)
+    resp.raise_for_status()
+    return _strip_ts_decoy_prefix(label, resp.content)
+
+
 def _parse_key_directive(line: str) -> Optional[dict]:
     """Parse an #EXT-X-KEY: directive into {method, uri, iv}.
 
@@ -315,23 +396,7 @@ class ProxyStream:
             text = resp.text
         except Exception:
             return url
-        if "#EXT-X-STREAM-INF" not in text:
-            return url
-        best_bw = -1
-        best_uri = None
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                if bw_match and i + 1 < len(lines):
-                    bw = int(bw_match.group(1))
-                    uri = lines[i + 1].strip()
-                    if bw > best_bw and uri and not uri.startswith("#"):
-                        best_bw = bw
-                        best_uri = uri
-        if best_uri:
-            return urljoin(url, best_uri)
-        return url
+        return _pick_best_variant(text, url)
 
     # ── Manifest refresh ───────────────────────────────────────────────────
 
@@ -610,56 +675,12 @@ class ProxyStream:
             self._stop_event.wait(POLL_INTERVAL)
 
     def _download_segment(self, seg: dict, local_path: str):
-        """Download a single segment to local disk.
-
-        If the segment is AES-128 encrypted (per its #EXT-X-KEY directive),
-        decrypt it server-side using the cached key + IV from the playlist
-        so the local stream.m3u8 can stay plain — every downstream consumer
-        (clients, ffprobe, transcoder mode) then sees a vanilla MPEG-TS
-        playlist with no encryption directive to worry about.
-        """
-        headers = self._upstream_headers()
-        info = seg.get("key_info")
-        # Encrypted: must buffer the full segment, then AES-CBC decrypt.
-        # AES-CBC isn't streamable across an unknown total length without
-        # also tracking padding; the segment is small enough (~2 MB) that
-        # buffering is fine and avoids partial-write corruption.
-        if info and info.get("method") == "AES-128" and info.get("uri"):
-            resp = self.session.get(seg["uri"], headers=headers, timeout=15)
-            resp.raise_for_status()
-            ciphertext = resp.content
-            key = self._get_key(info["uri"])
-            if key is None:
-                raise RuntimeError(f"key fetch failed for {info['uri']}")
-            iv = info.get("iv")
-            if iv is None:
-                # Fallback per HLS spec: media-sequence number padded to 128b
-                iv = seg["seq"].to_bytes(16, "big", signed=False)
-            from Crypto.Cipher import AES
-            from Crypto.Util.Padding import unpad
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            try:
-                plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
-            except (ValueError, Exception) as e:
-                # Padding / unpad errors here mean the ciphertext didn't
-                # match this key — almost always a stale session (VPN
-                # rotation invalidated the IP-bound key endpoint while
-                # we were mid-stream). Surface as a typed error so the
-                # poller loop can trigger a manifest refresh.
-                raise _DecryptError(str(e)) from e
-            plaintext = _strip_ts_decoy_prefix(self.channel_id, plaintext)
-            with open(local_path, "wb") as f:
-                f.write(plaintext)
-            return
-
-        # Plaintext (or unknown method we'd rather pass through). Buffered
-        # rather than streamed straight to disk — needs the full segment in
-        # hand to check for a decoy header prefix (see
-        # _strip_ts_decoy_prefix), and segments are small enough (~2-4 MB)
-        # that this costs nothing meaningful.
-        resp = self.session.get(seg["uri"], headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = _strip_ts_decoy_prefix(self.channel_id, resp.content)
+        """Download a single segment to local disk — see
+        _fetch_segment_bytes (module-level) for the fetch/decrypt/decoy-
+        strip logic, factored out so core/resolver/segment_sampler.py can
+        reuse it verbatim without writing anything to disk."""
+        data = _fetch_segment_bytes(self.session, seg, self._upstream_headers(),
+                                    self._get_key, self.channel_id)
         with open(local_path, "wb") as f:
             f.write(data)
 
