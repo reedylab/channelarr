@@ -239,9 +239,22 @@ async def scan_for_skip_phrase(connection) -> str | None:
 async def get_cookies(connection) -> list[dict]:
     """CDP Network.getAllCookies — not per-domain get_cookies() — deliberately,
     per app.py's own reasoning: segment/key auth often lives on a different
-    subdomain than the page, and per-domain lookups miss it."""
+    subdomain than the page, and per-domain lookups miss it.
+
+    Timeout-wrapped: nodriver's real Connection._listener (confirmed via its
+    own source) does `self.mapper.pop(message["id"])` for command responses
+    with NO exception guard at all. A KeyError there (a real risk under the
+    burst of concurrent get_response_body sends a busy real page's matched
+    responses trigger -- confirmed as the actual root cause of a hang-to-
+    full-deadline regression that looked like a capture-logic bug but wasn't)
+    propagates out of the listener's while-loop and kills that task silently
+    -- asyncio just logs an orphaned-task-exception and moves on. Every
+    subsequent .send() on that connection then hangs forever, since nothing
+    is left reading the websocket to resolve its Transaction future. This
+    call runs AFTER the manifest is already found, so a timeout here just
+    means slightly less-complete metadata, never a lost capture."""
     try:
-        result = await connection.send(uc.cdp.network.get_all_cookies())
+        result = await asyncio.wait_for(connection.send(uc.cdp.network.get_all_cookies()), timeout=5.0)
         raw = result if isinstance(result, list) else getattr(result, "cookies", []) or []
         out = []
         for c in raw:
@@ -521,15 +534,22 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
         if not outcome.error:
             outcome.error = f"No manifest found within {timeout}s"
     _log(f"final wait done: ok={outcome.ok} error={outcome.error}")
+    _log(f"pending asyncio tasks at completion: {len(asyncio.all_tasks())}")
 
     if outcome.ok:
         # user_agent + cookies are gathered from whichever target actually
         # succeeded — cheap, no behavioral dependency downstream (both
         # confirmed dead-data-adjacent per the plan; included for contract-
-        # shape completeness only).
+        # shape completeness only). Timeout-wrapped for the same reason as
+        # get_cookies() -- see that function's docstring: a busy real page
+        # can silently kill nodriver's listener task via an unguarded
+        # KeyError, after which this send() would otherwise hang forever.
         source = iframe_sessions[-1] if iframe_sessions else tab
         try:
-            ua_result = await source.send(uc.cdp.runtime.evaluate(expression="navigator.userAgent", return_by_value=True))
+            ua_result = await asyncio.wait_for(
+                source.send(uc.cdp.runtime.evaluate(expression="navigator.userAgent", return_by_value=True)),
+                timeout=5.0,
+            )
             ua_obj = ua_result[0] if isinstance(ua_result, tuple) else ua_result
             outcome.user_agent = getattr(ua_obj, "value", None)
         except Exception:
