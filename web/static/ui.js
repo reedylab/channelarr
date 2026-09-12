@@ -2712,6 +2712,7 @@ function openChartModal() {
   });
   $("#chart-modal-events").classList.add("hidden");
   $("#chart-modal-live-summary").classList.add("hidden");
+  $("#chart-modal-diag-actions").classList.add("hidden");
   closeDiagnosticsModal();
   overlay.classList.remove("hidden");
   renderModalChart();
@@ -2720,6 +2721,12 @@ function openChartModal() {
 $("#chart-modal-close").addEventListener("click", () => {
   $("#chart-modal-overlay").classList.add("hidden");
   closeDiagnosticsModal();
+});
+$("#chart-modal-stop-btn").addEventListener("click", () => {
+  if (diagModalChannelId) channelarr.diagStop(diagModalChannelId);
+});
+$("#chart-modal-reload-btn").addEventListener("click", () => {
+  if (diagModalChannelId) channelarr.diagReload(diagModalChannelId);
 });
 $("#chart-modal-overlay").addEventListener("click", (e) => {
   if (e.target === $("#chart-modal-overlay")) {
@@ -4051,7 +4058,11 @@ function renderDiagnosticsGrid(streams) {
       <div class="diag-card" onclick="channelarr.showDiagnostics('${row.channel_id}', '${esc(name)}')">
         <div class="diag-card-head">
           <h4>${esc(name)}</h4>
-          <span class="diag-badge diag-badge-${q}">${q}</span>
+          <div class="diag-card-actions">
+            <span class="diag-badge diag-badge-${q}">${q}</span>
+            <button class="btn-sm" title="Stop, clear cache, and reconnect" onclick="event.stopPropagation(); channelarr.diagReload('${row.channel_id}')">Reload</button>
+            <button class="btn-sm-danger" title="Stop stream" onclick="event.stopPropagation(); channelarr.diagStop('${row.channel_id}')">Stop</button>
+          </div>
         </div>
         <div class="diag-card-meta">
           <span>${esc(diagSourceLabel(row))}</span>
@@ -4069,6 +4080,33 @@ function renderDiagnosticsGrid(streams) {
       </div>`;
   }).join("");
 }
+
+// Physical stop / stall-recovery reload — same operation whether fired from
+// a dashboard card or the drill-down modal. There's no per-viewer session
+// concept in this app (every viewer of a channel shares one encoder), so
+// both of these affect everyone currently watching that channel.
+channelarr.diagStop = async function(channelId) {
+  if (!confirm("Stop this stream? Everyone currently watching it will be disconnected.")) return;
+  try {
+    await fetch(`${API}/diagnostics/${encodeURIComponent(channelId)}/stop`, { method: "POST" });
+    toast("success", "Stream stopped.");
+  } catch (e) {
+    toast("error", "Failed to stop stream.");
+  }
+};
+
+channelarr.diagReload = async function(channelId) {
+  if (!confirm("Reload this stream? It will stop, clear its cache, and reconnect — a brief interruption for anyone watching.")) return;
+  toast("info", "Reloading stream…");
+  try {
+    const r = await fetch(`${API}/diagnostics/${encodeURIComponent(channelId)}/reload`, { method: "POST" });
+    const d = await r.json();
+    toast(d.ok ? "success" : "error", d.ok ? "Stream reloaded." : (d.message || "Reload failed."));
+    if (diagModalChannelId === channelId) loadDiagModalData();
+  } catch (e) {
+    toast("error", "Failed to reload stream.");
+  }
+};
 
 channelarr.showDiagnostics = function(id, name) {
   diagModalChannelId = id;
@@ -4088,6 +4126,7 @@ function openDiagnosticsModal() {
   $("#chart-modal-title").textContent = `${diagModalChannelName} — Diagnostics`;
   $("#chart-modal-events").classList.remove("hidden");
   $("#chart-modal-live-summary").classList.remove("hidden");
+  $("#chart-modal-diag-actions").classList.remove("hidden");
   overlay.classList.remove("hidden");
   loadDiagModalData();
 

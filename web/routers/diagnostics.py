@@ -85,6 +85,38 @@ def diagnostics_history(channel_id: str, minutes: int = Query(default=60, ge=1, 
     }
 
 
+@router.post("/diagnostics/{channel_id}/stop")
+def diagnostics_stop(channel_id: str):
+    """Manual physical stop button. Kills the encoder/poller for this
+    channel; each mode's own stop() already clears its on-disk HLS cache
+    (see ChannelStream/ProxyStream/RemuxStream/ResolvedChannelStream
+    _clean_hls_dir()). The channel stays off until the next playlist
+    request boots it again from the schedule/fallback chain — same as any
+    other stop_channel() call in this app."""
+    from core.diagnostics import record_event
+    stopped = shared_state.streamer_mgr.stop_channel(channel_id)
+    record_event(channel_id, "manual_stop", {})
+    return {"ok": True, "stopped": stopped}
+
+
+@router.post("/diagnostics/{channel_id}/reload")
+def diagnostics_reload(channel_id: str):
+    """Stall-recovery button: stop the current encoder/poller (clears the
+    HLS cache) and immediately re-resolve + restart from the schedule,
+    rather than waiting for the player's next playlist request to notice
+    the stream is down and reboot it on its own. Runs the exact same
+    _pick_working_manifest() fallback-chain logic a passive restart would."""
+    from web.routers.hls import _start_from_schedule
+    from core.diagnostics import record_event
+    shared_state.streamer_mgr.stop_channel(channel_id)
+    ok, msg = _start_from_schedule(channel_id)
+    # Recorded after the restart, not before — a fresh start already resets
+    # this channel's diagnostics history (clear_channel(), called from every
+    # start_* path), so logging it first would just get wiped immediately.
+    record_event(channel_id, "manual_reload", {"restarted": ok})
+    return {"ok": ok, "message": msg}
+
+
 @router.post("/diagnostics/{channel_id}/client-event")
 async def diagnostics_client_event(channel_id: str, request: Request):
     """The video element itself reporting a stall or a live-catch-up seek —
