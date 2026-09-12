@@ -340,6 +340,80 @@ async def spike_single_capture(url: str, timeout: int = 30) -> CaptureResult:
     return result
 
 
+async def spike_synthetic_crash_isolation():
+    """(d) -- the DECISIVE version of the isolation test: zero network
+    dependency, fully deterministic, can be re-run any number of times
+    without hitting (or rate-limiting against) any real site.
+
+    Every real-site attempt at this test got confounded (a bad test URL that
+    wasn't actually live, then the whole fleet getting rate-limited by
+    hammering it all day) without ever answering the actual question. CDP
+    has a purpose-built command for exactly this: Page.crash() deliberately
+    kills the target's renderer process on command -- a real, hard crash,
+    not a timeout or a slow site. Two tabs load static `data:` pages (no
+    network at all), a third gets Page.crash()'d, and we check whether the
+    other two tabs' CDP sessions (in the same shared browser instance) still
+    respond to a trivial Runtime.evaluate before and after."""
+    print("\n=== (d-synthetic) crash-isolation test: Page.crash(), zero network ===")
+    browser = await uc.start(headless=False)
+    try:
+        page_html = ("data:text/html,<html><body><h1 id='marker'>alive</h1>"
+                     "<script>window.__ok=1</script></body></html>")
+
+        main_tab = browser.main_tab
+        tab_b = await browser.get(page_html, new_tab=True)
+        tab_bad = await browser.get(page_html, new_tab=True)
+        await main_tab.get(page_html)
+        await asyncio.sleep(1)
+
+        async def _probe(tab, label):
+            try:
+                result = await asyncio.wait_for(
+                    tab.send(uc.cdp.runtime.evaluate(expression="window.__ok === 1",
+                                                       return_by_value=True)),
+                    timeout=5.0,
+                )
+                remote_obj = result[0] if isinstance(result, tuple) else result
+                ok = bool(getattr(remote_obj, "value", False))
+                print(f"    [{label}] probe: alive={ok}")
+                return ok
+            except Exception as e:
+                print(f"    [{label}] probe FAILED: {e}")
+                return False
+
+        print("  -- before crash --")
+        before_a = await _probe(main_tab, "tab-A (main)")
+        before_b = await _probe(tab_b, "tab-B")
+
+        print("  -- crashing tab-BAD's renderer via Page.crash() --")
+        try:
+            await asyncio.wait_for(tab_bad.send(uc.cdp.page.crash()), timeout=5.0)
+        except Exception as e:
+            print(f"    Page.crash() call itself raised (often expected -- the "
+                  f"connection it was issued on just died): {e}")
+
+        await asyncio.sleep(2)
+
+        print("  -- after crash --")
+        after_a = await _probe(main_tab, "tab-A (main)")
+        after_b = await _probe(tab_b, "tab-B")
+
+        isolation_held = before_a and before_b and after_a and after_b
+        print(f"\n    VERDICT: tab-A and tab-B both survived tab-BAD's hard crash = {isolation_held}")
+        if isolation_held:
+            print("    >>> ISOLATION CONFIRMED -- a hard renderer crash in one tab did")
+            print("    >>> NOT affect the other tabs' CDP sessions in the same instance.")
+        else:
+            print("    >>> ISOLATION FAILURE -- escalate to the process-pool alternative")
+            print("    >>> per the plan's go/no-go gate.")
+        return isolation_held
+    finally:
+        try:
+            browser.stop()
+        except Exception:
+            pass
+
+
 async def spike_crash_isolation():
     """(d) -- the central bet of the multi-tab-in-shared-instance architecture.
     Open 3 tabs in ONE instance: 2 benign, 1 deliberately pointed at a known
@@ -410,32 +484,47 @@ async def main():
     print("SIDECAR 2.0 -- PHASE 0 SPIKE")
     print("=" * 70)
 
-    print("\n=== (a)+(b): single-capture reliability + cross-origin body-fetch hang ===")
-    results = []
-    for label, entry in FLEET_URLS.items():
-        url = entry["url"]
-        print(f"\n--- {label}: {url}")
-        r = await spike_single_capture(url, timeout=30)
-        results.append((label, entry, r))
-        print(f"    found={r.found} method={r.method} candidates_seen={r.candidates_seen} "
-              f"elapsed={r.elapsed_s:.1f}s error={r.error}")
+    # SPIKE_MODE gates whether real fleet sites get hit at all. Defaults to
+    # "isolation" (zero network, Page.crash()-based) specifically so this
+    # can be re-run freely while hardening code without ever risking
+    # rate-limiting the shared VPN exit IP against real target sites again
+    # (exactly what happened during fleet-wide validation). Set
+    # SPIKE_MODE=fleet explicitly (and space runs out, or rotate IPs) for a
+    # real validation pass.
+    mode = os.getenv("SPIKE_MODE", "isolation")
 
-    print("\n\n" + "=" * 70)
-    print("SUMMARY -- (a)/(b)")
-    print("=" * 70)
-    for label, entry, r in results:
-        status = "OK" if r.found else "MISS"
-        err = f" error={r.error}" if r.error else ""
-        expected = entry.get("needs_iframe")
-        via_mismatch = ""
-        if r.found and expected is not None:
-            actually_needed_iframe = (r.via == "iframe")
-            if actually_needed_iframe != expected:
-                via_mismatch = f" [expected needs_iframe={expected}, actually via={r.via}]"
-        print(f"  [{status}] {label:20s} method={r.method or '-':20s} via={r.via or '-':7s} "
-              f"candidates={r.candidates_seen} elapsed={r.elapsed_s:.1f}s{err}{via_mismatch}")
+    if mode == "fleet":
+        print("\n=== (a)+(b): single-capture reliability + cross-origin body-fetch hang ===")
+        results = []
+        for label, entry in FLEET_URLS.items():
+            url = entry["url"]
+            print(f"\n--- {label}: {url}")
+            r = await spike_single_capture(url, timeout=30)
+            results.append((label, entry, r))
+            print(f"    found={r.found} method={r.method} candidates_seen={r.candidates_seen} "
+                  f"elapsed={r.elapsed_s:.1f}s error={r.error}")
 
-    await spike_crash_isolation()
+        print("\n\n" + "=" * 70)
+        print("SUMMARY -- (a)/(b)")
+        print("=" * 70)
+        for label, entry, r in results:
+            status = "OK" if r.found else "MISS"
+            err = f" error={r.error}" if r.error else ""
+            expected = entry.get("needs_iframe")
+            via_mismatch = ""
+            if r.found and expected is not None:
+                actually_needed_iframe = (r.via == "iframe")
+                if actually_needed_iframe != expected:
+                    via_mismatch = f" [expected needs_iframe={expected}, actually via={r.via}]"
+            print(f"  [{status}] {label:20s} method={r.method or '-':20s} via={r.via or '-':7s} "
+                  f"candidates={r.candidates_seen} elapsed={r.elapsed_s:.1f}s{err}{via_mismatch}")
+    else:
+        print(f"\n(SPIKE_MODE={mode!r} -- skipping real-fleet capture loop; "
+              f"set SPIKE_MODE=fleet to run it)")
+
+    await spike_synthetic_crash_isolation()
+    if mode == "fleet":
+        await spike_crash_isolation()  # the real-site version, for comparison, only when explicitly hammering
 
     print("\nDone.")
 
