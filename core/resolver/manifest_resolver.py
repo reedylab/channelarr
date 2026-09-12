@@ -191,7 +191,7 @@ def refresh_due_manifests():
                 Channel.source_kind == "relay", Channel.manifest_id.isnot(None),
             )
             demand_rows = (
-                session.query(Manifest.id)
+                session.query(Manifest.id, Manifest.last_refreshed_at)
                 .filter(Manifest.tags.contains(["resolved"]))
                 .filter(Manifest.active == True)
                 .filter(Manifest.last_accessed_at.isnot(None))
@@ -212,7 +212,7 @@ def refresh_due_manifests():
                 .all()
             )
             always_on_rows = (
-                session.query(Manifest.id)
+                session.query(Manifest.id, Manifest.last_refreshed_at)
                 .join(Channel, Channel.manifest_id == Manifest.id)
                 .filter(Manifest.active == True)
                 .filter(Channel.type == "resolved")
@@ -266,7 +266,7 @@ def refresh_due_manifests():
             always_on_fallback_rows = []
             if fallback_ids:
                 always_on_fallback_rows = (
-                    session.query(Manifest.id)
+                    session.query(Manifest.id, Manifest.last_refreshed_at)
                     .filter(Manifest.id.in_(fallback_ids))
                     .filter(Manifest.active == True)
                     .filter(
@@ -282,7 +282,28 @@ def refresh_due_manifests():
                     .all()
                 )
 
-            ids = list({r[0] for r in (demand_rows + always_on_rows + always_on_fallback_rows)})
+            # Dedupe while preserving a genuine staleness order — a plain
+            # set-comprehension dedup here threw away each query's own
+            # order_by(last_refreshed_at), and since needs_heavy later
+            # takes a fixed-size slice ([:budget]), whichever manifest_ids
+            # happened to land past the cutoff in Python's (effectively
+            # arbitrary, but stable within one process) set-iteration order
+            # would NEVER get their turn for as long as the same due-pool
+            # kept recurring — a real starvation bug that got much more
+            # visible once the fallback-warming pool above made "due" pools
+            # regularly exceed the 5/tick heavy budget. Sorting by
+            # last_refreshed_at (nulls first = never-refreshed goes first)
+            # makes every item's turn depend on genuine staleness, not hash
+            # luck, so the budget rotates fairly across ticks.
+            combined = demand_rows + always_on_rows + always_on_fallback_rows
+            seen = set()
+            deduped = []
+            for mid, last_refreshed in combined:
+                if mid not in seen:
+                    seen.add(mid)
+                    deduped.append((mid, last_refreshed))
+            deduped.sort(key=lambda row: (row[1] is not None, row[1]))
+            ids = [mid for mid, _ in deduped]
 
         if not ids:
             return
