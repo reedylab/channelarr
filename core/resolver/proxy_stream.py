@@ -385,15 +385,27 @@ class ProxyStream:
                 resp = self.session.get(
                     variant_url, headers=self._upstream_headers(), timeout=10
                 )
-                if resp.status_code in (401, 403, 404):
+                # Any non-200 (not just 401/403/404) gets the same
+                # log+count+refresh+give-up treatment. This used to only
+                # apply to that one status tuple — anything else (502/503
+                # from an origin outage, 429, etc.) fell into a silent
+                # infinite retry with no logging and, because of the
+                # `continue` below, no chance for the source-stall detector
+                # to ever see it either. A channel wedged on a persistent
+                # upstream error looked indistinguishable from a healthy
+                # one in diagnostics — "running", no stalls, no errors —
+                # right up until a human noticed playback was actually dead
+                # (2026-09-12, an upstream origin returning 503 mid-stream).
+                if resp.status_code != 200:
                     consecutive_errors += 1
                     incr_counter(self.channel_id, "playlist_errors")
                     if consecutive_errors > 3:
                         record_event(self.channel_id, "give_up",
                                     {"reason": "consecutive_playlist_errors",
-                                     "count": consecutive_errors})
-                        logging.error("[PROXY] %s giving up after %d consecutive errors",
-                                      self.channel_id, consecutive_errors)
+                                     "count": consecutive_errors,
+                                     "status": resp.status_code})
+                        logging.error("[PROXY] %s giving up after %d consecutive errors (last status %d)",
+                                      self.channel_id, consecutive_errors, resp.status_code)
                         self._stop_event.set()
                         break
                     logging.warning("[PROXY] %s variant HTTP %d (#%d) — refreshing",
@@ -405,9 +417,6 @@ class ProxyStream:
                         consecutive_errors = 0
                     else:
                         self._stop_event.wait(10)
-                    continue
-                if resp.status_code != 200:
-                    self._stop_event.wait(POLL_INTERVAL)
                     continue
                 consecutive_errors = 0
             except Exception as e:
