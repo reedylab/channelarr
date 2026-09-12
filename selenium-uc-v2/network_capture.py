@@ -14,11 +14,15 @@ FastAPI shell + persistent-browser lifecycle around it.
 import asyncio
 import base64
 import json
+import logging
+import time
 
 import nodriver as uc
 import requests
 
 from session_attach import attach_to_target
+
+logger = logging.getLogger(__name__)
 
 # ── Ported from selenium-uc/app.py — pure Python, no browser-lib dependency ──
 
@@ -36,8 +40,24 @@ IFRAME_SKIP_SUBSTRINGS = (
     # iframe instead of the real player on one real source. These are login/
     # identity-provider infrastructure patterns, not target-site names.
     "auth.", "/sso", "sso-frame", "/login", "accounts.google.com",
+    # Generic ad-tech/analytics/tag-management iframe vendors observed
+    # empirically across real fleet testing — every one of these is common
+    # third-party ad/tracking infrastructure embedded on many unrelated
+    # sites, not a target site itself. Without these, the try-every-
+    # candidate-in-sequence logic below burns its whole per-candidate wait
+    # on each of these before ever reaching the real player iframe (real
+    # regression observed: a source that resolved in ~5s during Phase 0
+    # took 85s+ once several of these were present and untagged).
+    "dtscout.com", "lijit.com", "sharethis.com", "crwdcntrl.net",
+    "imasdk.googleapis.com", "quantserve.com", "scorecardresearch.com",
+    "adsrvr.org", "adnxs.com", "criteo.com", "taboola.com", "outbrain.com",
 )
 IFRAME_SKIP_SCHEMES = ("javascript:", "about:", "data:", "blob:")
+
+# Bounds for the try-every-iframe-candidate-in-sequence loop in run_capture —
+# see that loop's comment for the real regression this guards against.
+MAX_IFRAME_CANDIDATES = 5
+PER_CANDIDATE_WAIT_SECONDS = 3
 
 PLAY_SELECTORS = (
     ".play-button", ".vjs-big-play-button", ".jw-icon-display", "[class*='play']",
@@ -253,11 +273,19 @@ class CaptureOutcome:
         self.cookies = []
 
 
-def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Event, req_headers: dict):
+def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Event,
+                    req_headers: dict, t0: float, label: str):
     """Event-driven capture — replaces app.py's 80ms poll-and-hand-parse-
     get_log("performance") loop with nodriver's real CDP event push. See the
     sidecar-2.0 plan's Phase 0 results for why this is strictly better
-    (lower latency, no destructive-drain races, no restart-warmup quirk)."""
+    (lower latency, no destructive-drain races, no restart-warmup quirk).
+
+    t0/label are diagnostic-only (timing checkpoints) — added to chase a
+    real regression where this pipeline hangs to its full deadline on real
+    sources the Phase 0 spike resolves in ~10s. Not load-bearing logic."""
+
+    def _elapsed():
+        return f"{time.time() - t0:.2f}s"
 
     async def on_request(event):
         try:
@@ -282,33 +310,53 @@ def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Ev
             if not (_matches(url_, mime) or _looks_like_json_stream(url_)):
                 return
 
+            logger.info("[%s][%s] candidate response: %s (mime=%s)", label, _elapsed(), url_[:120], mime)
+
             meta = req_headers.get(rid, {})
             headers = meta.get("headers", {})
 
             body_text = None
-            # Prefer the plain-HTTP refetch for anything that looks like an
-            # m3u8 URL outright — this is the cross-origin-hang workaround
-            # from app.py, kept as cheap insurance even though Phase 0 found
-            # it doesn't reproduce under nodriver for the cases tested.
-            if ".m3u8" in url_.lower():
+            # CDP body-fetch FIRST, HTTP short-circuit only as a fallback —
+            # matching app.py's actual behavior and the Phase 0 spike (which
+            # reliably succeeds via CDP in ~10ms). Getting this order backwards
+            # is a real regression that was live here: an unauthenticated
+            # plain requests.get() against a real, anti-bot-protected .m3u8
+            # URL can itself take the full 10s to resolve (slow-drip/
+            # challenge response, not a quick reject) on EVERY matching
+            # response — with a live player firing multiple matching
+            # requests (master + media playlist, periodic re-polls), trying
+            # HTTP first before ever attempting the fast CDP path turned a
+            # ~5-10s capture into 85s+. asyncio.to_thread below keeps the
+            # (now-fallback-only) HTTP call from blocking the event loop
+            # that drives the CDP websocket read loop, but the real fix is
+            # the ordering itself.
+            cdp_start = time.time()
+            try:
+                cdp_result = await asyncio.wait_for(
+                    capture_tab.send(uc.cdp.network.get_response_body(request_id=rid)),
+                    timeout=5.0,
+                )
+                if cdp_result:
+                    body_str, b64 = cdp_result
+                    body_text = _decode_body(body_str, b64)
+                logger.info("[%s][%s] CDP body-fetch for %s: %s (%.2fs)", label, _elapsed(),
+                            url_[:80], "got body" if body_text else "empty/no body", time.time() - cdp_start)
+            except Exception as e:
+                logger.info("[%s][%s] CDP body-fetch for %s FAILED: %s (%.2fs)", label, _elapsed(),
+                            url_[:80], e, time.time() - cdp_start)
+                body_text = None
+
+            if body_text is None and ".m3u8" in url_.lower():
+                http_start = time.time()
                 try:
-                    r = requests.get(url_, headers=headers, timeout=10)
+                    r = await asyncio.to_thread(requests.get, url_, headers=headers, timeout=10)
                     if r.status_code == 200 and "#EXTM3U" in r.text:
                         body_text = r.text
-                except Exception:
-                    pass
-
-            if body_text is None:
-                try:
-                    cdp_result = await asyncio.wait_for(
-                        capture_tab.send(uc.cdp.network.get_response_body(request_id=rid)),
-                        timeout=5.0,
-                    )
-                    if cdp_result:
-                        body_str, b64 = cdp_result
-                        body_text = _decode_body(body_str, b64)
-                except Exception:
-                    body_text = None
+                    logger.info("[%s][%s] HTTP fallback for %s: status=%s (%.2fs)", label, _elapsed(),
+                                url_[:80], r.status_code, time.time() - http_start)
+                except Exception as e:
+                    logger.info("[%s][%s] HTTP fallback for %s FAILED: %s (%.2fs)", label, _elapsed(),
+                                url_[:80], e, time.time() - http_start)
 
             found_manifest_url = url_
             if body_text and "#EXTM3U" not in body_text:
@@ -322,7 +370,7 @@ def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Ev
                         parsed = json.loads(body_text)
                         embedded = _find_m3u8_in_json(parsed)
                         if embedded:
-                            r = requests.get(embedded, headers=headers, timeout=10)
+                            r = await asyncio.to_thread(requests.get, embedded, headers=headers, timeout=10)
                             if r.status_code == 200 and "#EXTM3U" in r.text:
                                 body_text = r.text
                                 found_manifest_url = embedded
@@ -343,18 +391,45 @@ def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Ev
             outcome.mime = mime or "application/vnd.apple.mpegurl"
             outcome.headers = dict(getattr(resp, "headers", {}) or {})
             outcome.referer = headers.get("Referer") or headers.get("referer")
+            logger.info("[%s][%s] SUCCESS: %s", label, _elapsed(), found_manifest_url[:120])
             found_event.set()
         except Exception as e:
+            logger.exception("[%s][%s] on_response error", label, _elapsed())
             outcome.error = f"on_response error: {e}"
 
     return on_request, on_response
 
 
-async def attach_capture(capture_tab, outcome, found_event, req_headers):
-    on_request, on_response = _make_handlers(capture_tab, outcome, found_event, req_headers)
+async def attach_capture(capture_tab, outcome, found_event, req_headers, t0: float, label: str = "?"):
+    on_request, on_response = _make_handlers(capture_tab, outcome, found_event, req_headers, t0, label)
     await capture_tab.send(uc.cdp.network.enable())
     capture_tab.add_handler(uc.cdp.network.RequestWillBeSent, lambda e: asyncio.create_task(on_request(e)))
     capture_tab.add_handler(uc.cdp.network.ResponseReceived, lambda e: asyncio.create_task(on_response(e)))
+    logger.info("[%s][%.2fs] capture attached", label, time.time() - t0)
+
+
+def _detach_capture(capture_tab, label: str = "?"):
+    """Undo attach_capture's add_handler calls. Required because nodriver's
+    add_handler unconditionally appends to self.handlers[event_type] (never
+    dedups, no built-in per-call scoping) -- confirmed via its own source.
+    app.py reuses ONE persistent tab across every /capture call, so without
+    this, every call's handlers -- especially every failed call's, whose
+    found_event never got set and so never early-returns -- stay registered
+    forever, all still firing on every future navigation's network events.
+    This was a real, confirmed regression: repeated calls against the same
+    persistent tab progressively slow down (N stacked handler pairs doing
+    matching + CDP get_response_body sends per event) and eventually hang
+    every subsequent capture to its full deadline, while a fresh one-off
+    tab/browser (zero prior handlers) always succeeds in seconds."""
+    remove = getattr(capture_tab, "remove_handler", None)
+    if not remove:
+        return
+    for evt in (uc.cdp.network.RequestWillBeSent, uc.cdp.network.ResponseReceived):
+        try:
+            remove(evt)
+        except Exception:
+            pass
+    logger.info("[%s] capture detached", label)
 
 
 async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True) -> CaptureOutcome:
@@ -366,46 +441,86 @@ async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: 
     outcome = CaptureOutcome()
     found_event = asyncio.Event()
     req_headers = {}
-
-    await attach_capture(tab, outcome, found_event, req_headers)
-    await tab.get(url)
-    await asyncio.sleep(3)
-
+    t0 = time.time()
     iframe_sessions = []
+
+    def _log(msg):
+        logger.info("[run_capture][%.2fs] %s", time.time() - t0, msg)
+
+    try:
+        return await _run_capture_body(
+            browser, tab, url, timeout, switch_iframe,
+            outcome, found_event, req_headers, iframe_sessions, t0, _log,
+        )
+    finally:
+        # Always detach, success or failure or exception -- see
+        # _detach_capture's docstring for why this is load-bearing on a
+        # persistent, cross-call-reused tab.
+        _detach_capture(tab, "top")
+        registry = getattr(tab, "_session_registry", None)
+        if registry:
+            for s in iframe_sessions:
+                registry.pop(str(s.session_id), None)
+
+
+async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
+                             outcome, found_event, req_headers, iframe_sessions, t0, _log):
+    await attach_capture(tab, outcome, found_event, req_headers, t0, "top")
+    _log(f"navigating to {url[:120]}")
+    await tab.get(url)
+    _log("tab.get() returned, sleeping 3s to let the page settle")
+    await asyncio.sleep(3)
+    _log(f"post-settle: found_event.is_set()={found_event.is_set()}")
+
     if not found_event.is_set() and switch_iframe:
         candidates = await _find_iframe_candidates(browser)
-        if candidates:
-            for candidate in candidates:
-                try:
-                    session = await attach_to_target(tab, candidate.target.target_id)
-                except Exception:
-                    continue
-                iframe_sessions.append(session)
-                skip = await scan_for_skip_phrase(session)
-                if skip:
-                    continue  # this iframe says the stream isn't available — try the next candidate
-                await attach_capture(session, outcome, found_event, req_headers)
-                if not found_event.is_set():
-                    await try_click_play(session)
-                if found_event.is_set():
-                    break
-                # give this candidate a short window before moving to the next
-                try:
-                    await asyncio.wait_for(found_event.wait(), timeout=8)
-                    break
-                except asyncio.TimeoutError:
-                    continue
+        _log(f"iframe candidates found: {len(candidates or [])}")
+        # Bound worst case regardless of how many iframes a source embeds
+        # (ad/tracking iframes not covered by IFRAME_SKIP_SUBSTRINGS are a
+        # real, observed failure mode otherwise — a source with a dozen
+        # third-party tags could otherwise burn minutes before ever
+        # reaching the real player). MAX_IFRAME_CANDIDATES candidates,
+        # PER_CANDIDATE_WAIT_SECONDS each, keeps the worst case bounded and
+        # small relative to the overall capture timeout.
+        for i, candidate in enumerate((candidates or [])[:MAX_IFRAME_CANDIDATES]):
+            cand_url = str(getattr(candidate.target, "url", "") or "")
+            _log(f"iframe candidate #{i}: {cand_url[:100]}")
+            try:
+                session = await attach_to_target(tab, candidate.target.target_id)
+            except Exception as e:
+                _log(f"  attach_to_target failed: {e}")
+                continue
+            iframe_sessions.append(session)
+            skip = await scan_for_skip_phrase(session)
+            if skip:
+                _log(f"  skip-phrase matched ({skip!r}), trying next candidate")
+                continue
+            await attach_capture(session, outcome, found_event, req_headers, t0, f"iframe#{i}")
+            if not found_event.is_set():
+                clicked = await try_click_play(session)
+                _log(f"  click-play on iframe#{i}: clicked={clicked}")
+            if found_event.is_set():
+                break
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=PER_CANDIDATE_WAIT_SECONDS)
+                break
+            except asyncio.TimeoutError:
+                _log(f"  iframe#{i} candidate window expired, moving on")
+                continue
 
     if not found_event.is_set():
         # nothing drilled found it — try the top page's own click as a
         # cheap fallback (some sources autoplay/click on the top level)
-        await try_click_play(iframe_sessions[-1] if iframe_sessions else tab)
+        clicked = await try_click_play(iframe_sessions[-1] if iframe_sessions else tab)
+        _log(f"fallback click-play: clicked={clicked}")
 
+    _log(f"entering final wait (timeout={timeout}s)")
     try:
         await asyncio.wait_for(found_event.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         if not outcome.error:
             outcome.error = f"No manifest found within {timeout}s"
+    _log(f"final wait done: ok={outcome.ok} error={outcome.error}")
 
     if outcome.ok:
         # user_agent + cookies are gathered from whichever target actually
