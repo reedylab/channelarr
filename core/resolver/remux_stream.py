@@ -232,7 +232,10 @@ class RemuxStream:
     def _refresh_manifest(self):
         try:
             from core.resolver.manifest_resolver import ManifestResolverService
-            ManifestResolverService.refresh_manifest(self.manifest_id)
+            # priority="high" (the default): a real viewer is watching this
+            # channel right now, so this must not queue behind background
+            # fallback-warming refreshes on the sidecar's single browser.
+            ManifestResolverService.refresh_manifest(self.manifest_id, priority="high")
         except Exception as e:
             logging.warning("[REMUX] %s manifest refresh failed: %s", self.channel_id, e)
         try:

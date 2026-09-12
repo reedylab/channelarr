@@ -180,6 +180,7 @@ def refresh_due_manifests():
         logger.info("[RESOLVER] Refresh tick skipped — pipeline busy (JIT or prior tick)")
         return
     needs_heavy: list[str] = []
+    priority_by_id: dict[str, str] = {}
     try:
         from core.models.channel import Channel
         now = datetime.now(timezone.utc)
@@ -305,6 +306,16 @@ def refresh_due_manifests():
             deduped.sort(key=lambda row: (row[1] is not None, row[1]))
             ids = [mid for mid, _ in deduped]
 
+            # Tag each manifest with the priority it should carry into a heavy
+            # sidecar refresh — fallback-warming-only manifests are pure
+            # background work and get "low" (defers on the sidecar's single
+            # browser to any pending live/on-demand request); anything that's
+            # a demand-driven or always-on PRIMARY gets "high", even if it
+            # also happens to show up in someone else's fallback list.
+            priority_by_id = {mid: "low" for mid, _ in always_on_fallback_rows}
+            for mid, _ in demand_rows + always_on_rows:
+                priority_by_id[mid] = "high"
+
         if not ids:
             return
 
@@ -330,6 +341,13 @@ def refresh_due_manifests():
     if not needs_heavy:
         return
 
+    # High-priority (demand-driven / always-on PRIMARY) items go first within
+    # the tick's budget — a batch of low-priority fallback-warming refreshes
+    # must not crowd out the primaries that are actually keeping a channel on
+    # the air right now, on top of what the sidecar-side priority lock
+    # already does for items still queued once the capture starts.
+    needs_heavy.sort(key=lambda mid: priority_by_id.get(mid, "high") != "high")
+
     budget = HEAVY_REFRESH_BUDGET_PER_TICK
     logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
                 len(needs_heavy), budget)
@@ -342,7 +360,7 @@ def refresh_due_manifests():
                         len(needs_heavy[:budget]) - i, len(needs_heavy[:budget]))
             break
         try:
-            ManifestResolverService.refresh_manifest(mid)
+            ManifestResolverService.refresh_manifest(mid, priority=priority_by_id.get(mid, "high"))
         except Exception as e:
             logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
         finally:
@@ -375,10 +393,16 @@ def _native_resolver():
     return _native_mod
 
 
-def _call_sidecar(url: str, timeout: int) -> dict:
+def _call_sidecar(url: str, timeout: int, priority: str = "high") -> dict:
     """Capture a manifest for a page URL. Some sources expose the HLS URL in
     plain HTML and can be resolved by a pure-HTTP native resolver (no browser);
-    everything else goes through the selenium-uc sidecar /capture endpoint."""
+    everything else goes through the selenium-uc sidecar /capture endpoint.
+
+    priority is forwarded to the sidecar's single-browser lock as-is — "low"
+    (background fallback-warming) defers there to any pending "high" (live/
+    on-demand) request. See selenium-uc/app.py's _PriorityLock. Anything but
+    an explicit "low" behaves like a plain mutex on the sidecar side, so the
+    default here preserves prior behavior for every existing caller."""
     native = _native_resolver()
     if native is not None:
         try:
@@ -394,10 +418,10 @@ def _call_sidecar(url: str, timeout: int) -> dict:
     sidecar_url = f"{get_setting('SELENIUM_URL', 'http://localhost:4445')}/capture"
     # HTTP timeout = browser timeout + 30s buffer for startup/teardown
     http_timeout = timeout + 30
-    logger.info("Calling sidecar %s for %s", sidecar_url, url)
+    logger.info("Calling sidecar %s for %s (priority=%s)", sidecar_url, url, priority)
     resp = http_requests.post(
         sidecar_url,
-        json={"url": url, "timeout": timeout, "switch_iframe": True},
+        json={"url": url, "timeout": timeout, "switch_iframe": True, "priority": priority},
         timeout=http_timeout,
     )
     resp.raise_for_status()
@@ -431,13 +455,18 @@ class ManifestResolverService:
                 event_start: str | None = None,
                 event_end: str | None = None,
                 auto_create: bool = False,
-                logo_urls: list | None = None) -> dict:
+                logo_urls: list | None = None,
+                priority: str = "high") -> dict:
         """Capture an m3u8 manifest via the sidecar and store it in DB.
 
         If existing_manifest_id is provided, the specified row is updated in place
         (used for token refresh — keeps the same manifest ID so streams don't break).
         If auto_create is True and resolve succeeds, a resolved channel is
         created automatically with the given tags and event times.
+
+        priority: "low" for background fallback-warming so it defers to any
+        live/on-demand request pending on the sidecar's single browser —
+        see _call_sidecar. Everything else should leave this at the default.
         """
         # In-flight dedup — if another thread is already resolving this URL, wait for it
         with _inflight_lock:
@@ -462,7 +491,7 @@ class ManifestResolverService:
         result = None
 
         try:
-            capture = _call_sidecar(url, timeout)
+            capture = _call_sidecar(url, timeout, priority=priority)
 
             if not capture.get("ok"):
                 err = capture.get("error", "Unknown error from sidecar")
@@ -736,7 +765,7 @@ class ManifestResolverService:
                 "expires_at": new_expiry.isoformat(), "path": "light"}
 
     @staticmethod
-    def refresh_manifest(manifest_id: str, timeout: int = 60) -> dict:
+    def refresh_manifest(manifest_id: str, timeout: int = 60, priority: str = "high") -> dict:
         """Re-resolve an existing manifest using its stored page_url.
 
         Updates the same row in place (preserves manifest_id) so active streams
@@ -744,6 +773,13 @@ class ManifestResolverService:
         path — launches a browser, navigates the watch page, drills iframes,
         captures the manifest. Reserve for cases where light_refresh_manifest()
         has failed (upstream session rotated, manifest URL no longer valid).
+
+        priority: pass "low" only for background fallback-warming (a manifest
+        that isn't the active source for anyone right now). Every other
+        caller — a live proxy/remux stream refreshing its own primary after a
+        401/403, the JIT event resolver, a user-triggered resolve — leaves
+        this at the default "high" so it doesn't queue behind background work
+        on the sidecar's single browser.
         """
         with get_session() as session:
             row = (
@@ -758,10 +794,11 @@ class ManifestResolverService:
         if not page_url:
             return {"ok": False, "manifest_id": manifest_id, "error": "no page_url for refresh"}
 
-        logger.info("Refreshing manifest %s from %s (full sidecar path)", manifest_id, page_url)
+        logger.info("Refreshing manifest %s from %s (full sidecar path, priority=%s)",
+                    manifest_id, page_url, priority)
         result = ManifestResolverService.resolve(
             url=page_url, title=title, timeout=timeout,
-            existing_manifest_id=manifest_id,
+            existing_manifest_id=manifest_id, priority=priority,
         )
         if result.get("ok"):
             result["path"] = "full"

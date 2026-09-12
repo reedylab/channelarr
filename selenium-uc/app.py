@@ -72,7 +72,71 @@ try:
     logger.info("Pre-patched chromedriver for Chrome %s", _chrome_version)
 except Exception as e:
     logger.warning("Chromedriver pre-patch failed (will patch on first use): %s", e)
-_browser_lock = threading.RLock()
+class _PriorityLock:
+    """A mutex where a "low"-priority acquire defers to any pending "high"-
+    priority waiter, instead of contending FIFO.
+
+    Root cause this exists to fix: the single Chrome instance behind
+    _browser_lock is now shared by two very different kinds of work —
+    background fallback-warming heavy-refreshes (queued by
+    refresh_due_manifests' always-on-fallback pool) and a live channel's
+    own emergency token refresh (ProxyStream/RemuxStream calling
+    refresh_manifest() because an actively-watched stream just got a 401/
+    403). Before this, both competed for the plain lock on equal footing,
+    so a batch of low-value background refreshes could sit ahead of a
+    live viewer's own urgent refresh in the queue, turning a routine token
+    rotation into a multi-minute stall. Everyone still has to wait out
+    whatever capture is *currently running* — a single browser can't be
+    preempted mid-navigation without risking the exact crash/corruption
+    this sidecar has been hardened against — but once it frees up, any
+    pending "high" waiter goes first regardless of arrival order.
+
+    Only capture() passes an explicit priority (from the caller's
+    CaptureRequest.priority). Every other call site (health probe,
+    /restart, cookie warmup) uses the plain `with _browser_lock:` /
+    `.acquire(timeout=...)` form, which defaults to "high" — i.e. behaves
+    exactly like a normal mutex, unaffected by this change.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._locked = False
+        self._high_waiters = 0
+
+    def acquire(self, timeout=None, priority="high"):
+        with self._cond:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            if priority == "high":
+                self._high_waiters += 1
+            try:
+                while self._locked or (priority == "low" and self._high_waiters > 0):
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        self._cond.wait(remaining)
+                    else:
+                        self._cond.wait()
+                self._locked = True
+                return True
+            finally:
+                if priority == "high":
+                    self._high_waiters -= 1
+
+    def release(self):
+        with self._cond:
+            self._locked = False
+            self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+_browser_lock = _PriorityLock()
 _browser = None
 _capture_count = 0
 
@@ -82,6 +146,11 @@ class CaptureRequest(BaseModel):
     timeout: int = 60
     switch_iframe: bool = True
     debug: bool = False
+    # "low" = background/fallback-warming work, which defers to any pending
+    # "high" (live/on-demand) request once the browser frees up — see
+    # _PriorityLock. Anything not explicitly marked "low" behaves exactly
+    # like a plain mutex, same as before this existed.
+    priority: str = "high"
 
 
 def _kill_chrome_processes():
@@ -1323,7 +1392,13 @@ def capture(req: CaptureRequest):
     # Hard deadline: timeout + 45s covers page load + manifest wait + overhead
     deadline = req.timeout + 45
 
-    with _browser_lock:
+    wait_start = time.monotonic()
+    _browser_lock.acquire(priority=req.priority)
+    wait_s = time.monotonic() - wait_start
+    if wait_s > 1:
+        logger.info("Capture for %s (priority=%s) waited %.1fs for the browser",
+                     req.url, req.priority, wait_s)
+    try:
         global _browser
         try:
             logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d)",
@@ -1391,3 +1466,5 @@ def capture(req: CaptureRequest):
 
         finally:
             _release_browser()
+    finally:
+        _browser_lock.release()

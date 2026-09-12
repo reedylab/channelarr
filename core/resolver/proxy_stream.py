@@ -253,7 +253,10 @@ class ProxyStream:
             from core.resolver.manifest_resolver import ManifestResolverService
             from core.database import get_session
             from core.models.manifest import Manifest
-            result = ManifestResolverService.refresh_manifest(self.manifest_id)
+            # priority="high" (the default): a real viewer is watching this
+            # channel right now, so this must not queue behind background
+            # fallback-warming refreshes on the sidecar's single browser.
+            result = ManifestResolverService.refresh_manifest(self.manifest_id, priority="high")
             if not result.get("ok"):
                 return None
             with get_session() as session:
