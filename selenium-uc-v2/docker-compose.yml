@@ -1,0 +1,41 @@
+services:
+  # Standalone, pre-integration test deployment for sidecar 2.0. Deliberately
+  # NOT part of docker-compose.yml/docker-compose.postgres.yml (the actual
+  # production stack) -- Jake's explicit ask was to stand this up and prove
+  # it separately until integration is ready, without disrupting channelarr
+  # operations. This file lets it run persistently (restart: unless-stopped)
+  # for extended validation instead of ad-hoc `docker run` test containers
+  # that get torn down after every check.
+  #
+  # Shares gluetun's network namespace by referencing the ALREADY-RUNNING
+  # channelarr-vpn container by name (works across separate compose
+  # projects -- network_mode: container:<name> is just a docker run flag
+  # under the hood, not compose-project-scoped). Same VPN egress as
+  # production and the v1 sidecar, deliberately -- real source testing needs
+  # the same egress posture production uses.
+  selenium-uc-v2:
+    build: .
+    container_name: channelarr-selenium-uc-v2
+    network_mode: "container:channelarr-vpn"
+    shm_size: 2g
+    environment:
+      - DISPLAY_NUM=93   # channelarr-selenium-uc (v1) already owns :99 in this shared netns
+      - CHROME_PROFILE_DIR=/data/chrome-profile
+      - SIDECAR_MAX_TABS=${SIDECAR_MAX_TABS:-3}
+    volumes:
+      - selenium_v2_profile:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys;r=urllib.request.urlopen('http://localhost:4446/health',timeout=10);sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
+        tag: "channelarr-selenium-uc-v2"
+
+volumes:
+  selenium_v2_profile:
