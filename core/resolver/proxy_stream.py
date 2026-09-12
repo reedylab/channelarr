@@ -44,6 +44,19 @@ MAX_SEGMENTS_ON_DISK = 10  # rolling window of segment files to keep
 # larger) setting.
 COLD_START_SEED_SEGMENTS = 4
 
+# Even with a small, fast initial download batch, exposing a playlist the
+# moment that batch lands leaves the player almost no runway to absorb this
+# poller's inherently bursty landing cadence — POLL_INTERVAL (2s) is shorter
+# than a typical segment duration (~4-6s), so roughly half of all polls find
+# nothing new and the rest land 1-2 segments at once. With only
+# COLD_START_SEED_SEGMENTS on hand that shows up as repeated buffer-underrun
+# stalls and live-edge reseeks in the player during the first ~20-30s
+# (2026-09-12). Holding the very first playlist write until this many
+# segments have accumulated — which costs one or two extra poll cycles
+# beyond the initial seed batch, not a return to the old full-backlog
+# wait — trades a little more upfront latency for a much smoother start.
+MIN_STARTUP_SEGMENTS = 6
+
 # Trigger a manifest refresh after N consecutive segment-decrypt failures.
 # Mid-stream decrypt failures mean the upstream session went stale (typically
 # a VPN exit-IP rotation invalidated the IP-bound AES key endpoint) — the
@@ -352,6 +365,7 @@ class ProxyStream:
         consecutive_errors = 0
         local_seq = 0  # our own sequence counter for the local playlist
         segment_files: list[tuple[int, str, float]] = []  # (local_seq, filename, duration)
+        has_written_playlist = False  # see MIN_STARTUP_SEGMENTS
 
         # production_speed_ratio / source_stall state — see the constants'
         # docstrings above for why this is checked every loop iteration
@@ -538,7 +552,9 @@ class ProxyStream:
                     except OSError:
                         pass
 
-                self._write_playlist(segment_files)
+                if has_written_playlist or len(segment_files) >= MIN_STARTUP_SEGMENTS:
+                    has_written_playlist = True
+                    self._write_playlist(segment_files)
 
             if new_count:
                 logging.info("[PROXY] %s downloaded %d segment(s), total on disk: %d",
