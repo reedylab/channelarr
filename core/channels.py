@@ -565,6 +565,54 @@ class ChannelManager:
         logging.info("[CHANNELS] Removed fallback source %s from channel %s", manifest_id, channel_id)
         return self.get_channel(channel_id)
 
+    def set_primary_manifest(self, channel_id: str, manifest_id: str) -> dict | None:
+        """Swap which manifest is primary for a resolved channel. The OLD
+        primary is automatically pushed onto the FRONT of the fallback
+        chain (so it's tried first if the new primary fails), and carries
+        the channel's current encoder_mode/source_kind as ITS fallback
+        override — this makes trying an alternate source as primary a
+        cheap, reversible experiment (call again with the old manifest_id
+        to revert) rather than a one-way door. No-op if already primary.
+        """
+        from core.database import get_session
+        from core.models import Channel as ChannelRow
+        from core.models.manifest import Manifest
+
+        with get_session() as session:
+            row = session.query(ChannelRow).filter_by(id=channel_id).first()
+            if row is None or row.type != "resolved":
+                return None
+            if session.query(Manifest.id).filter_by(id=manifest_id).first() is None:
+                return None
+            if manifest_id == row.manifest_id:
+                return self.get_channel(channel_id)
+
+            old_primary = row.manifest_id
+            chain = [mid for mid in (row.fallback_manifest_ids or []) if mid != manifest_id]
+            if old_primary:
+                chain.insert(0, old_primary)
+
+            modes = dict(row.fallback_encoder_modes or {})
+            kinds = dict(row.fallback_source_kinds or {})
+            new_mode_override = modes.pop(manifest_id, None)
+            new_kind_override = kinds.pop(manifest_id, None)
+            if old_primary:
+                modes[old_primary] = row.encoder_mode
+                if row.source_kind:
+                    kinds[old_primary] = row.source_kind
+
+            row.manifest_id = manifest_id
+            row.fallback_manifest_ids = chain
+            if new_mode_override:
+                row.encoder_mode = new_mode_override
+            if new_kind_override:
+                row.source_kind = new_kind_override
+            row.fallback_encoder_modes = modes
+            row.fallback_source_kinds = kinds
+        logging.info("[CHANNELS] Swapped primary manifest for channel %s: %s -> %s (old primary now first fallback)",
+                     channel_id, old_primary, manifest_id)
+        return self.get_channel(channel_id)
+
     def set_fallback_sources(self, channel_id: str, manifest_ids: list) -> dict | None:
         """Replace a resolved channel's whole fallback chain at once (bulk
         reorder). Silently drops the primary manifest_id and any ids that

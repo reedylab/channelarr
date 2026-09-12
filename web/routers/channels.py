@@ -249,6 +249,27 @@ def api_remove_fallback_source(channel_id: str, manifest_id: str):
     return _enrich(ch)
 
 
+@router.post("/channels/{channel_id}/set-primary")
+async def api_set_primary_manifest(channel_id: str, request: Request):
+    """Swap which manifest is primary. The old primary automatically
+    becomes the first fallback, so this is a cheap, reversible experiment
+    for trying an alternate source (e.g. a different upstream site) as the
+    main feed — call it again with the old manifest_id to revert."""
+    data = await request.json()
+    manifest_id = data.get("manifest_id")
+    if not manifest_id:
+        return JSONResponse({"error": "manifest_id required"}, status_code=400)
+    guard = _require_resolved(channel_id)
+    if isinstance(guard, JSONResponse):
+        return guard
+    ch = shared_state.channel_mgr.set_primary_manifest(channel_id, manifest_id)
+    if not ch:
+        return JSONResponse({"error": "Manifest not found"}, status_code=404)
+    shared_state.streamer_mgr.stop_channel(channel_id)
+    shared_state.regenerate_m3u()
+    return _enrich(ch)
+
+
 @router.put("/channels/{channel_id}/fallback-sources")
 async def api_set_fallback_sources(channel_id: str, request: Request):
     """Bulk-replace the fallback chain — used by the UI's reorder control."""
