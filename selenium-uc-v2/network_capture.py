@@ -6,9 +6,13 @@ design (see project public-repo hygiene convention) — every constant here is
 generic (ad-network domains, CSS selectors, CDN/platform vendor names), never
 a scraped target site.
 
-Phase 1 scope (single persistent tab, no pool yet — see the sidecar-2.0 plan,
-Phase 1): this module owns the actual /capture logic; app.py owns the
-FastAPI shell + persistent-browser lifecycle around it.
+This module owns the actual /capture logic and is tab-agnostic by design --
+app.py owns the FastAPI shell + browser/tab lifecycle around it. As of
+Phase 2, app.py opens a fresh, single-use tab per capture (closed after) to
+sidestep a whole class of cross-call state-leak bug found during Phase 1
+(see _detach_capture's docstring); nothing in this module assumes or
+requires that, though -- it works identically against a short-lived
+ephemeral tab or a long-lived reused one.
 """
 
 import asyncio
@@ -368,6 +372,15 @@ class CaptureOutcome:
         self.user_agent = None
         self.referer = None
         self.cookies = []
+        # The actual tab/session whose on_response handler found the
+        # manifest -- set in _make_handlers right where outcome.ok is set.
+        # NOT necessarily the last iframe candidate tried: if the top-level
+        # page's own handler succeeds while iframe candidates are still
+        # being attempted in sequence, "last iframe tried" would silently
+        # extract UA/cookies from the wrong (possibly ad/tracking) target.
+        # Real bug, fixed here -- cookies are genuinely load-bearing per the
+        # sidecar-2.0 plan's gap-map, not just contract-shape padding.
+        self.source = None
 
 
 def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Event,
@@ -488,6 +501,7 @@ def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Ev
             outcome.mime = mime or "application/vnd.apple.mpegurl"
             outcome.headers = dict(getattr(resp, "headers", {}) or {})
             outcome.referer = headers.get("Referer") or headers.get("referer")
+            outcome.source = capture_tab
             logger.info("[%s][%s] SUCCESS: %s", label, _elapsed(), found_manifest_url[:120])
             found_event.set()
         except Exception as e:
@@ -509,15 +523,18 @@ def _detach_capture(capture_tab, label: str = "?"):
     """Undo attach_capture's add_handler calls. Required because nodriver's
     add_handler unconditionally appends to self.handlers[event_type] (never
     dedups, no built-in per-call scoping) -- confirmed via its own source.
-    app.py reuses ONE persistent tab across every /capture call, so without
-    this, every call's handlers -- especially every failed call's, whose
-    found_event never got set and so never early-returns -- stay registered
-    forever, all still firing on every future navigation's network events.
-    This was a real, confirmed regression: repeated calls against the same
-    persistent tab progressively slow down (N stacked handler pairs doing
-    matching + CDP get_response_body sends per event) and eventually hang
-    every subsequent capture to its full deadline, while a fresh one-off
-    tab/browser (zero prior handlers) always succeeds in seconds."""
+
+    Historical note: this was originally load-bearing because Phase 1's
+    app.py reused ONE persistent tab across every /capture call -- without
+    this, every call's handlers (especially every failed call's, whose
+    found_event never got set and so never early-returns) stayed registered
+    forever, all still firing on every future navigation's network events,
+    a real, confirmed regression (progressively slower captures, eventually
+    hanging every subsequent one to its full deadline). Phase 2's app.py
+    now opens a fresh, single-use tab per capture and closes it after, which
+    already prevents this on its own -- a closed tab's handlers die with it.
+    Kept anyway as cheap defense-in-depth (this module doesn't assume
+    anything about the caller's tab lifecycle, see the module docstring)."""
     remove = getattr(capture_tab, "remove_handler", None)
     if not remove:
         return
@@ -530,7 +547,8 @@ def _detach_capture(capture_tab, label: str = "?"):
 
 
 async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True) -> CaptureOutcome:
-    """Full capture pipeline against an already-open, persistent tab: attach
+    """Full capture pipeline against an already-open tab (ephemeral or
+    persistent, this module doesn't care -- see module docstring): attach
     capture handlers, navigate, drill into an iframe if warranted (trying
     EACH non-skip candidate in turn, not just the first — the iframe-
     selection-robustness improvement from the sidecar-2.0 plan), scan for
@@ -631,14 +649,21 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
     _log(f"pending asyncio tasks at completion: {len(asyncio.all_tasks())}")
 
     if outcome.ok:
-        # user_agent + cookies are gathered from whichever target actually
-        # succeeded — cheap, no behavioral dependency downstream (both
-        # confirmed dead-data-adjacent per the plan; included for contract-
-        # shape completeness only). Timeout-wrapped for the same reason as
-        # get_cookies() -- see that function's docstring: a busy real page
-        # can silently kill nodriver's listener task via an unguarded
-        # KeyError, after which this send() would otherwise hang forever.
-        source = iframe_sessions[-1] if iframe_sessions else tab
+        # user_agent is cosmetic/dead-data-adjacent, but cookies are
+        # genuinely load-bearing (segment/key auth) -- both gathered from
+        # outcome.source, the ACTUAL target whose handler found the
+        # manifest (set in _make_handlers), not "the last iframe candidate
+        # attempted" -- those aren't always the same thing: the top-level
+        # page's own handler can succeed while iframe candidates are still
+        # being tried in sequence, in which case the last-tried iframe is
+        # irrelevant (often an ad/tracking frame) and pulling cookies from
+        # it would be wrong. Falls back to the old heuristic only if
+        # outcome.source somehow wasn't set (defensive, shouldn't happen).
+        # Timeout-wrapped below for the same reason as get_cookies() -- see
+        # that function's docstring: a busy real page can silently kill
+        # nodriver's listener task via an unguarded KeyError, after which
+        # this send() would otherwise hang forever.
+        source = outcome.source or (iframe_sessions[-1] if iframe_sessions else tab)
         try:
             ua_result = await asyncio.wait_for(
                 source.send(uc.cdp.runtime.evaluate(expression="navigator.userAgent", return_by_value=True)),
