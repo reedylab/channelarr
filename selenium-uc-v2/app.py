@@ -76,7 +76,7 @@ class PrioritySemaphore:
         if self._value > 0:
             self._value -= 1
             return
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._waiters[priority].append(fut)
         await fut
 
@@ -134,7 +134,19 @@ async def _close_tab_safely(tab, timeout=5):
     otherwise hang forever too. Timeout-wrapped for the same reason; a tab
     that fails to close cleanly just leaks until the whole browser is
     eventually recycled (existing _get_browser() health check), not a
-    request-blocking hang."""
+    request-blocking hang.
+
+    Known residual risk, not yet mitigated: nothing tracks or bounds actual
+    live Chrome tab count independently of PrioritySemaphore's logical slot
+    count -- the semaphore gates how many NEW captures can start, not
+    whether every previously-opened tab actually got closed. If close
+    silently times out occasionally over many hours of real operation,
+    leaked tabs (each a real renderer process) could accumulate slowly
+    until the next full browser recycle. Worth watching via the sustained
+    resource-observation loop (chrome process count) rather than fixing
+    preemptively tonight -- a real fix would mean tracking open tab IDs and
+    reconciling against browser.targets periodically, more Phase 2.5 scope
+    than a quick patch."""
     if tab is None:
         return
     try:
