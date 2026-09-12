@@ -93,6 +93,37 @@ def _kill_chrome_processes():
             pass
 
 
+def _quit_browser_safely(browser, timeout=8):
+    """`.quit()` sends an HTTP request to chromedriver and waits for a reply.
+    If Chrome's renderer/browser process has crashed but chromedriver itself
+    is left wedged (still alive, but blocked talking to a dead socket),
+    `.quit()` can hang with no timeout of its own — turning a transient
+    renderer crash into `_browser_lock` staying held indefinitely (every
+    other call site here already has deadline protection; this was the one
+    unprotected blocking call, and the likely reason a crash was escalating
+    all the way to the 12-minute health-check self-kill instead of
+    self-healing in seconds). Runs the quit in a daemon thread with a short
+    timeout; `_kill_chrome_processes()` (already timeout-bounded) guarantees
+    the process is actually gone either way, so a hung `.quit()` costs at
+    most `timeout` seconds instead of an unbounded wait."""
+    if browser is None:
+        return
+    done = threading.Event()
+
+    def _do_quit():
+        try:
+            browser.quit()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_do_quit, daemon=True).start()
+    if not done.wait(timeout=timeout):
+        logger.warning("browser.quit() didn't return within %ds — abandoning it, "
+                       "relying on _kill_chrome_processes() for actual cleanup", timeout)
+
+
 def _clear_chrome_singleton_locks():
     """Remove stale Chrome singleton lock files from the profile dir.
 
@@ -251,7 +282,7 @@ def _get_browser():
     except Exception:
         logger.warning("Browser session unresponsive, recreating")
         try:
-            _browser.quit()
+            _quit_browser_safely(_browser)
         except Exception:
             pass
         _kill_chrome_processes()
@@ -682,7 +713,7 @@ def restart():
     with _browser_lock:
         if _browser:
             try:
-                _browser.quit()
+                _quit_browser_safely(_browser)
             except Exception:
                 pass
         _browser = None
@@ -1320,7 +1351,7 @@ def capture(req: CaptureRequest):
                 logger.error("Capture deadline exceeded for %s (%ds), killing browser",
                              req.url, deadline)
                 try:
-                    _browser.quit()
+                    _quit_browser_safely(_browser)
                 except Exception:
                     pass
                 _kill_chrome_processes()
@@ -1339,7 +1370,7 @@ def capture(req: CaptureRequest):
             if result_dict.pop("_browser_needs_reset", False):
                 logger.info("Resetting browser after short-circuit capture (session wedged)")
                 try:
-                    _browser.quit()
+                    _quit_browser_safely(_browser)
                 except Exception:
                     pass
                 _kill_chrome_processes()
@@ -1351,7 +1382,7 @@ def capture(req: CaptureRequest):
             logger.exception("Capture failed for %s", req.url)
             try:
                 if _browser:
-                    _browser.quit()
+                    _quit_browser_safely(_browser)
             except Exception:
                 pass
             _kill_chrome_processes()
