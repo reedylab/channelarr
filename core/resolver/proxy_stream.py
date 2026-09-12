@@ -31,6 +31,19 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 2  # seconds between playlist polls
 MAX_SEGMENTS_ON_DISK = 10  # rolling window of segment files to keep
 
+# How many segments behind the upstream's live edge to seed on the very
+# first poll, deliberately independent of hls_list_size (tunable per
+# deployment for unrelated reasons, e.g. serving-window depth). Cold-start
+# always downloads every segment newer than the seed point, serially,
+# before the local playlist exists at all — so this needs to stay small
+# regardless of hls_list_size, or a source with a deep live window (ad-
+# insertion CDNs commonly keep 15+ segments vs. a plain live feed's 3-6)
+# leaves the player with nothing for a minute or more. Tying this to
+# hls_list_size used to mean the fast-path never engaged at all for such a
+# source unless its window happened to exceed that (unrelated, often much
+# larger) setting.
+COLD_START_SEED_SEGMENTS = 4
+
 # Trigger a manifest refresh after N consecutive segment-decrypt failures.
 # Mid-stream decrypt failures mean the upstream session went stale (typically
 # a VPN exit-IP rotation invalidated the IP-bound AES key endpoint) — the
@@ -395,20 +408,23 @@ class ProxyStream:
                     self._key_cache.pop(stale, None)
 
             # First poll optimization: DAI/HLS live playlists can advertise
-            # hours of DVR backlog (thousands of segments). We only need the
-            # live edge. Seed seen_uris with every segment EXCEPT the last N
-            # positions so the download loop processes at most hls_list_size
-            # segments and writes the first playlist within seconds instead
-            # of tens of minutes. Using full URI as the dedup key (not the
-            # sequence number) avoids collisions — DAI ad pods/slates reuse
-            # small seq numbers like 0,1,2,3 across pods, which a seq-based
-            # dedup would collapse into a single entry.
-            if not seen_uris and len(segments) > self.hls_list_size:
-                cutoff = len(segments) - self.hls_list_size
+            # anywhere from a few segments (plain live) to a deep DVR-style
+            # backlog (ad-insertion CDNs commonly keep 15+ segments for pod
+            # buffering). We only need the live edge. Seed seen_uris with
+            # every segment EXCEPT the last COLD_START_SEED_SEGMENTS
+            # positions so the download loop writes the first playlist
+            # within seconds regardless of how deep that window is — see
+            # COLD_START_SEED_SEGMENTS's docstring for why this is
+            # deliberately not tied to hls_list_size. Using full URI as the
+            # dedup key (not the sequence number) avoids collisions — DAI ad
+            # pods/slates reuse small seq numbers like 0,1,2,3 across pods,
+            # which a seq-based dedup would collapse into a single entry.
+            if not seen_uris and len(segments) > COLD_START_SEED_SEGMENTS:
+                cutoff = len(segments) - COLD_START_SEED_SEGMENTS
                 for seg in segments[:cutoff]:
                     seen_uris.add(seg["uri"])
                 logging.info("[PROXY] %s seeded past %d backlog segments; will grab the last %d",
-                             self.channel_id, cutoff, self.hls_list_size)
+                             self.channel_id, cutoff, COLD_START_SEED_SEGMENTS)
 
             # Download new segments
             new_count = 0
