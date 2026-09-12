@@ -73,6 +73,51 @@ PRODUCTION_WINDOW_SECONDS = 3.0
 SOURCE_STALL_SECONDS = 15.0
 
 
+# Some CDNs prepend a fake image header (observed: a 36-byte RIFF/WebP
+# header) before the real MPEG-TS sync bytes on an otherwise-plain segment —
+# the same trick RemuxStream's forced `-f mpegts` demux already works around
+# for its own download path (see remux_stream.py's _mux_pair). Proxy mode
+# serves raw bytes straight through with no re-mux step, so a player that
+# trusts the leading magic bytes over content (Jellyfin/ffprobe) sees a 1x1
+# "webp image" instead of video and fails outright, even though hls.js in a
+# browser tolerates it fine by resyncing past the garbage — exactly the
+# "works in browser, fails completely in Jellyfin" split this produces.
+_TS_PACKET_SIZE = 188
+_TS_SYNC_BYTE = 0x47
+_TS_DECOY_SCAN_WINDOW = 512  # observed decoy headers are tiny (~36B); this
+                             # leaves generous room for other CDNs' variants
+_TS_SYNC_CONFIRM_PACKETS = 8  # consecutive 188-byte-periodic sync bytes
+                               # required before trusting a candidate offset
+
+
+def _find_ts_sync_offset(data: bytes) -> Optional[int]:
+    """Byte offset of the first confirmed MPEG-TS sync point, or None if the
+    segment is too short to confirm one or genuinely isn't MPEG-TS."""
+    span = _TS_SYNC_CONFIRM_PACKETS * _TS_PACKET_SIZE
+    if len(data) < span:
+        return None
+    limit = min(len(data) - span, _TS_DECOY_SCAN_WINDOW)
+    for pos in range(limit + 1):
+        if data[pos] != _TS_SYNC_BYTE:
+            continue
+        if all(data[pos + i * _TS_PACKET_SIZE] == _TS_SYNC_BYTE
+               for i in range(_TS_SYNC_CONFIRM_PACKETS)):
+            return pos
+    return None
+
+
+def _strip_ts_decoy_prefix(channel_id: str, data: bytes) -> bytes:
+    """Return `data` with any decoy header before the real MPEG-TS sync
+    point removed. A segment that already starts clean (the common case) is
+    returned untouched at negligible cost."""
+    offset = _find_ts_sync_offset(data)
+    if not offset:
+        return data
+    logging.info("[PROXY] %s stripped %d-byte decoy header before real MPEG-TS sync",
+                 channel_id, offset)
+    return data[offset:]
+
+
 class _DecryptError(Exception):
     """Raised by _download_segment when AES decryption fails (wrong key /
     stale session). Distinguished from generic download errors so the
@@ -577,17 +622,21 @@ class ProxyStream:
                 # we were mid-stream). Surface as a typed error so the
                 # poller loop can trigger a manifest refresh.
                 raise _DecryptError(str(e)) from e
+            plaintext = _strip_ts_decoy_prefix(self.channel_id, plaintext)
             with open(local_path, "wb") as f:
                 f.write(plaintext)
             return
 
-        # Plaintext (or unknown method we'd rather pass through): stream
-        # straight to disk with no buffering.
-        resp = self.session.get(seg["uri"], headers=headers, timeout=15, stream=True)
+        # Plaintext (or unknown method we'd rather pass through). Buffered
+        # rather than streamed straight to disk — needs the full segment in
+        # hand to check for a decoy header prefix (see
+        # _strip_ts_decoy_prefix), and segments are small enough (~2-4 MB)
+        # that this costs nothing meaningful.
+        resp = self.session.get(seg["uri"], headers=headers, timeout=15)
         resp.raise_for_status()
+        data = _strip_ts_decoy_prefix(self.channel_id, resp.content)
         with open(local_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
+            f.write(data)
 
     def _write_playlist(self, segment_files: list[tuple[int, str, float, bool]]):
         """Write a local HLS playlist from the current segment list.
