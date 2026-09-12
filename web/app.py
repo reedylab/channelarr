@@ -250,6 +250,15 @@ async def lifespan(app: FastAPI):
     add_job("manifest_refresh", refresh_due_manifests, seconds=60, max_instances=1)
     logging.info("[RESOLVER] Scheduled manifest refresh tick (60s interval)")
 
+    # Player-health probe tick — pure HTTP (no selenium/browser cost), so
+    # deliberately independent of pipeline_lock/manifest_refresh's single-
+    # worker sidecar coordination. Keeps multi-player source rankings warm
+    # and reacts immediately to any currently-running channel the live
+    # diagnostics dashboard already flags as struggling.
+    from core.resolver.player_health import probe_due_channels
+    add_job("player_health_probe", probe_due_channels, seconds=120, max_instances=1)
+    logging.info("[PLAYER-HEALTH] Scheduled player health probe tick (120s interval)")
+
     # YouTube pre-cache worker (stays as thread — cookie warmup + failure tracking)
     from core.youtube import start_yt_cache_worker
     start_yt_cache_worker(channel_mgr)

@@ -33,6 +33,7 @@ TASK_NAMES = {
     "event_resolver": "Event Queue JIT Resolver",
     "event_expire": "Event Queue Expire",
     "manifest_refresh": "Manifest Refresh Tick",
+    "player_health_probe": "Player Health Probe",
     "yt_cache_worker": "YouTube Pre-Cache",
     "vpn_sampler": "VPN Latency Sampler",
     "vpn_auto_rotate": "VPN Auto-Rotate Check",

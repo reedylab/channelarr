@@ -805,6 +805,85 @@ class ManifestResolverService:
         return result
 
     @staticmethod
+    def discover_and_store_fallbacks(channel_id: str, primary_manifest_id: str,
+                                     timeout: int = 20) -> int:
+        """For multi-player sources only (see the native-resolver plugin's
+        discover-all hook): walk every other known player path for this
+        channel's stream id and store each one that yields a working
+        manifest as a fallback source on the channel.
+
+        Meant to piggyback on the moment `_pick_working_manifest` (hls.py)
+        already decided the whole fallback chain was exhausted and is
+        heavy-refreshing the primary — an already-expensive, infrequent
+        event, so tacking on this pure-HTTP discovery sweep (no selenium/
+        browser cost) is safe there without its own separate schedule or
+        adding to the sidecar's load. The source's own incident messaging
+        during a 2026-09-12 DDoS ("check all players 1-6") made clear these
+        alternates fail independently — capturing them all up front (not
+        just the default Player 1 the resolver has always used) directly
+        shortens future downtime windows.
+
+        "Player 1" itself (path="stream") is skipped — that's the primary,
+        already handled by the caller. Ranking/ordering these fallbacks by
+        reliability is a later project; for now this only makes sure
+        they're captured and available at all for the existing fallback-
+        chain logic to try in order.
+
+        Returns the number of NEW fallback manifests added (0 if this
+        source has no discover-all hook, the channel doesn't exist, or
+        nothing new was found).
+        """
+        from core.resolver import player_health
+        discovered = player_health.discover_and_record(channel_id, primary_manifest_id, timeout=timeout)
+        if discovered is None:
+            return 0
+
+        from web import shared_state
+        ch = shared_state.channel_mgr.get_channel(channel_id)
+        if not ch:
+            return 0
+        ch_name = ch.get("name") or channel_id
+        existing_titles = {fb.get("title") for fb in (ch.get("fallback_sources") or [])}
+
+        added = 0
+        for item in discovered:
+            path = item.get("path")
+            if path == "stream" or not item.get("ok"):
+                continue  # Player 1 / default is the primary, not a fallback; failed paths aren't stored
+            capture = item.get("capture") or {}
+            title = f"{ch_name} (player: {path})"
+            if title in existing_titles:
+                continue  # already tracking this player path as a fallback
+
+            body_text = _sanitize_body(capture.get("body"))
+            if not body_text or "#EXTM3U" not in body_text:
+                continue
+            try:
+                manifest_id = _store_manifest(
+                    page_url=item.get("page_url"),
+                    user_agent=capture.get("user_agent", ""),
+                    manifest_url=capture["manifest_url"],
+                    mime=capture.get("mime"),
+                    resp_headers=capture.get("headers"),
+                    body_text=body_text,
+                    title=title,
+                    context={},
+                    heartbeat=capture.get("heartbeat"),
+                    cookies=capture.get("cookies"),
+                    referer_url=capture.get("referer"),
+                )
+                shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id)
+                added += 1
+            except Exception as e:
+                logger.warning("[RESOLVER] failed to store discovered player %s for channel %s: %s",
+                              path, channel_id, e)
+
+        if added:
+            logger.info("[RESOLVER] channel %s: discovered and stored %d new player fallback(s)",
+                        channel_id, added)
+        return added
+
+    @staticmethod
     def get_batch_status():
         return dict(_batch)
 

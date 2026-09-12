@@ -13,6 +13,8 @@ from core.models.manifest import Capture, Manifest, Variant, HeaderProfile
 from core.models.scraped_event import ScrapedEvent
 from core.models.vpn_server import VpnServer
 from core.models.diagnostics import StreamDiagnosticSnapshot
+from core.models.player_health import PlayerHealthScore
 
 __all__ = ["Base", "Channel", "EpgPwCache", "Capture", "Manifest", "Variant",
-           "HeaderProfile", "ScrapedEvent", "VpnServer", "StreamDiagnosticSnapshot"]
+           "HeaderProfile", "ScrapedEvent", "VpnServer", "StreamDiagnosticSnapshot",
+           "PlayerHealthScore"]

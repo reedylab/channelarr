@@ -125,10 +125,29 @@ def _pick_working_manifest(ch):
     try:
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
-        if fresh:
-            return primary_id, fresh, default_mode, default_kind
     except Exception as e:
         logging.warning("[HLS] Refresh before start failed for %s: %s", primary_id, e)
+        fresh = None
+
+    # Piggyback player-fallback discovery + ranking on this already-
+    # expensive, rare moment (see discover_and_store_fallbacks' and
+    # player_health's docstrings) — fire-and-forget in the background since
+    # it can take up to ~45s and must not add to this call's own latency
+    # (it's on the critical path to a player actually getting bytes).
+    # No-ops instantly for any source without this discover-all hook.
+    def _discover_and_rank(channel_id, manifest_id):
+        from core.resolver import player_health
+        ManifestResolverService.discover_and_store_fallbacks(channel_id, manifest_id)
+        player_health.maybe_promote_best_player(channel_id)
+
+    threading.Thread(
+        target=_discover_and_rank,
+        args=(ch.get("id"), primary_id),
+        daemon=True,
+    ).start()
+
+    if fresh:
+        return primary_id, fresh, default_mode, default_kind
     return primary_id, ch.get("manifest_url"), default_mode, default_kind
 
 
