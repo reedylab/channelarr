@@ -1,0 +1,424 @@
+"""
+Sidecar 2.0 — capture logic. Ported from selenium-uc/app.py onto nodriver's
+event-driven CDP model + session_attach.py's iframe-session-attach (see that
+file for why nodriver needs it at all). This module is source-name-free by
+design (see project public-repo hygiene convention) — every constant here is
+generic (ad-network domains, CSS selectors, CDN/platform vendor names), never
+a scraped target site.
+
+Phase 1 scope (single persistent tab, no pool yet — see the sidecar-2.0 plan,
+Phase 1): this module owns the actual /capture logic; app.py owns the
+FastAPI shell + persistent-browser lifecycle around it.
+"""
+
+import asyncio
+import base64
+import json
+
+import nodriver as uc
+import requests
+
+from session_attach import attach_to_target
+
+# ── Ported from selenium-uc/app.py — pure Python, no browser-lib dependency ──
+
+MATCH_PATTERNS = ("m3u8", "application/x-mpegurl", "application/vnd.apple.mpegurl")
+INCLUDE_TYPES = ("Media", "Fetch", "XHR", "Document", "Other")
+# /proxy/ catches HLS playlists served from generic proxy paths whose filename
+# has been disguised (.css/.csv/.txt/.json) to evade scrapers that key on
+# .m3u8 — the body-sniff below handles validation.
+JSON_STREAM_PATTERNS = ("ngtv.io", "/api/", "/media/", "/stream", "anvato", "uplynk", "/proxy/")
+
+IFRAME_SKIP_SUBSTRINGS = (
+    "chatango.com", "adbanner", "/ads/", "/ad-", "google.com/recaptcha",
+    "doubleclick.net", "googletagmanager.com", "googlesyndication", "googleadservices",
+    # Generic auth/SSO-frame patterns — added after the spike picked an SSO
+    # iframe instead of the real player on one real source. These are login/
+    # identity-provider infrastructure patterns, not target-site names.
+    "auth.", "/sso", "sso-frame", "/login", "accounts.google.com",
+)
+IFRAME_SKIP_SCHEMES = ("javascript:", "about:", "data:", "blob:")
+
+PLAY_SELECTORS = (
+    ".play-button", ".vjs-big-play-button", ".jw-icon-display", "[class*='play']",
+    "button[aria-label*='play' i]", ".btn-play", "#play-btn",
+    ".plyr__control--overlaid", "video", ".video-player", ".player", "#player",
+    ".jw-wrapper",
+)
+
+# Ported verbatim from selenium-uc/app.py::_scan_all_frames_for_skip — each
+# phrase's specific false-positive rationale lives in that function's
+# comments; reproduced faithfully here, not paraphrased.
+SKIP_PHRASES = [
+    "premium only", "premium members only",
+    "subscribe to watch", "upgrade to watch",
+    "unlock this stream",
+    "live stream starting soon", "stream starting soon",
+    "event has not started", "stream will begin shortly",
+    "broadcast will begin",
+    # Some sites render "DELAYED START" as a status badge when the broadcast
+    # hasn't gone live yet — the player never initializes, so no manifest is
+    # ever requested and we'd otherwise wait the full timeout for nothing.
+    # Safe here because this only runs inside iframes (where the player +
+    # its status overlay live), not the top-level page (where related-game
+    # sidebars list other games' "delayed start" badges).
+    "delayed start",
+    # The bare word 'upcoming' false-triggers on sites with secondary
+    # 'Upcoming Listings' sections while a live stream is playing. Match
+    # contextual pregame wording instead.
+    "upcoming event", "upcoming broadcast", "upcoming stream",
+    # Post-game box-score state: 'FINAL' label + summary sections appear on
+    # the same game URL after it ends, with no live player. Live pages show
+    # the video player instead, never these summary headers.
+    "top performers today", "team comparison",
+    # End-of-stream wording — page renders a "game over" card instead of the
+    # player. Without these, we wait the full deadline scanning for a
+    # manifest that will never arrive.
+    "stream has ended", "stream ended",
+    "event has ended", "match has ended",
+    "game has ended", "broadcast has ended",
+    "event is over", "game is over",
+]
+
+CLICK_PLAY_JS = """
+(function(){
+  var sels = %s;
+  for (var i=0;i<sels.length;i++){
+    try {
+      var el = document.querySelector(sels[i]);
+      if (el) { el.click(); if (el.play) { el.play().catch(function(){}); } return sels[i]; }
+    } catch(e) {}
+  }
+  var v = document.querySelector('video');
+  if (v) { v.click(); if (v.play) v.play().catch(function(){}); return 'video-fallback'; }
+  return null;
+})()
+""" % (list(PLAY_SELECTORS),)
+
+SKIP_SCAN_JS = """
+(function(){
+  var t = (document.body ? document.body.innerText : '') || '';
+  return t.toLowerCase();
+})()
+"""
+
+
+def _matches(url: str, mime: str = "") -> bool:
+    hay = f"{url} {mime}".lower()
+    return any(p in hay for p in MATCH_PATTERNS)
+
+
+def _looks_like_json_stream(url: str) -> bool:
+    return any(p in url.lower() for p in JSON_STREAM_PATTERNS)
+
+
+def _find_m3u8_in_json(obj):
+    """Recursively search a parsed JSON object for an m3u8 URL. Ported
+    verbatim from selenium-uc/app.py::_find_m3u8_in_json."""
+    if isinstance(obj, str):
+        if ".m3u8" in obj and obj.startswith("http"):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            result = _find_m3u8_in_json(v)
+            if result:
+                return result
+    if isinstance(obj, list):
+        for item in obj:
+            result = _find_m3u8_in_json(item)
+            if result:
+                return result
+    return None
+
+
+def _decode_body(body_str, base64_encoded):
+    if not body_str:
+        return None
+    raw = base64.b64decode(body_str) if base64_encoded else body_str.encode("utf-8", errors="ignore")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="ignore")
+    return text
+
+
+def is_vod_endlist(body_text: str) -> bool:
+    """Ported verbatim from selenium-uc/app.py:1302-1312 — a live playlist
+    never contains #EXT-X-ENDLIST; its presence means a fixed-length VOD
+    (typically a short outro/replay clip after a game ends). Reject so
+    auto-channel-creation doesn't produce ghost channels that immediately
+    404. The playlist structure is the only reliable signal — any status
+    text overlay lives inside the video frame, not HTML."""
+    return "#EXT-X-ENDLIST" in body_text
+
+
+async def _find_iframe_candidates(browser):
+    """Enumerate browser.targets (the UNFILTERED list — browser.tabs
+    deliberately filters iframe-type targets out, see session_attach.py's
+    module docstring) and rank iframe candidates, same substring-skip
+    selection app.py uses, but returning ALL of them in try-order (not just
+    the first) — the iframe-selection-robustness improvement from the
+    sidecar-2.0 plan (motivated by the Phase 0 spike picking a wrong/SSO
+    iframe on one real source). Each returned item is the raw Connection
+    object browser.targets holds (has `.target.target_id`), not a bare ID."""
+    await browser.update_targets()
+    iframe_targets = [
+        t for t in browser.targets
+        if getattr(t.target, "type_", None) == "iframe"
+    ]
+    if not iframe_targets:
+        return None
+
+    def _skip(url_: str) -> bool:
+        low = url_.lower()
+        if any(low.startswith(s) for s in IFRAME_SKIP_SCHEMES):
+            return True
+        return any(s in low for s in IFRAME_SKIP_SUBSTRINGS)
+
+    candidates = [(t, str(getattr(t.target, "url", "") or "")) for t in iframe_targets]
+    good = [t for t, u in candidates if not _skip(u)]
+    ordered = good + [t for t, u in candidates if _skip(u)]  # skip-matched ones last, still tried
+    return ordered  # caller tries each in order, not just the first
+
+
+async def try_click_play(connection) -> bool:
+    """Works uniformly on a full Tab OR a bare attached Connection (iframe
+    session) — see session_attach.py for why .select()/.evaluate() (Tab-only)
+    aren't used here; raw Runtime.evaluate works on both."""
+    try:
+        result = await connection.send(
+            uc.cdp.runtime.evaluate(expression=CLICK_PLAY_JS, return_by_value=True,
+                                     await_promise=True, user_gesture=True)
+        )
+        remote_obj = result[0] if isinstance(result, tuple) else result
+        return bool(getattr(remote_obj, "value", None))
+    except Exception:
+        return False
+
+
+async def scan_for_skip_phrase(connection) -> str | None:
+    """Ported from selenium-uc/app.py::_scan_all_frames_for_skip — iframe-
+    only scanning (the real player + its status overlay live inside the
+    iframe; scanning the top-level page produced false positives from
+    sidebar/related-content sections on other sources)."""
+    try:
+        result = await connection.send(
+            uc.cdp.runtime.evaluate(expression=SKIP_SCAN_JS, return_by_value=True, timeout=5)
+        )
+        remote_obj = result[0] if isinstance(result, tuple) else result
+        text = getattr(remote_obj, "value", "") or ""
+        for phrase in SKIP_PHRASES:
+            if phrase in text:
+                return phrase
+    except Exception:
+        pass
+    return None
+
+
+async def get_cookies(connection) -> list[dict]:
+    """CDP Network.getAllCookies — not per-domain get_cookies() — deliberately,
+    per app.py's own reasoning: segment/key auth often lives on a different
+    subdomain than the page, and per-domain lookups miss it."""
+    try:
+        result = await connection.send(uc.cdp.network.get_all_cookies())
+        raw = result if isinstance(result, list) else getattr(result, "cookies", []) or []
+        out = []
+        for c in raw:
+            out.append({
+                "name": getattr(c, "name", None),
+                "value": getattr(c, "value", None),
+                "domain": getattr(c, "domain", None),
+                "path": getattr(c, "path", None) or "/",
+                "secure": bool(getattr(c, "secure", False)),
+                "httpOnly": bool(getattr(c, "http_only", False)),
+                "expiry": int(getattr(c, "expires", -1)) if getattr(c, "expires", -1) and getattr(c, "expires", -1) > 0 else None,
+                "sameSite": str(getattr(c, "same_site", None)) if getattr(c, "same_site", None) else None,
+            })
+        return out
+    except Exception:
+        return []
+
+
+class CaptureOutcome:
+    def __init__(self):
+        self.ok = False
+        self.error = None
+        self.manifest_url = None
+        self.body = None
+        self.mime = None
+        self.headers = None
+        self.user_agent = None
+        self.referer = None
+        self.cookies = []
+
+
+def _make_handlers(capture_tab, outcome: CaptureOutcome, found_event: asyncio.Event, req_headers: dict):
+    """Event-driven capture — replaces app.py's 80ms poll-and-hand-parse-
+    get_log("performance") loop with nodriver's real CDP event push. See the
+    sidecar-2.0 plan's Phase 0 results for why this is strictly better
+    (lower latency, no destructive-drain races, no restart-warmup quirk)."""
+
+    async def on_request(event):
+        try:
+            resource_type = event.type_.value if getattr(event, "type_", None) else None
+            if resource_type and resource_type not in INCLUDE_TYPES:
+                return
+            req_headers[event.request_id] = {
+                "headers": dict(getattr(event.request, "headers", {}) or {}),
+                "url": event.request.url,
+            }
+        except Exception:
+            pass
+
+    async def on_response(event):
+        if found_event.is_set():
+            return
+        try:
+            rid = event.request_id
+            resp = event.response
+            url_ = resp.url
+            mime = getattr(resp, "mime_type", "") or ""
+            if not (_matches(url_, mime) or _looks_like_json_stream(url_)):
+                return
+
+            meta = req_headers.get(rid, {})
+            headers = meta.get("headers", {})
+
+            body_text = None
+            # Prefer the plain-HTTP refetch for anything that looks like an
+            # m3u8 URL outright — this is the cross-origin-hang workaround
+            # from app.py, kept as cheap insurance even though Phase 0 found
+            # it doesn't reproduce under nodriver for the cases tested.
+            if ".m3u8" in url_.lower():
+                try:
+                    r = requests.get(url_, headers=headers, timeout=10)
+                    if r.status_code == 200 and "#EXTM3U" in r.text:
+                        body_text = r.text
+                except Exception:
+                    pass
+
+            if body_text is None:
+                try:
+                    cdp_result = await asyncio.wait_for(
+                        capture_tab.send(uc.cdp.network.get_response_body(request_id=rid)),
+                        timeout=5.0,
+                    )
+                    if cdp_result:
+                        body_str, b64 = cdp_result
+                        body_text = _decode_body(body_str, b64)
+                except Exception:
+                    body_text = None
+
+            found_manifest_url = url_
+            if body_text and "#EXTM3U" not in body_text:
+                # Disguised-HLS body-sniff: check first 4096 chars even when
+                # URL/mime didn't match MATCH_PATTERNS (catches .css/.csv/.txt-
+                # disguised manifests) or a JSON-API wrapping an embedded m3u8.
+                if "#EXTM3U" in body_text[:4096]:
+                    pass  # already true, kept branch for clarity/symmetry with app.py
+                else:
+                    try:
+                        parsed = json.loads(body_text)
+                        embedded = _find_m3u8_in_json(parsed)
+                        if embedded:
+                            r = requests.get(embedded, headers=headers, timeout=10)
+                            if r.status_code == 200 and "#EXTM3U" in r.text:
+                                body_text = r.text
+                                found_manifest_url = embedded
+                    except Exception:
+                        body_text = None
+
+            if not body_text or "#EXTM3U" not in body_text:
+                return
+
+            if is_vod_endlist(body_text):
+                outcome.error = "Skipped: stream ended (VOD playlist)"
+                found_event.set()
+                return
+
+            outcome.ok = True
+            outcome.manifest_url = found_manifest_url
+            outcome.body = body_text
+            outcome.mime = mime or "application/vnd.apple.mpegurl"
+            outcome.headers = dict(getattr(resp, "headers", {}) or {})
+            outcome.referer = headers.get("Referer") or headers.get("referer")
+            found_event.set()
+        except Exception as e:
+            outcome.error = f"on_response error: {e}"
+
+    return on_request, on_response
+
+
+async def attach_capture(capture_tab, outcome, found_event, req_headers):
+    on_request, on_response = _make_handlers(capture_tab, outcome, found_event, req_headers)
+    await capture_tab.send(uc.cdp.network.enable())
+    capture_tab.add_handler(uc.cdp.network.RequestWillBeSent, lambda e: asyncio.create_task(on_request(e)))
+    capture_tab.add_handler(uc.cdp.network.ResponseReceived, lambda e: asyncio.create_task(on_response(e)))
+
+
+async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True) -> CaptureOutcome:
+    """Full capture pipeline against an already-open, persistent tab: attach
+    capture handlers, navigate, drill into an iframe if warranted (trying
+    EACH non-skip candidate in turn, not just the first — the iframe-
+    selection-robustness improvement from the sidecar-2.0 plan), scan for
+    skip-phrases, click play, wait for a manifest."""
+    outcome = CaptureOutcome()
+    found_event = asyncio.Event()
+    req_headers = {}
+
+    await attach_capture(tab, outcome, found_event, req_headers)
+    await tab.get(url)
+    await asyncio.sleep(3)
+
+    iframe_sessions = []
+    if not found_event.is_set() and switch_iframe:
+        candidates = await _find_iframe_candidates(browser)
+        if candidates:
+            for candidate in candidates:
+                try:
+                    session = await attach_to_target(tab, candidate.target.target_id)
+                except Exception:
+                    continue
+                iframe_sessions.append(session)
+                skip = await scan_for_skip_phrase(session)
+                if skip:
+                    continue  # this iframe says the stream isn't available — try the next candidate
+                await attach_capture(session, outcome, found_event, req_headers)
+                if not found_event.is_set():
+                    await try_click_play(session)
+                if found_event.is_set():
+                    break
+                # give this candidate a short window before moving to the next
+                try:
+                    await asyncio.wait_for(found_event.wait(), timeout=8)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+    if not found_event.is_set():
+        # nothing drilled found it — try the top page's own click as a
+        # cheap fallback (some sources autoplay/click on the top level)
+        await try_click_play(iframe_sessions[-1] if iframe_sessions else tab)
+
+    try:
+        await asyncio.wait_for(found_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if not outcome.error:
+            outcome.error = f"No manifest found within {timeout}s"
+
+    if outcome.ok:
+        # user_agent + cookies are gathered from whichever target actually
+        # succeeded — cheap, no behavioral dependency downstream (both
+        # confirmed dead-data-adjacent per the plan; included for contract-
+        # shape completeness only).
+        source = iframe_sessions[-1] if iframe_sessions else tab
+        try:
+            ua_result = await source.send(uc.cdp.runtime.evaluate(expression="navigator.userAgent", return_by_value=True))
+            ua_obj = ua_result[0] if isinstance(ua_result, tuple) else ua_result
+            outcome.user_agent = getattr(ua_obj, "value", None)
+        except Exception:
+            pass
+        outcome.cookies = await get_cookies(source)
+
+    return outcome
