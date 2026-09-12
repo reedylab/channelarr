@@ -59,6 +59,17 @@ IFRAME_SKIP_SCHEMES = ("javascript:", "about:", "data:", "blob:")
 MAX_IFRAME_CANDIDATES = 5
 PER_CANDIDATE_WAIT_SECONDS = 3
 
+# How long to actively poll for at least one real content iframe to appear
+# before giving up on iframe drilling entirely, matching v1's
+# WebDriverWait(browser, 10).until(lambda d: len(d.find_elements(By.TAG_NAME,
+# "iframe")) > 0) (selenium-uc/app.py:1231-1233) -- confirmed via real fleet
+# testing to be a real gap: a single point-in-time check right after the
+# fixed 3s settle sleep can miss a player iframe that injects later (ad-load
+# delay, lazy player init), where v1's poll-until-appear-or-timeout would
+# still catch it.
+IFRAME_APPEAR_TIMEOUT = 10
+IFRAME_POLL_INTERVAL = 0.5
+
 PLAY_SELECTORS = (
     ".play-button", ".vjs-big-play-button", ".jw-icon-display", "[class*='play']",
     "button[aria-label*='play' i]", ".btn-play", "#play-btn",
@@ -111,6 +122,33 @@ CLICK_PLAY_JS = """
   }
   var v = document.querySelector('video');
   if (v) { v.click(); if (v.play) v.play().catch(function(){}); return 'video-fallback'; }
+  return null;
+})()
+""" % (list(PLAY_SELECTORS),)
+
+# Locates the same candidate element CLICK_PLAY_JS would click, but returns
+# its viewport center coordinates instead of clicking it directly -- used to
+# dispatch a REAL CDP Input.dispatchMouseEvent (see try_click_play) rather
+# than a JS-level .click(), which produces an event.isTrusted=false event
+# some sites silently ignore for gating playback on a genuine user gesture.
+FIND_PLAYABLE_RECT_JS = """
+(function(){
+  var sels = %s;
+  function rectOf(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2});
+    }
+    return null;
+  }
+  for (var i=0;i<sels.length;i++){
+    try {
+      var el = document.querySelector(sels[i]);
+      if (el) { var rect = rectOf(el); if (rect) return rect; }
+    } catch(e) {}
+  }
+  var v = document.querySelector('video');
+  if (v) { var rect = rectOf(v); if (rect) return rect; }
   return null;
 })()
 """ % (list(PLAY_SELECTORS),)
@@ -173,6 +211,20 @@ def is_vod_endlist(body_text: str) -> bool:
     return "#EXT-X-ENDLIST" in body_text
 
 
+def _is_content_iframe(url_: str) -> bool:
+    """A real player iframe is always http(s) — chrome-untrusted://,
+    chrome://, devtools:// etc. are Chrome's own internal UI surfaces that
+    show up in browser.targets as type_=="iframe" too (confirmed via real
+    fleet testing: chrome-untrusted://new-tab-page/one-google-bar showed up
+    as a candidate on EVERY real capture that reached iframe drilling,
+    every time, regardless of source). These can never serve a manifest, so
+    they're excluded outright rather than merely deprioritized like the
+    substring-matched skip list below -- letting one through as a "good"
+    (non-skip) candidate meant it got tried FIRST, ahead of any real
+    candidate, burning a full PER_CANDIDATE_WAIT_SECONDS window every time."""
+    return url_.lower().startswith(("http://", "https://"))
+
+
 async def _find_iframe_candidates(browser):
     """Enumerate browser.targets (the UNFILTERED list — browser.tabs
     deliberately filters iframe-type targets out, see session_attach.py's
@@ -186,6 +238,7 @@ async def _find_iframe_candidates(browser):
     iframe_targets = [
         t for t in browser.targets
         if getattr(t.target, "type_", None) == "iframe"
+        and _is_content_iframe(str(getattr(t.target, "url", "") or ""))
     ]
     if not iframe_targets:
         return None
@@ -205,7 +258,38 @@ async def _find_iframe_candidates(browser):
 async def try_click_play(connection) -> bool:
     """Works uniformly on a full Tab OR a bare attached Connection (iframe
     session) — see session_attach.py for why .select()/.evaluate() (Tab-only)
-    aren't used here; raw Runtime.evaluate works on both."""
+    aren't used here; raw Runtime.evaluate/Input.dispatchMouseEvent both
+    work on either.
+
+    Tries a REAL trusted mouse click first (CDP Input.dispatchMouseEvent at
+    the candidate element's coordinates — matches what Selenium's native
+    WebElement.click() does under the hood in v1, a genuine OS-level input
+    event with event.isTrusted=true), falling back to the plain JS-level
+    .click() below only if no clickable candidate was found. This is a real,
+    observed gap ported back from comparing against v1: some sites gate
+    playback on a trusted user gesture and silently no-op on a synthetic
+    click, which JS-level .click() always is."""
+    try:
+        rect_result = await connection.send(
+            uc.cdp.runtime.evaluate(expression=FIND_PLAYABLE_RECT_JS, return_by_value=True)
+        )
+        remote_obj = rect_result[0] if isinstance(rect_result, tuple) else rect_result
+        raw = getattr(remote_obj, "value", None)
+        if raw:
+            info = json.loads(raw)
+            x, y = float(info["x"]), float(info["y"])
+            await connection.send(uc.cdp.input_.dispatch_mouse_event(
+                type_="mousePressed", x=x, y=y,
+                button=uc.cdp.input_.MouseButton.LEFT, click_count=1,
+            ))
+            await connection.send(uc.cdp.input_.dispatch_mouse_event(
+                type_="mouseReleased", x=x, y=y,
+                button=uc.cdp.input_.MouseButton.LEFT, click_count=1,
+            ))
+            return True
+    except Exception:
+        pass
+
     try:
         result = await connection.send(
             uc.cdp.runtime.evaluate(expression=CLICK_PLAY_JS, return_by_value=True,
@@ -486,7 +570,17 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
     _log(f"post-settle: found_event.is_set()={found_event.is_set()}")
 
     if not found_event.is_set() and switch_iframe:
-        candidates = await _find_iframe_candidates(browser)
+        # Actively poll for at least one real content iframe to appear
+        # (up to IFRAME_APPEAR_TIMEOUT total) instead of a single point-in-
+        # time check -- see IFRAME_APPEAR_TIMEOUT's comment for the real
+        # regression this fixes.
+        candidates = None
+        poll_deadline = time.time() + IFRAME_APPEAR_TIMEOUT
+        while True:
+            candidates = await _find_iframe_candidates(browser)
+            if candidates or found_event.is_set() or time.time() >= poll_deadline:
+                break
+            await asyncio.sleep(IFRAME_POLL_INTERVAL)
         _log(f"iframe candidates found: {len(candidates or [])}")
         # Bound worst case regardless of how many iframes a source embeds
         # (ad/tracking iframes not covered by IFRAME_SKIP_SUBSTRINGS are a
