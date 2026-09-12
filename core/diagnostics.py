@@ -278,6 +278,10 @@ def get_summary(channel_id: str) -> dict:
     cutoff_5m = time.time() - 300
     reconnects_5m = sum(1 for e in events if e["type"] == "relay_reconnect" and e["ts"] >= cutoff_5m)
     resyncs_5m = sum(1 for e in events if e["type"] == "resync_skip" and e["ts"] >= cutoff_5m)
+    # source_stall is proxy mode's equivalent of resync_skip — the upstream
+    # playlist stopped advancing even though fetches keep returning 200. See
+    # ProxyStream._poller_loop_inner's SOURCE_STALL_SECONDS.
+    source_stalls_5m = sum(1 for e in events if e["type"] == "source_stall" and e["ts"] >= cutoff_5m)
     # Client-reported playback events are the most direct signal there is —
     # everything else here is a proxy for "is the viewer actually seeing a
     # problem"; these ARE that problem, reported by the video element
@@ -287,6 +291,7 @@ def get_summary(channel_id: str) -> dict:
     error_events_5m = sum(1 for e in events
                           if e["type"] in ("give_up", "fallback_chain_exhausted",
                                             "playlist_wait_timeout", "resync_skip",
+                                            "source_stall",
                                             "client_stall", "client_seek_jump")
                           and e["ts"] >= cutoff_5m)
 
@@ -312,6 +317,7 @@ def get_summary(channel_id: str) -> dict:
         "fetch_latency_ms_max": round(fetch_max, 1) if fetch_max is not None else None,
         "reconnect_gap_ms_max": round(reconnect_gap_max, 1) if reconnect_gap_max is not None else None,
         "resyncs_last_5m": resyncs_5m,
+        "source_stalls_last_5m": source_stalls_5m,
         "client_stalls_last_5m": client_stalls_5m,
         "client_seeks_last_5m": client_seeks_5m,
         "playlist_wait_ms_max": round(playlist_wait_max, 1) if playlist_wait_max is not None else None,

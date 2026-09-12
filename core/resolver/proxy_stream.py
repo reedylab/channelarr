@@ -43,6 +43,22 @@ DECRYPT_FAILURES_BEFORE_REFRESH = 3
 # time to land + the player time to re-fetch the playlist.
 DECRYPT_REFRESH_DEBOUNCE_SECONDS = 60
 
+# production_speed_ratio window — same concept as RemuxStream's (see there
+# for the full rationale): sum(new segment duration)/wall-clock elapsed over
+# a rolling window, not per-poll, so a burst of several segments landing at
+# once doesn't produce a meaningless spike. Unlike remux, this loop already
+# runs on a fixed POLL_INTERVAL regardless of whether anything new showed up,
+# so the window is checked unconditionally every iteration — that's what
+# lets a stall show up as a live, decaying ratio *during* the stall, not
+# just as a low reading the moment it resolves.
+PRODUCTION_WINDOW_SECONDS = 3.0
+# No new segment for this long -> the upstream playlist itself has stopped
+# advancing even though our fetches keep returning 200. fetch_latency_ms
+# alone can't see this (each individual request is fine); it's exactly the
+# blind spot that let a proxy-mode channel sit dark for ~57s while every
+# diagnostic counter read clean (2026-09-12).
+SOURCE_STALL_SECONDS = 15.0
+
 
 class _DecryptError(Exception):
     """Raised by _download_segment when AES decryption fails (wrong key /
@@ -279,6 +295,15 @@ class ProxyStream:
         local_seq = 0  # our own sequence counter for the local playlist
         segment_files: list[tuple[int, str, float]] = []  # (local_seq, filename, duration)
 
+        # production_speed_ratio / source_stall state — see the constants'
+        # docstrings above for why this is checked every loop iteration
+        # rather than only when a new segment actually lands.
+        prod_window_start = time.time()
+        prod_window_dur = 0.0
+        last_new_segment_at = time.time()
+        source_stalled = False
+        stall_started_at = None
+
         variant_url = self._resolve_variant_url(self.manifest_url)
         logging.info("[PROXY] %s polling variant: %s",
                      self.channel_id, variant_url[:120])
@@ -403,6 +428,7 @@ class ProxyStream:
                     segment_files.append((local_seq, local_filename, seg["duration"], seg.get("discontinuity", False)))
                     local_seq += 1
                     new_count += 1
+                    prod_window_dur += seg["duration"]
                     self._consecutive_decrypt_failures = 0
                 except _DecryptError as e:
                     self._consecutive_decrypt_failures += 1
@@ -456,6 +482,38 @@ class ProxyStream:
             if new_count:
                 logging.info("[PROXY] %s downloaded %d segment(s), total on disk: %d",
                              self.channel_id, new_count, len(segment_files))
+                last_new_segment_at = time.time()
+                if source_stalled:
+                    stalled_for = time.time() - stall_started_at
+                    record_event(self.channel_id, "source_stall_recovered",
+                                {"stalled_seconds": round(stalled_for, 1)})
+                    logging.info("[PROXY] %s source stall recovered after %.0fs",
+                                 self.channel_id, stalled_for)
+                    source_stalled = False
+                    stall_started_at = None
+
+            # production_speed_ratio: checked every iteration (not just when
+            # new_count > 0) so a genuine stall shows up as a live, decaying
+            # ratio while it's happening — see PRODUCTION_WINDOW_SECONDS.
+            window_elapsed = time.time() - prod_window_start
+            if window_elapsed >= PRODUCTION_WINDOW_SECONDS:
+                record_sample(self.channel_id, "production_speed_ratio",
+                             prod_window_dur / window_elapsed)
+                prod_window_dur = 0.0
+                prod_window_start = time.time()
+
+            # source_stall: the playlist itself has stopped advancing even
+            # though our fetches keep returning 200 — invisible to
+            # fetch_latency_ms/playlist_errors, which only see individual
+            # request health, not whether new content is actually arriving.
+            stall_gap = time.time() - last_new_segment_at
+            if stall_gap >= SOURCE_STALL_SECONDS and not source_stalled:
+                source_stalled = True
+                stall_started_at = last_new_segment_at
+                record_event(self.channel_id, "source_stall", {"gap_seconds": round(stall_gap, 1)})
+                incr_counter(self.channel_id, "source_stalls")
+                logging.warning("[PROXY] %s source stall — no new segments in %.0fs",
+                                self.channel_id, stall_gap)
 
             # Prune seen_uris to avoid unbounded growth — keep only URIs that
             # are still advertised in the current playlist, plus a small buffer.

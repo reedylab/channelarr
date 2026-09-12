@@ -4119,6 +4119,7 @@ function renderDiagModalLiveSummary(s) {
   if (s.reconnect_gap_ms_max != null) bits.push(`reconnect gap ${Math.round(s.reconnect_gap_ms_max)}ms`);
   bits.push(`${s.reconnects_last_5m || 0} reconnects/5m`);
   if (s.resyncs_last_5m) bits.push(`<span style="color:var(--warn)">${s.resyncs_last_5m} resync${s.resyncs_last_5m === 1 ? "" : "s"}/5m</span>`);
+  if (s.source_stalls_last_5m) bits.push(`<span style="color:var(--warn)">${s.source_stalls_last_5m} source stall${s.source_stalls_last_5m === 1 ? "" : "s"}/5m</span>`);
   if (s.client_stalls_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_stalls_last_5m} player stall${s.client_stalls_last_5m === 1 ? "" : "s"}/5m</span>`);
   if (s.client_seeks_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_seeks_last_5m} player jump${s.client_seeks_last_5m === 1 ? "" : "s"}/5m</span>`);
   bits.push(`${s.errors_last_5m || 0} errors/5m`);
