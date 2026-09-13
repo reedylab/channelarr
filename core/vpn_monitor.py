@@ -343,15 +343,49 @@ def list_servers(sort: str = "avg_rtt", order: str = None, limit: int = 50) -> l
 
 
 def maybe_auto_rotate():
-    """Called every 60s. Rotates if interval > 0 AND enough time has passed."""
+    """Called every 60s. Rotates on either of two independent triggers:
+
+    - the scheduled interval (vpn_auto_rotate_minutes) has elapsed, or
+    - core.block_detector has seen multiple independent domains failing
+      with connection-level errors within its own short window --
+      a strong signal it's our own exit IP getting blocked, not a
+      one-off site outage (see core/block_detector.py's docstring).
+      Gated by vpn_auto_rotate_on_block (default on) and its own,
+      separate debounce (vpn_block_rotate_min_interval_minutes) so a
+      persistent block doesn't re-trigger a rotation every tick.
+
+    Both triggers share the same _last_rotate_at debounce timestamp so
+    a scheduled and a block-triggered rotation can't stack back-to-back
+    -- rotation itself is disruptive (invalidates IP-gated sessions on
+    every OTHER currently-healthy stream too), so it's worth spacing out
+    regardless of which trigger fired it.
+    """
     from core.config import get_setting
+    global _last_rotate_at
+    now = datetime.now(timezone.utc)
+
     try:
         minutes = int(get_setting("vpn_auto_rotate_minutes", "0") or "0")
     except (ValueError, TypeError):
         minutes = 0
-    if minutes <= 0:
+    if minutes > 0:
+        if not _last_rotate_at or (now - _last_rotate_at).total_seconds() >= minutes * 60:
+            rotate_vpn(reason="auto")
+            return
+
+    on_block = str(get_setting("vpn_auto_rotate_on_block", "true")).strip().lower() not in ("0", "false", "no")
+    if not on_block:
         return
-    global _last_rotate_at
-    if _last_rotate_at and (datetime.now(timezone.utc) - _last_rotate_at).total_seconds() < minutes * 60:
+    try:
+        block_minutes = int(get_setting("vpn_block_rotate_min_interval_minutes", "10") or "10")
+    except (ValueError, TypeError):
+        block_minutes = 10
+    if _last_rotate_at and (now - _last_rotate_at).total_seconds() < block_minutes * 60:
         return
-    rotate_vpn(reason="auto")
+
+    from core.block_detector import looks_like_ip_block, distinct_recent_blocked_domains
+    if looks_like_ip_block():
+        domains = distinct_recent_blocked_domains()
+        logger.warning("[VPN] auto-rotating -- possible IP block detected across "
+                       "%d independent domains: %s", len(domains), domains)
+        rotate_vpn(reason="block_detected")
