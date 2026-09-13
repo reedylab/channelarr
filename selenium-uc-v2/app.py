@@ -23,13 +23,16 @@ SIDECAR_MAX_TABS), not from a fixed set of pre-warmed tabs waiting to be
 assigned. Priority (high = live-viewer-driven, low = background fallback-
 warming) only matters once every slot is in use — see PrioritySemaphore.
 
-Endpoints (per the plan's confirmed load-bearing set — everything else,
-including /tab/*, /restart, /screenshot, is out of scope: /tab/* has zero
-active callers since tab_proxy mode is dead, /restart and /screenshot aren't
-called by any core/web code):
-  POST /capture         {url, timeout, switch_iframe, priority}
+Endpoints (per the plan's confirmed load-bearing set, plus a debug/vision
+capability added for AI/human troubleshooting -- /tab/* and /restart stay
+out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
+/restart isn't called by any core/web code):
+  POST /capture                              {url, timeout, switch_iframe, priority, debug}
   GET  /health
   POST /cookies/youtube
+  GET  /screenshot                           live snapshot of the persistent main_tab
+  GET  /debug/{debug_id}/screenshots         list checkpoint screenshots from a debug=True capture
+  GET  /debug/{debug_id}/screenshot/{stage}  fetch one as PNG
 """
 
 import asyncio
@@ -37,10 +40,12 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 
 import nodriver as uc
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 import network_capture as nc
@@ -60,6 +65,26 @@ _MAX_TABS = int(os.getenv("SIDECAR_MAX_TABS", "3"))
 # "definitely stale" rather than "might still be working").
 _TAB_STALE_SECONDS = int(os.getenv("SIDECAR_TAB_STALE_SECONDS", "300"))
 _TAB_SWEEP_INTERVAL = int(os.getenv("SIDECAR_TAB_SWEEP_INTERVAL", "60"))
+# Cap how many past debug=True captures' screenshot dirs stick around --
+# oldest-evicted. Small, real hardening detail: debug traffic could
+# otherwise slowly fill the container's disk over a long session, the same
+# "small things that accumulate silently over hours" lesson as the tab-leak
+# fix above.
+_MAX_DEBUG_DIRS = int(os.getenv("SIDECAR_MAX_DEBUG_DIRS", "20"))
+
+
+def _evict_old_debug_dirs():
+    try:
+        if not os.path.isdir(nc.DEBUG_DIR):
+            return
+        dirs = [os.path.join(nc.DEBUG_DIR, d) for d in os.listdir(nc.DEBUG_DIR)]
+        dirs = [d for d in dirs if os.path.isdir(d)]
+        dirs.sort(key=lambda d: os.path.getmtime(d))
+        for d in dirs[:-_MAX_DEBUG_DIRS] if len(dirs) > _MAX_DEBUG_DIRS else []:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception as e:
+        logger.warning("Debug-dir eviction failed: %s", e)
 
 _browser = None
 _browser_lock = asyncio.Lock()
@@ -292,6 +317,8 @@ async def capture(req: CaptureRequest):
     global _capture_count
     deadline = req.timeout + 45  # same "+45s covers page load + wait + overhead" convention as v1
 
+    debug_id = uuid.uuid4().hex[:12] if req.debug else None
+
     await _slots.acquire(req.priority)
     tab = None
     try:
@@ -300,18 +327,19 @@ async def capture(req: CaptureRequest):
         # does its own navigation to req.url, so open blank here.
         tab = await _open_tracked_tab(browser, "about:blank")
 
-        logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d, priority=%s)",
-                    req.url, req.timeout, deadline, _capture_count, req.priority)
+        logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d, priority=%s, debug_id=%s)",
+                    req.url, req.timeout, deadline, _capture_count, req.priority, debug_id)
 
         outcome = await asyncio.wait_for(
             nc.run_capture(browser, tab, req.url, timeout=req.timeout,
-                            switch_iframe=req.switch_iframe),
+                            switch_iframe=req.switch_iframe,
+                            debug=req.debug, debug_id=debug_id),
             timeout=deadline,
         )
         _capture_count += 1
 
         if not outcome.ok:
-            return {"ok": False, "error": outcome.error or "Capture failed"}
+            return {"ok": False, "error": outcome.error or "Capture failed", "debug_id": debug_id}
 
         return {
             "ok": True,
@@ -322,18 +350,21 @@ async def capture(req: CaptureRequest):
             "user_agent": outcome.user_agent,
             "referer": outcome.referer,
             "cookies": outcome.cookies,
+            "debug_id": debug_id,
             # heartbeat intentionally omitted — confirmed dead data, see
             # the sidecar-2.0 plan's Phase 1 gap-map item 4.
         }
     except asyncio.TimeoutError:
         logger.error("Capture deadline exceeded for %s (%ds)", req.url, deadline)
-        return {"ok": False, "error": f"Capture deadline exceeded ({deadline}s)"}
+        return {"ok": False, "error": f"Capture deadline exceeded ({deadline}s)", "debug_id": debug_id}
     except Exception as e:
         logger.exception("Capture failed for %s", req.url)
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "debug_id": debug_id}
     finally:
         await _close_tab_safely(tab)
         _slots.release()
+        if debug_id:
+            _evict_old_debug_dirs()
 
 
 def _tracked_tabs_status() -> dict:
@@ -404,3 +435,64 @@ async def cookies_youtube():
     # read as empty via `data.get("netscape") or ""`) regardless of
     # whether cookie extraction itself worked.
     return {"ok": True, "netscape": "\n".join(lines), "count": len(cookies)}
+
+
+@app.get("/screenshot")
+async def screenshot():
+    """Live snapshot of the persistent main_tab -- matches v1's /screenshot
+    naming/endpoint (selenium-uc/app.py:793-822). Less useful than the
+    debug=True checkpoint captures for debugging a SPECIFIC failed capture
+    (v2's ephemeral tabs are closed by the time anyone could screenshot
+    them otherwise) but cheap to keep for parity and quick manual "what
+    does headful Chrome look like right now" checks between requests."""
+    if _browser is None:
+        raise HTTPException(status_code=503, detail="no browser yet")
+    try:
+        b64_png = await asyncio.wait_for(
+            _browser.main_tab.send(uc.cdp.page.capture_screenshot()), timeout=10.0,
+        )
+        if not b64_png:
+            raise HTTPException(status_code=502, detail="empty screenshot data")
+        import base64
+        return Response(content=base64.b64decode(b64_png), media_type="image/png")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _safe_token(value: str) -> bool:
+    """debug_id/stage come straight from the URL path -- reject anything
+    that isn't a plain alnum/underscore/hyphen token before using it in a
+    filesystem path, so a caller can't path-traverse out of DEBUG_DIR
+    (e.g. stage="../../../etc/passwd"). Cheap defense-in-depth even on an
+    internal-only sidecar."""
+    return bool(value) and all(c.isalnum() or c in "_-" for c in value)
+
+
+@app.get("/debug/{debug_id}/screenshots")
+async def list_debug_screenshots(debug_id: str):
+    """List checkpoint screenshot stage names available for a debug=True
+    capture (see network_capture.py::_debug_screenshot for the four
+    stages: 01_after_load, 02_after_iframe_switch, 03_after_click,
+    04_after_wait -- not all four are guaranteed present, e.g. a capture
+    that succeeded at the top level never reaches the iframe/click
+    stages)."""
+    if not _safe_token(debug_id):
+        raise HTTPException(status_code=400, detail="invalid debug_id")
+    debug_dir = os.path.join(nc.DEBUG_DIR, debug_id)
+    if not os.path.isdir(debug_dir):
+        raise HTTPException(status_code=404, detail="unknown debug_id")
+    stages = sorted(f[:-4] for f in os.listdir(debug_dir) if f.endswith(".png"))
+    return {"ok": True, "debug_id": debug_id, "stages": stages}
+
+
+@app.get("/debug/{debug_id}/screenshot/{stage}")
+async def get_debug_screenshot(debug_id: str, stage: str):
+    if not (_safe_token(debug_id) and _safe_token(stage)):
+        raise HTTPException(status_code=400, detail="invalid debug_id/stage")
+    path = os.path.join(nc.DEBUG_DIR, debug_id, f"{stage}.png")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="no screenshot for that debug_id/stage")
+    with open(path, "rb") as f:
+        return Response(content=f.read(), media_type="image/png")

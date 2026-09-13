@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 
 import nodriver as uc
@@ -27,6 +28,30 @@ import requests
 from session_attach import attach_to_target
 
 logger = logging.getLogger(__name__)
+
+DEBUG_DIR = "/tmp/capdbg"
+
+
+async def _debug_screenshot(target, debug_dir: str, stage: str):
+    """Best-effort checkpoint screenshot for AI/human troubleshooting of a
+    stuck or failed capture -- mirrors selenium-uc/app.py's
+    _dbg_screenshot() at the same four pipeline stages (01_after_load,
+    02_after_iframe_switch, 03_after_click, 04_after_wait), via CDP
+    Page.captureScreenshot (nodriver: cdp.page.capture_screenshot(),
+    returns a plain base64 PNG string directly per its own type hint --
+    not a typed object, so this isn't at risk of the Cookie.from_json()-
+    style schema-crash class of bug found earlier). Never raises -- a
+    failed screenshot must never fail the actual capture."""
+    try:
+        b64_png = await target.send(uc.cdp.page.capture_screenshot())
+        if not b64_png:
+            return
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{stage}.png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64_png))
+    except Exception as e:
+        logger.info("[debug-screenshot] %s failed: %s", stage, e)
 
 # ── Ported from selenium-uc/app.py — pure Python, no browser-lib dependency ──
 
@@ -592,18 +617,23 @@ def _detach_capture(capture_tab, label: str = "?"):
     logger.info("[%s] capture detached", label)
 
 
-async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True) -> CaptureOutcome:
+async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True,
+                       debug: bool = False, debug_id: str | None = None) -> CaptureOutcome:
     """Full capture pipeline against an already-open tab (ephemeral or
     persistent, this module doesn't care -- see module docstring): attach
     capture handlers, navigate, drill into an iframe if warranted (trying
     EACH non-skip candidate in turn, not just the first — the iframe-
     selection-robustness improvement from the sidecar-2.0 plan), scan for
-    skip-phrases, click play, wait for a manifest."""
+    skip-phrases, click play, wait for a manifest.
+
+    debug=True (with a caller-supplied debug_id) saves checkpoint
+    screenshots to DEBUG_DIR/{debug_id}/ -- see _debug_screenshot."""
     outcome = CaptureOutcome()
     found_event = asyncio.Event()
     req_headers = {}
     t0 = time.time()
     iframe_sessions = []
+    debug_dir = os.path.join(DEBUG_DIR, debug_id) if (debug and debug_id) else None
 
     def _log(msg):
         logger.info("[run_capture][%.2fs] %s", time.time() - t0, msg)
@@ -612,6 +642,7 @@ async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: 
         return await _run_capture_body(
             browser, tab, url, timeout, switch_iframe,
             outcome, found_event, req_headers, iframe_sessions, t0, _log,
+            debug_dir,
         )
     finally:
         # Always detach, success or failure or exception -- see
@@ -625,13 +656,16 @@ async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: 
 
 
 async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
-                             outcome, found_event, req_headers, iframe_sessions, t0, _log):
+                             outcome, found_event, req_headers, iframe_sessions, t0, _log,
+                             debug_dir=None):
     await attach_capture(tab, outcome, found_event, req_headers, t0, "top")
     _log(f"navigating to {url[:120]}")
     await tab.get(url)
     _log("tab.get() returned, sleeping 3s to let the page settle")
     await asyncio.sleep(3)
     _log(f"post-settle: found_event.is_set()={found_event.is_set()}")
+    if debug_dir:
+        await _debug_screenshot(tab, debug_dir, "01_after_load")
 
     if not found_event.is_set() and switch_iframe:
         # Actively poll for at least one real content iframe to appear
@@ -679,11 +713,24 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
                 _log(f"  iframe#{i} candidate window expired, moving on")
                 continue
 
+    if debug_dir:
+        # One screenshot regardless of whether iframe drilling happened at
+        # all -- matches v1's fixed four-stage naming
+        # (02_after_iframe_switch) even though v2 may have tried several
+        # candidates in sequence; reflects whichever target (top page or
+        # the last-attempted iframe session) is current at this point.
+        await _debug_screenshot(iframe_sessions[-1] if iframe_sessions else tab,
+                                 debug_dir, "02_after_iframe_switch")
+
     if not found_event.is_set():
         # nothing drilled found it — try the top page's own click as a
         # cheap fallback (some sources autoplay/click on the top level)
         clicked = await try_click_play(iframe_sessions[-1] if iframe_sessions else tab)
         _log(f"fallback click-play: clicked={clicked}")
+
+    if debug_dir:
+        await _debug_screenshot(iframe_sessions[-1] if iframe_sessions else tab,
+                                 debug_dir, "03_after_click")
 
     _log(f"entering final wait (timeout={timeout}s)")
     try:
@@ -693,6 +740,9 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
             outcome.error = f"No manifest found within {timeout}s"
     _log(f"final wait done: ok={outcome.ok} error={outcome.error}")
     _log(f"pending asyncio tasks at completion: {len(asyncio.all_tasks())}")
+    if debug_dir:
+        await _debug_screenshot(iframe_sessions[-1] if iframe_sessions else tab,
+                                 debug_dir, "04_after_wait")
 
     if outcome.ok:
         # user_agent is cosmetic/dead-data-adjacent, but cookies are
