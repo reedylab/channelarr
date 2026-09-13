@@ -418,12 +418,32 @@ def refresh_due_manifests():
         # calls. Submitting the whole batch at once and letting the
         # semaphore throttle it is simpler and less error-prone than
         # sizing this executor to match RESOLVER_LOW_SLOTS separately.
+        #
+        # Real, confirmed anti-bot trigger found the hard way after raising
+        # HEAVY_REFRESH_BUDGET_PER_TICK_MULTI: submitting the whole batch at
+        # once means every item due for the SAME native-resolver-handled
+        # domain (one specific domain family dominates the current due
+        # pool) fires within the same second -- confirmed via a real tick
+        # where 9 of 15 concurrently-submitted items all targeted the same
+        # domain simultaneously, immediately followed by that upstream
+        # refusing our exit IP. Native resolves are cheap/fast but this
+        # pool has zero per-domain awareness, so raising throughput for the
+        # sidecar's sake also raised same-domain burst intensity for
+        # pure-HTTP sources that were never a bottleneck and don't want a
+        # burst pattern. A small stagger between submissions (not a
+        # concurrency cap -- items already running keep running
+        # concurrently) spreads same-domain items across a few real
+        # seconds instead of one instant, closer to how a human's browser
+        # tabs would actually open, without materially hurting throughput
+        # (each item's own runtime is 60-105s, dwarfing a sub-second
+        # stagger).
+        stagger = float(get_setting("HEAVY_REFRESH_STAGGER_SECONDS", "0.75"))
         with ThreadPoolExecutor(max_workers=max(1, len(batch))) as ex:
-            futures = {
-                ex.submit(ManifestResolverService.refresh_manifest, mid,
-                          priority=priority_by_id.get(mid, "high")): mid
-                for mid in batch
-            }
+            futures = {}
+            for mid in batch:
+                futures[ex.submit(ManifestResolverService.refresh_manifest, mid,
+                                   priority=priority_by_id.get(mid, "high"))] = mid
+                time.sleep(stagger)
             for fut in as_completed(futures):
                 mid = futures[fut]
                 try:
