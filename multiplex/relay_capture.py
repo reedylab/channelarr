@@ -668,6 +668,9 @@ async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_se
     return {"ok": True, "error": None, "click_log": click_log, "contexts": contexts}
 
 
+_POLL_PER_CONTEXT_TIMEOUT_SECONDS = 5.0
+
+
 async def poll_relay(contexts: list) -> dict:
     """Polls every context from start_relay's return, merging results --
     in practice only one context ever actually has the real <video> and
@@ -675,20 +678,48 @@ async def poll_relay(contexts: list) -> dict:
     recording=False (or eventually error out once their own 120s search
     times out, which is not itself fatal -- only ALL contexts erroring/
     ending counts as the session being over). Returns {"ok", "chunks",
-    "ended", "error", "recording"}."""
+    "ended", "error", "recording"}.
+
+    Each context gets its OWN short timeout -- real, confirmed-live bug
+    found in production: with a bare per-context await and no timeout, a
+    SINGLE wedged context (a CDP connection whose listener died -- the
+    same nodriver failure class fixed elsewhere this session) blocked
+    this whole function past the caller's own 15s deadline, even though
+    the OTHER contexts (including whichever one actually held the real,
+    still-healthy <video>) were perfectly fine and had real chunks
+    waiting. The caller (app.py's /relay/{id}/chunks) then returned a
+    blank-error failure every single poll -- and since that's a single,
+    generic failure, not a real "this session is dead" signal,
+    TabRelaySource kept retrying indefinitely without ever giving up and
+    restarting, which is what a genuinely dead session needs to recover.
+    A per-context timeout means one wedged context is skipped (its
+    chunks lost for that poll, no different from a slow response) rather
+    than silently stalling every context's chunks forever."""
+    async def _poll_one(ctx):
+        return await asyncio.wait_for(_eval_json(ctx, _RELAY_POLL_JS),
+                                       timeout=_POLL_PER_CONTEXT_TIMEOUT_SECONDS)
+
+    # Concurrent, not sequential -- with a per-context timeout but a
+    # sequential await, N contexts could still stack up to N times that
+    # timeout in the worst case (multiple wedged at once), which can
+    # itself exceed the caller's own outer deadline. Running them all at
+    # once bounds total wall time to the single slowest context's own
+    # timeout, not the sum.
+    raw_results = await asyncio.gather(*(_poll_one(ctx) for ctx in contexts),
+                                        return_exceptions=True)
+
     chunks: list = []
     any_recording = False
     all_ended = True
     last_error = None
     any_ok = False
-    for ctx in contexts:
-        try:
-            result = await _eval_json(ctx, _RELAY_POLL_JS)
-        except Exception as e:
-            # Context unreachable (e.g. its target closed) -- doesn't
-            # override all_ended's running AND; a genuinely dead context
-            # is consistent with "this one's done" either way.
-            last_error = str(e)
+    for result in raw_results:
+        if isinstance(result, Exception):
+            # Context unreachable/unresponsive (target closed, or wedged
+            # past its own timeout above) -- doesn't override all_ended's
+            # running AND; a genuinely dead context is consistent with
+            # "this one's done" either way.
+            last_error = str(result) or type(result).__name__
             continue
         if not result:
             continue
