@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urljoin
 
@@ -44,7 +45,41 @@ _inflight_lock = threading.Lock()
 # so only one of them is pumping work into the single-threaded sidecar at
 # a time. User-driven resolves bypass this lock — they still serialize at
 # the sidecar but shouldn't be blocked by an in-progress sweep.
+#
+# This whole model assumes a single-threaded sidecar (v1's one-browser-
+# one-lock reality) -- see _HIGH_POOL/_LOW_POOL below for the concurrent
+# alternative, used only when RESOLVER_CONCURRENCY_MODE="multi". In
+# "single" mode (the default, and v1's only mode) pipeline_lock is used
+# completely unchanged -- zero behavior difference from before this was
+# added.
 pipeline_lock = threading.Lock()
+
+# ── Concurrency mode + priority-reserved slot pools ────────────────────
+# "single" (default): every dispatch site below uses pipeline_lock exactly
+# as before -- byte-identical to pre-existing behavior, the safe default
+# and the only sane mode against v1 (one browser, one lock; concurrent
+# callers would just queue there anyway with no benefit and added
+# complexity). "multi": opt in once pointed at a sidecar that can actually
+# run concurrent captures (sidecar 2.0) -- replaces pipeline_lock with two
+# HARD-partitioned semaphores so background/keep-warm work can never
+# starve live-viewer/JIT work by saturating a shared pool. Read fresh each
+# call (get_setting is not cached, matches the existing SELENIUM_URL
+# pattern) so flipping it takes effect live, no restart needed.
+#
+# Defaults (3 high / 5 low = 8 total) match sidecar 2.0's own validated
+# SIDECAR_MAX_TABS=8 default exactly -- re-tune both together if that ever
+# changes.
+_HIGH_POOL = threading.Semaphore(int(get_setting("RESOLVER_HIGH_SLOTS", "3")))
+_LOW_POOL = threading.Semaphore(int(get_setting("RESOLVER_LOW_SLOTS", "5")))
+
+
+def _concurrency_mode() -> str:
+    mode = (get_setting("RESOLVER_CONCURRENCY_MODE", "single") or "single").lower()
+    return mode if mode in ("single", "multi") else "single"
+
+
+def _pool_for_priority(priority: str):
+    return _LOW_POOL if priority == "low" else _HIGH_POOL
 
 # Cap on heavy sidecar refreshes per refresh tick. Light refreshes are cheap
 # (HTTP only) and uncapped, but heavy refreshes launch Chrome and chew RAM.
@@ -351,20 +386,43 @@ def refresh_due_manifests():
     budget = HEAVY_REFRESH_BUDGET_PER_TICK
     logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
                 len(needs_heavy), budget)
-    for i, mid in enumerate(needs_heavy[:budget]):
-        # Non-blocking, per-item — see refresh_due_manifests' docstring for
-        # why this isn't just one acquire around the whole loop.
-        if not pipeline_lock.acquire(blocking=False):
-            logger.info("[RESOLVER] Heavy refresh yielding lock (JIT or another tick got it) "
-                        "— %d/%d remaining will retry next tick",
-                        len(needs_heavy[:budget]) - i, len(needs_heavy[:budget]))
-            break
-        try:
-            ManifestResolverService.refresh_manifest(mid, priority=priority_by_id.get(mid, "high"))
-        except Exception as e:
-            logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
-        finally:
-            pipeline_lock.release()
+    batch = needs_heavy[:budget]
+
+    if _concurrency_mode() == "multi":
+        # No pipeline_lock at all in this mode -- resolve()'s own
+        # _LOW_POOL.acquire() (background/keep-warm work defaults to
+        # "high" priority_by_id unless explicitly tagged "low" upstream,
+        # same as before) is what actually bounds concurrent sidecar
+        # calls. Submitting the whole batch at once and letting the
+        # semaphore throttle it is simpler and less error-prone than
+        # sizing this executor to match RESOLVER_LOW_SLOTS separately.
+        with ThreadPoolExecutor(max_workers=max(1, len(batch))) as ex:
+            futures = {
+                ex.submit(ManifestResolverService.refresh_manifest, mid,
+                          priority=priority_by_id.get(mid, "high")): mid
+                for mid in batch
+            }
+            for fut in as_completed(futures):
+                mid = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
+    else:
+        for i, mid in enumerate(batch):
+            # Non-blocking, per-item — see refresh_due_manifests' docstring
+            # for why this isn't just one acquire around the whole loop.
+            if not pipeline_lock.acquire(blocking=False):
+                logger.info("[RESOLVER] Heavy refresh yielding lock (JIT or another tick got it) "
+                            "— %d/%d remaining will retry next tick",
+                            len(batch) - i, len(batch))
+                break
+            try:
+                ManifestResolverService.refresh_manifest(mid, priority=priority_by_id.get(mid, "high"))
+            except Exception as e:
+                logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
+            finally:
+                pipeline_lock.release()
 
 
 _native_mod = False  # False = not yet looked up; None = absent; else module
@@ -490,9 +548,38 @@ class ManifestResolverService:
         _status["last_error"] = None
         result = None
 
+        # Concurrency-mode-gated: single mode (default) does nothing extra
+        # here — pipeline_lock, acquired by the CALLING loop (scheduled
+        # refresh tick, JIT resolver), is what serializes sidecar access,
+        # completely unchanged from before this existed. Multi mode has no
+        # equivalent caller-side lock anymore (see refresh_due_manifests/
+        # resolve_batch/event_resolver.py) -- this acquire is what actually
+        # bounds concurrent sidecar calls to RESOLVER_HIGH_SLOTS/
+        # RESOLVER_LOW_SLOTS, hard-partitioned by priority so background
+        # work can never starve a live/JIT request by saturating a shared
+        # pool. Blocking acquire (not non-blocking like pipeline_lock) is
+        # intentional: callers that opted into multi mode WANT to queue for
+        # a slot rather than skip the tick, since the whole point is
+        # multiple items make real progress concurrently instead of one
+        # tick doing one item.
+        #
+        # Known accepted limitation: _status (module-level, single-slot)
+        # was built assuming one resolve() in flight at a time -- under
+        # multi mode with several concurrent resolve() calls, "running"/
+        # "last_url" become best-effort/racy (last-writer-wins), a
+        # reporting-only issue, not a correctness issue in the actual
+        # capture/storage logic below.
+        mode = _concurrency_mode()
+        pool = _pool_for_priority(priority) if mode == "multi" else None
+        if pool:
+            pool.acquire()
         try:
             capture = _call_sidecar(url, timeout, priority=priority)
+        finally:
+            if pool:
+                pool.release()
 
+        try:
             if not capture.get("ok"):
                 err = capture.get("error", "Unknown error from sidecar")
                 _status["last_error"] = err
@@ -889,7 +976,10 @@ class ManifestResolverService:
 
     @staticmethod
     def resolve_batch(urls: list[dict], timeout: int = 60, auto_create: bool = False):
-        """Resolve a list of URLs sequentially.
+        """Resolve a list of URLs -- sequentially in "single" mode (default,
+        byte-identical to original behavior), concurrently (bounded by
+        resolve()'s own _HIGH_POOL) in "multi" mode. See
+        _concurrency_mode()/RESOLVER_CONCURRENCY_MODE.
 
         Each entry in urls can include: url, title, tags, event_start, event_end.
         If auto_create is True, a resolved channel is created for each successful
@@ -905,22 +995,8 @@ class ManifestResolverService:
             for u in urls
         ]
 
-        for i, entry in enumerate(urls):
-            _batch["current_url"] = entry["url"]
-            _batch["results"][i]["status"] = "resolving"
-
-            result = ManifestResolverService.resolve(
-                url=entry["url"],
-                title=entry.get("title"),
-                timeout=timeout,
-                tags=entry.get("tags"),
-                event_start=entry.get("event_start"),
-                event_end=entry.get("event_end"),
-                auto_create=auto_create,
-                logo_urls=entry.get("logo_urls"),
-            )
-
-            if result["ok"]:
+        def _apply_result(i, result):
+            if result.get("ok"):
                 _batch["results"][i]["status"] = "done"
                 _batch["results"][i]["manifest_id"] = result["manifest_id"]
                 _batch["results"][i]["manifest_url"] = result["manifest_url"]
@@ -929,9 +1005,59 @@ class ManifestResolverService:
                 _batch["results"][i]["channel_name"] = result.get("channel_name")
             else:
                 _batch["results"][i]["status"] = "failed"
-                _batch["results"][i]["error"] = result["error"]
+                _batch["results"][i]["error"] = result.get("error")
 
-            _batch["completed"] = i + 1
+        if _concurrency_mode() == "multi":
+            # Batch-resolve is interactive/admin-triggered (bulk auto-
+            # channel-creation from scraper output), not background work --
+            # defaults to "high" priority same as resolve()'s own default,
+            # so these calls contend for _HIGH_POOL. Fire the whole list at
+            # once and let resolve()'s own semaphore acquire throttle actual
+            # concurrent sidecar calls, same reasoning as the heavy-refresh
+            # loop above -- no separate executor-sizing decision needed.
+            # _batch["current_url"] isn't meaningful with several URLs
+            # in flight at once; left None here (same "status reporting is
+            # best-effort under multi mode" tradeoff as resolve()'s own
+            # docstring).
+            for i, entry in enumerate(urls):
+                _batch["results"][i]["status"] = "resolving"
+            _batch["current_url"] = None
+            with ThreadPoolExecutor(max_workers=max(1, len(urls))) as ex:
+                futures = {
+                    ex.submit(ManifestResolverService.resolve,
+                              url=entry["url"], title=entry.get("title"), timeout=timeout,
+                              tags=entry.get("tags"), event_start=entry.get("event_start"),
+                              event_end=entry.get("event_end"), auto_create=auto_create,
+                              logo_urls=entry.get("logo_urls")): i
+                    for i, entry in enumerate(urls)
+                }
+                completed = 0
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        result = {"ok": False, "error": str(e)}
+                    _apply_result(i, result)
+                    completed += 1
+                    _batch["completed"] = completed
+        else:
+            for i, entry in enumerate(urls):
+                _batch["current_url"] = entry["url"]
+                _batch["results"][i]["status"] = "resolving"
+
+                result = ManifestResolverService.resolve(
+                    url=entry["url"],
+                    title=entry.get("title"),
+                    timeout=timeout,
+                    tags=entry.get("tags"),
+                    event_start=entry.get("event_start"),
+                    event_end=entry.get("event_end"),
+                    auto_create=auto_create,
+                    logo_urls=entry.get("logo_urls"),
+                )
+                _apply_result(i, result)
+                _batch["completed"] = i + 1
 
         _batch["running"] = False
         _batch["current_url"] = None

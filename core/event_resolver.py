@@ -167,7 +167,16 @@ def resolve_due_events():
     """
     from core.database import get_session
     from core.models import ScrapedEvent
-    from core.resolver.manifest_resolver import pipeline_lock
+    from core.resolver.manifest_resolver import pipeline_lock, _concurrency_mode
+
+    if _concurrency_mode() == "multi":
+        # No pipeline_lock in this mode -- resolve()'s own _HIGH_POOL/
+        # _LOW_POOL (acquired inside resolve_batch's per-item resolve()
+        # calls) is what actually coordinates sidecar access across JIT,
+        # the scheduled refresh tick, and everything else, so JIT no
+        # longer needs to wait its turn behind a single global mutex here.
+        _resolve_due_events_inner()
+        return
 
     LOCK_WAIT_SECONDS = 100  # under the 120s JIT tick interval, above a single item's worst case
     if not pipeline_lock.acquire(timeout=LOCK_WAIT_SECONDS):
