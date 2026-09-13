@@ -973,7 +973,13 @@ async def relay_start(req: RelayStartRequest):
     tab = None
     try:
         browser = await _get_browser()
-        tab = await browser.get("about:blank", new_tab=True)
+        # Real, confirmed-live gap: this call had NO timeout at all --
+        # unlike everything after it (wrapped in the 180s deadline
+        # below), a genuinely contended/wedged browser could hang here
+        # indefinitely, well past even that deadline, with zero log
+        # output (not even the "Starting relay session" line below,
+        # which comes after this) to show anything was ever attempted.
+        tab = await asyncio.wait_for(browser.get("about:blank", new_tab=True), timeout=30)
         keep_target_id = _tab_target_id(tab)
         logger.info("Starting relay session %s: %s", session_id, req.url)
         # 180s, not 90s -- real, confirmed-live failure mode: start_relay's
