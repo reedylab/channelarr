@@ -1071,8 +1071,9 @@ class ManifestResolverService:
         def _try_stored(mid, mode, kind):
             result = ManifestResolverService.refresh_manifest(mid, timeout=timeout, priority="high")
             if result.get("ok"):
+                label = "primary" if mid == primary_id else "fallback (stored)"
                 return {"manifest_id": mid, "manifest_url": result.get("manifest_url"),
-                        "encoder_mode": mode, "source_kind": kind}
+                        "encoder_mode": mode, "source_kind": kind, "label": label}
             return None
 
         def _try_native_path(cand):
@@ -1087,11 +1088,17 @@ class ManifestResolverService:
                 return None
             shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id)
             return {"manifest_id": manifest_id, "manifest_url": item["capture"]["manifest_url"],
-                    "encoder_mode": default_mode, "source_kind": default_kind}
+                    "encoder_mode": default_mode, "source_kind": default_kind,
+                    "label": f"fallback (player: {cand['path']})"}
 
         total_candidates = len(stored) + len(native_candidates)
         logger.info("[RESOLVER] channel %s: racing %d candidate(s) (%d stored + %d native path) "
                     "for any working source", channel_id, total_candidates, len(stored), len(native_candidates))
+
+        from core.diagnostics import record_event, set_meta
+        race_start = time.monotonic()
+        record_event(channel_id, "race_started",
+                     {"candidates": total_candidates, "stored": len(stored), "native": len(native_candidates)})
 
         # Deliberately NOT a `with ThreadPoolExecutor(...) as ex:` block --
         # that form calls shutdown(wait=True) on exit, which would block
@@ -1127,11 +1134,20 @@ class ManifestResolverService:
             logger.warning("[RESOLVER] channel %s: race hit its overall %ds budget with nothing "
                             "back yet", channel_id, timeout + 45)
 
+        race_elapsed_ms = (time.monotonic() - race_start) * 1000
         if winner:
             logger.info("[RESOLVER] channel %s: race won by manifest %s (%.0fs budget)",
                         channel_id, winner["manifest_id"], timeout)
+            record_event(channel_id, "race_won", {
+                "manifest_id": winner["manifest_id"], "label": winner.get("label"),
+                "candidates": total_candidates, "elapsed_ms": round(race_elapsed_ms),
+            })
+            set_meta(channel_id, active_source_label=winner.get("label"),
+                     fallback_active=(winner.get("label") != "primary"))
         else:
             logger.warning("[RESOLVER] channel %s: no race candidate succeeded within budget", channel_id)
+            record_event(channel_id, "race_exhausted",
+                         {"candidates": total_candidates, "elapsed_ms": round(race_elapsed_ms)})
         return winner
 
     @staticmethod

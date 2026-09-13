@@ -85,6 +85,42 @@ def diagnostics_history(channel_id: str, minutes: int = Query(default=60, ge=1, 
     }
 
 
+@router.get("/diagnostics/{channel_id}/players")
+def diagnostics_player_rankings(channel_id: str):
+    """Player-path health rankings for a multi-player source -- empty list
+    for any channel that isn't one (no PlayerHealthScore rows tracked for
+    it yet). Surfaces player_health.py's scoring model directly in the UI
+    so it's visible/debuggable without grepping logs, per the same
+    reasoning as the diagnostics dashboard itself."""
+    from core.resolver import player_health
+
+    scores = player_health.get_scores(channel_id)
+    if not scores:
+        return {"channel_id": channel_id, "primary_path": None, "paths": []}
+
+    ch = shared_state.channel_mgr.get_channel(channel_id)
+    primary_path = (player_health.get_primary_player_path(ch["manifest_id"])
+                     if ch and ch.get("manifest_id") else None)
+
+    paths = [
+        {
+            "path": path,
+            "score": round(player_health.score_of(row), 3),
+            "is_primary": path == primary_path,
+            "success_count": row.success_count,
+            "failure_count": row.failure_count,
+            "consecutive_failures": row.consecutive_failures,
+            "last_ok": row.last_ok,
+            "last_probed_at": row.last_probed_at.isoformat() if row.last_probed_at else None,
+            "last_latency_ms": row.last_latency_ms,
+            "last_error": row.last_error,
+        }
+        for path, row in scores.items()
+    ]
+    paths.sort(key=lambda p: p["score"], reverse=True)
+    return {"channel_id": channel_id, "primary_path": primary_path, "paths": paths}
+
+
 @router.post("/diagnostics/{channel_id}/stop")
 def diagnostics_stop(channel_id: str):
     """Manual physical stop button. Kills the encoder/poller for this

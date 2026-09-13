@@ -324,6 +324,12 @@ def get_summary(channel_id: str) -> dict:
         "reconnects_last_5m": reconnects_5m,
         "errors_last_5m": error_events_5m,
         "fallback_active": fallback_active,
+        # Which candidate is actually serving right now -- "primary",
+        # "fallback (stored)", or "fallback (player: X)" for a discovered
+        # multi-player path. Set alongside fallback_active at every
+        # candidate-selection point in hls.py's _pick_working_manifest and
+        # manifest_resolver.py's resolve_any_working_source.
+        "active_source_label": meta.get("active_source_label"),
         "quality": quality,
     }
 

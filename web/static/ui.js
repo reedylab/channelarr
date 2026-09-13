@@ -344,6 +344,11 @@ function formatUptime(s) {
   return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
 }
 
+function formatRelativeTime(isoString) {
+  const ageSec = Math.max(0, (Date.now() - new Date(isoString).getTime()) / 1000);
+  return `${formatUptime(Math.round(ageSec))} ago`;
+}
+
 function formatDuration(s) {
   s = Math.round(s);
   if (s < 60) return `${s}s`;
@@ -3988,6 +3993,19 @@ function diagSourceLabel(row) {
   return parts.join(" / ") || "local";
 }
 
+// Which specific candidate is serving right now -- "primary", "fallback
+// (stored)", or "fallback (player: X)" for a discovered multi-player
+// path. Falls back to the old binary "on fallback" text if the backend
+// hasn't set a label yet (e.g. a stream started before this existed).
+function diagActiveSourceBadge(row) {
+  if (row.active_source_label) {
+    const isFallback = row.active_source_label !== "primary";
+    const color = isFallback ? "var(--danger)" : "var(--ok)";
+    return `<span style="color:${color};font-weight:600">${esc(row.active_source_label)}</span>`;
+  }
+  return row.fallback_active ? '<span style="color:var(--danger);font-weight:600">on fallback</span>' : "";
+}
+
 const DIAG_METRIC_LABELS = Object.fromEntries(DIAG_METRICS.map(m => [m.key, m.label]));
 
 // Small self-contained sparkline — no axes/labels/tooltip, just the shape.
@@ -4073,7 +4091,7 @@ function renderDiagnosticsGrid(streams) {
           ${row.client_stalls_last_5m ? `<span style="color:var(--danger)">${row.client_stalls_last_5m} stall${row.client_stalls_last_5m === 1 ? "" : "s"}/5m</span>` : ""}
           ${row.client_seeks_last_5m ? `<span style="color:var(--danger)">${row.client_seeks_last_5m} jump${row.client_seeks_last_5m === 1 ? "" : "s"}/5m</span>` : ""}
           <span>${row.errors_last_5m || 0} error${row.errors_last_5m === 1 ? "" : "s"}/5m</span>
-          ${row.fallback_active ? '<span style="color:var(--danger);font-weight:600">on fallback</span>' : ""}
+          ${diagActiveSourceBadge(row)}
         </div>
         <div class="diag-sparkline-label text-muted" style="font-size:10px;margin-bottom:2px">${esc(sparkLabel)}</div>
         <div class="diag-sparkline">${renderMiniSparkline(row.spark_values, sparkColor)}</div>
@@ -4141,7 +4159,50 @@ function openDiagnosticsModal() {
       const d = JSON.parse(e.data);
       renderDiagModalLiveSummary(d.summary || {});
     } catch (err) {}
+    // Piggyback on the same ~15s SSE tick rather than a separate poll loop
+    // -- player-path scores only change as often as player_health/
+    // player_evaluator actually probe (minutes, not seconds), so this is
+    // already faster than the data itself moves.
+    loadDiagModalPlayerRankings();
   };
+  loadDiagModalPlayerRankings();
+}
+
+// Player-path health rankings (multi-player sources only) -- empty/hidden
+// for anything else. Refreshed on the same cadence as the live-summary SSE
+// tick (piggybacked below) rather than its own poll loop, since scores
+// only change as often as player_health/player_evaluator actually probe
+// (minutes, not seconds) -- no value in fetching faster than that.
+async function loadDiagModalPlayerRankings() {
+  if (!diagModalChannelId) return;
+  const el = $("#chart-modal-player-rankings");
+  try {
+    const r = await fetch(`${API}/diagnostics/${encodeURIComponent(diagModalChannelId)}/players`);
+    const d = await r.json();
+    if (!d.paths || !d.paths.length) {
+      el.classList.add("hidden");
+      el.innerHTML = "";
+      return;
+    }
+    const rows = d.paths.map(p => {
+      const pct = Math.round(p.score * 100);
+      const barColor = p.score >= 0.6 ? "var(--ok)" : p.score >= 0.3 ? "var(--warn)" : "var(--danger)";
+      const age = p.last_probed_at ? formatRelativeTime(p.last_probed_at) : "never";
+      const statusIcon = p.last_ok === true ? "&#10003;" : p.last_ok === false ? "&#10007;" : "?";
+      const statusColor = p.last_ok === true ? "var(--ok)" : p.last_ok === false ? "var(--danger)" : "var(--muted)";
+      return `<div class="player-rank-row${p.is_primary ? " player-rank-primary" : ""}">
+        <span class="player-rank-path">${esc(p.path)}${p.is_primary ? " <b>(primary)</b>" : ""}</span>
+        <span class="player-rank-bar-track"><span class="player-rank-bar" style="width:${pct}%;background:${barColor}"></span></span>
+        <span class="player-rank-pct">${pct}%</span>
+        <span style="color:${statusColor}" title="${p.last_error ? esc(p.last_error) : "ok"}">${statusIcon}</span>
+        <span class="text-muted" style="font-size:11px">${age}</span>
+      </div>`;
+    }).join("");
+    el.innerHTML = `<div class="player-rank-title text-muted">Player path rankings</div>${rows}`;
+    el.classList.remove("hidden");
+  } catch (e) {
+    el.classList.add("hidden");
+  }
 }
 
 function closeDiagnosticsModal() {
@@ -4162,7 +4223,8 @@ function renderDiagModalLiveSummary(s) {
   if (s.client_stalls_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_stalls_last_5m} player stall${s.client_stalls_last_5m === 1 ? "" : "s"}/5m</span>`);
   if (s.client_seeks_last_5m) bits.push(`<span style="color:var(--danger)">${s.client_seeks_last_5m} player jump${s.client_seeks_last_5m === 1 ? "" : "s"}/5m</span>`);
   bits.push(`${s.errors_last_5m || 0} errors/5m`);
-  if (s.fallback_active) bits.push(`<span style="color:var(--danger);font-weight:600">on fallback</span>`);
+  const sourceBadge = diagActiveSourceBadge(s);
+  if (sourceBadge) bits.push(sourceBadge);
   el.innerHTML = `<span class="diag-badge diag-badge-${q}">${q}</span> ${bits.join(" &middot; ")}`;
 }
 

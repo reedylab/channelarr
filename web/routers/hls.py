@@ -91,13 +91,14 @@ def _pick_working_manifest(ch):
             continue
         mode = fb_modes.get(mid, default_mode) if i > 0 else default_mode
         kind = fb_kinds.get(mid, default_kind) if i > 0 else default_kind
+        cand_label = "primary" if i == 0 else f"fallback #{i} ({cand.get('title') or mid})"
         if not _is_expired(cand.get("expires_at")):
             if i > 0:
                 logging.info("[HLS] %s: using fallback source #%d (%s, encoder_mode=%s, source_kind=%s)",
                              ch.get("id"), i, mid, mode, kind)
                 record_event(ch.get("id"), "fallback_activated",
                             {"index": i, "manifest_id": mid, "reason": "primary_expired_or_exhausted"})
-            set_meta(ch.get("id"), fallback_active=(i > 0))
+            set_meta(ch.get("id"), fallback_active=(i > 0), active_source_label=cand_label)
             return mid, murl, mode, kind
         try:
             if ManifestResolverService.light_refresh_manifest(mid).get("ok"):
@@ -108,7 +109,7 @@ def _pick_working_manifest(ch):
                     record_event(ch.get("id"),
                                 "fallback_activated" if i > 0 else "manifest_light_refreshed",
                                 {"index": i, "manifest_id": mid})
-                    set_meta(ch.get("id"), fallback_active=(i > 0))
+                    set_meta(ch.get("id"), fallback_active=(i > 0), active_source_label=cand_label)
                     return mid, fresh, mode, kind
         except Exception as e:
             logging.warning("[HLS] light refresh failed for candidate %s: %s", mid, e)
@@ -140,6 +141,7 @@ def _pick_working_manifest(ch):
             return (winner["manifest_id"], winner["manifest_url"],
                     winner["encoder_mode"], winner["source_kind"])
         logging.warning("[HLS] %s: race found nothing, falling back to primary best-effort", ch.get("id"))
+        set_meta(ch.get("id"), fallback_active=False, active_source_label="primary (best-effort, all candidates failed)")
         # Falls through to the single-mode-equivalent primary-only attempt
         # below as a last resort -- resolve_any_working_source already
         # tried primary itself as one of its race candidates, so this is
@@ -155,6 +157,7 @@ def _pick_working_manifest(ch):
     # player-fallback discovery + ranking in the background (too slow to
     # help this same request, but keeps data warm for next time).
     logging.info("[HLS] %s: heavy-refreshing primary %s", ch.get("id"), primary_id)
+    set_meta(ch.get("id"), fallback_active=False, active_source_label="primary (heavy-refresh)")
     try:
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
