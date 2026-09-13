@@ -38,6 +38,7 @@ out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
 import asyncio
 import logging
 import os
+import signal
 import threading
 import time
 import uuid
@@ -364,6 +365,24 @@ async def _close_tab_safely(tab, timeout=5):
     fixed in network_capture.py's timeout-wrapped tail calls), this would
     otherwise hang forever too. Timeout-wrapped for the same reason.
 
+    Real, confirmed bug (found under sustained production load, direct
+    process inspection): Target.closeTarget succeeding does NOT reliably
+    terminate the underlying OS renderer process on a real, content-heavy
+    page. A tab that ran to its full capture timeout (still-loading ads/
+    trackers/media, retrying network requests) can leave its renderer
+    process alive and actively burning CPU (confirmed: 30-40% CPU,
+    sustained, well after a "successful" close) even though CDP's own
+    bookkeeping (browser.targets, _active_tabs) shows a clean, closed
+    state — accumulating roughly one leaked process per timed-out capture
+    under real load. Reproduced directly: 10 sequential + 8 concurrent
+    SYNTHETIC (data:) captures leaked nothing at all; real-site captures
+    that ran to their full timeout did, every time. Navigating to
+    about:blank BEFORE closing (a well-known technique in browser-
+    automation tooling for tearing down heavy pages) stops the page's own
+    JS/network/media activity first, giving Chrome a clean, idle target to
+    actually tear down -- rather than asking it to close a target with
+    live in-flight work still attached.
+
     On success, untracks the tab immediately. On failure/timeout, the tab
     stays in _active_tabs -- _sweep_stale_tabs (a periodic background task,
     see its own docstring) is what actually bounds real Chrome tab count
@@ -373,6 +392,10 @@ async def _close_tab_safely(tab, timeout=5):
         return
     tid = _tab_target_id(tab)
     try:
+        try:
+            await asyncio.wait_for(tab.get("about:blank"), timeout=timeout)
+        except Exception:
+            pass  # best-effort -- still attempt the real close below regardless
         await asyncio.wait_for(tab.close(), timeout=timeout)
         if tid:
             _active_tabs.pop(tid, None)
@@ -400,6 +423,15 @@ async def _sweep_stale_tabs():
     time."""
     while True:
         await asyncio.sleep(_TAB_SWEEP_INTERVAL)
+        logger.info("[sweeper] tick (browser=%s, active_tabs=%d)",
+                    "alive" if _browser is not None else "none", len(_active_tabs))
+        # OS-level orphaned-renderer reap runs every pass regardless of
+        # _active_tabs state -- it's checking real OS processes CDP-level
+        # tracking can't see at all, not reconciling _active_tabs itself.
+        if _browser is not None:
+            killed = await _reap_orphaned_renderers()
+            if killed:
+                logger.info("[sweeper] OS-level reap killed %d orphaned renderer(s)", killed)
         if _browser is None or not _active_tabs:
             continue
         now = time.time()
@@ -422,9 +454,123 @@ async def _sweep_stale_tabs():
             _active_tabs.pop(tid, None)
 
 
+def _proc_age_seconds(pid: int) -> float | None:
+    """Process age via /proc/<pid>/stat's starttime field (clock ticks since
+    boot, field 22) compared against /proc/uptime -- the standard, precise
+    way to get a process's real age without needing to have tracked its
+    creation ourselves. Returns None if the process is already gone or
+    unreadable (races are expected/harmless here, caller treats as skip)."""
+    try:
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        with open(f"/proc/{pid}/stat") as f:
+            # cmdline can contain ')' and spaces, so split on the LAST ')'
+            # to safely find the field-22 boundary regardless of its content.
+            fields = f.read().rsplit(")", 1)[1].split()
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        starttime_ticks = float(fields[19])  # index 19 = field 22 minus the 2 we split off
+        proc_start_seconds = starttime_ticks / clk_tck
+        return uptime - proc_start_seconds
+    except Exception:
+        return None
+
+
+_protected_renderer_pids: set[int] = set()
+
+
+def _renderer_pids_now() -> set[int]:
+    """All current /proc-visible chrome renderer PIDs."""
+    pids = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode(errors="replace")
+        except Exception:
+            continue
+        if "--type=renderer" in cmdline:
+            pids.add(pid)
+    return pids
+
+
+def _snapshot_protected_renderer_pids():
+    """Called right after a fresh browser.start() succeeds, before any
+    capture has run. Whatever renderer PID(s) exist at that moment belong
+    to the persistent main tab + chrome-internal helper targets (new-tab-
+    page, omnibox popups, etc.) -- legitimate, meant to live for the whole
+    container lifetime, and must never be touched by the reaper below.
+
+    Found the hard way that CDP's own SystemInfo.getProcessInfo() does NOT
+    distinguish these from orphaned ones -- it reports every renderer
+    process still alive regardless of whether its target was closed,
+    confirmed by watching two real natural sweep ticks report the exact
+    same "known" PID set both before and after a real leak was created and
+    left unreaped. A protected-baseline-at-startup snapshot is a much
+    simpler, more reliable signal: multiplex's own design guarantees no
+    ephemeral per-capture tab should ever legitimately outlive one capture
+    (~105s at defaults), so anything NOT in this baseline that's still
+    alive well past that is unambiguously leaked, full stop."""
+    global _protected_renderer_pids
+    _protected_renderer_pids = _renderer_pids_now()
+    logger.info("[sweeper] protected baseline renderer pids: %s",
+                sorted(_protected_renderer_pids))
+
+
+async def _reap_orphaned_renderers(grace_seconds: int = 120):
+    """OS-level enforcement, independent of and in addition to CDP-level tab
+    tracking (_active_tabs/_sweep_stale_tabs above). Real, confirmed bug
+    (found under sustained production load): Target.closeTarget succeeding
+    does NOT reliably terminate a real, content-heavy page's renderer
+    process -- confirmed via direct /proc inspection, a renderer can still
+    be alive and actively burning CPU (30-40%, sustained) minutes after its
+    tab was "successfully" closed and untracked. CDP-level bookkeeping
+    (browser.targets, _active_tabs) cannot see this at all.
+
+    Any /proc-visible renderer PID that is (a) NOT in the startup-time
+    protected baseline (_snapshot_protected_renderer_pids) and (b) older
+    than grace_seconds is definitionally orphaned -- no legitimate
+    ephemeral capture tab lives anywhere near that long -- and gets killed
+    directly by PID. grace_seconds defaults well above the ~105s outer
+    per-capture deadline specifically so a real, still-in-flight capture
+    is never mistaken for a leak."""
+    killed = 0
+    for pid in _renderer_pids_now():
+        if pid in _protected_renderer_pids:
+            continue
+        age = _proc_age_seconds(pid)
+        if age is None or age < grace_seconds:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+            logger.warning(
+                "OS-level reaper killed orphaned renderer pid=%d (age=%.0fs, "
+                "not in protected baseline) -- Target.closeTarget succeeded "
+                "but the OS process never actually died",
+                pid, age,
+            )
+        except ProcessLookupError:
+            pass  # already gone, fine
+        except Exception as e:
+            logger.warning("OS-level reaper failed to kill pid=%d: %s", pid, e)
+    return killed
+
+
 @app.on_event("startup")
 async def _start_sweeper():
-    asyncio.create_task(_sweep_stale_tabs())
+    logger.info("[sweeper] starting background task (interval=%ds)", _TAB_SWEEP_INTERVAL)
+    task = asyncio.create_task(_sweep_stale_tabs())
+
+    def _log_if_died(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("[sweeper] background task died: %s: %s", type(exc).__name__, exc, exc_info=exc)
+
+    task.add_done_callback(_log_if_died)
 
 
 def _clear_stale_profile_locks():
@@ -512,6 +658,7 @@ async def _get_browser():
                 ),
                 timeout=_STARTUP_TIMEOUT,
             )
+            _snapshot_protected_renderer_pids()
         except Exception as e:
             logger.error("Browser startup failed: %s", e)
             raise
