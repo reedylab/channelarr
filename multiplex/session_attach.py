@@ -107,8 +107,22 @@ async def _patched_listener(self):
         else:
             message = json.loads(raw)
             if "id" in message:
-                tx = self.mapper.pop(message["id"])
-                tx(**message)
+                try:
+                    tx = self.mapper.pop(message["id"])
+                    tx(**message)
+                except Exception as e:
+                    # Same fix as app.py's _patch_listener_id_dispatch, applied
+                    # here too since this is a separate, hand-written copy of
+                    # the same listener loop (needed for session-multiplexed
+                    # dispatch) -- a bad/unexpected message id must not kill
+                    # this connection's listener any more than it should
+                    # nodriver's own. tx(**message) itself is already safe
+                    # (Transaction.__call__ is patched in app.py and applies
+                    # here too, since SessionTransaction inherits it
+                    # unchanged); this guards the .pop() itself, one step
+                    # earlier in the same branch.
+                    print(f"    [session_attach] id-dispatch failed for "
+                          f"message id={message.get('id')}: {type(e).__name__}: {e}")
                 continue
 
             try:

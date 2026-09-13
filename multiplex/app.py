@@ -108,7 +108,118 @@ def _patch_transaction_call():
     Transaction.__call__ = _fixed_call
 
 
+def _patch_listener_id_dispatch():
+    """Second half of the same fix. _patch_transaction_call above guards
+    Transaction.__call__ itself, but Connection._listener's id-response
+    branch has a SEPARATE unguarded failure point one line earlier:
+
+        if "id" in message:
+            tx: Transaction = self.mapper.pop(message["id"])   # <-- here
+            tx(**message)
+
+    self.mapper.pop(message["id"]) has no default -- if a response ever
+    arrives for an id genuinely not in the mapper (a duplicate/stale
+    response, or one for a transaction something else already removed),
+    the bare KeyError escapes right here, before tx(**message) is ever
+    reached, same as the schema-drift case but at a different point in
+    the same branch. Not yet observed directly (unlike the schema-drift
+    case, which killed a real capture), but it's the same class of gap in
+    the same unguarded branch, cheap to close defensively, and matches
+    this exact concern already raised once this session for this same
+    line. Full copy of the real _listener (connection.py) with one
+    change: the id-branch wrapped in try/except instead of bare -- same
+    technique session_attach.py's own hand-written listener copy uses for
+    its event branch, now applied symmetrically to the id branch in both
+    places (see the matching edit in session_attach.py)."""
+    import asyncio as _asyncio
+    import json as _json
+    import logging as _logging
+    from asyncio import iscoroutine, iscoroutinefunction
+    import websockets.exceptions
+    from nodriver.core.connection import Connection, ProtocolException
+    from nodriver import cdp
+
+    _logger = _logging.getLogger("nodriver.core.connection")
+
+    async def _fixed_listener(self):
+        while True:
+            try:
+                async with self._lock:
+                    raw = await _asyncio.wait_for(self.websocket.recv(), 0.05)
+            except ProtocolException:
+                break
+            except websockets.exceptions.ConnectionClosedOK:
+                await self.disconnect()
+                break
+            except websockets.exceptions.ConnectionClosed:
+                await self.disconnect()
+                break
+            except _asyncio.TimeoutError:
+                await _asyncio.sleep(0.05)
+                continue
+            except Exception as e:
+                _logger.info("error when receiving websocket response: %s" % e, exc_info=True)
+                raise
+            else:
+                message = _json.loads(raw)
+                if "id" in message:
+                    try:
+                        tx = self.mapper.pop(message["id"])
+                        tx(**message)
+                    except Exception as e:
+                        # Same principle as _patch_transaction_call: never let
+                        # one bad message kill this connection's whole
+                        # listener. Whatever awaits this id (if anything still
+                        # does) times out normally instead of hanging forever
+                        # with no explanation.
+                        logger.warning(
+                            "Listener id-dispatch failed for message id=%s "
+                            "(dropping, not fatal to the connection): %s: %s",
+                            message.get("id"), type(e).__name__, e,
+                        )
+                    continue
+                try:
+                    event = cdp.util.parse_json_event(message)
+                except Exception:
+                    continue
+                if type(event) not in self.handlers:
+                    continue
+                callbacks = self.handlers[type(event)]
+                if not callbacks:
+                    continue
+                for callback in callbacks:
+                    try:
+                        if iscoroutinefunction(callback) or iscoroutine(callback):
+                            try:
+                                _asyncio.create_task(callback(event, self))
+                            except TypeError:
+                                _asyncio.create_task(callback(event))
+                        else:
+                            try:
+                                callback(event, self)
+                            except TypeError:
+                                callback(event)
+                    except Exception as e:
+                        _logger.warning(
+                            "exception in callback %s for event %s => %s",
+                            callback, event.__class__.__name__, e, exc_info=True,
+                        )
+
+    # Connection uses a custom metaclass (CantTouchThis) whose __setattr__
+    # blocks plain class-attribute assignment here ("don't set '_listener' on
+    # the Connection class directly") -- it wants per-instance patching
+    # instead (see session_attach.py's own _ensure_patched for that pattern,
+    # used there because only tabs that actually attach a child session need
+    # the extra dispatch logic). This fix is semantically global though --
+    # ANY connection's id-response branch can hit this, not just tabs that
+    # attach sessions -- so bypass the metaclass guard directly via type's
+    # own __setattr__ (skips CantTouchThis.__setattr__ entirely) rather than
+    # patching every tab instance individually.
+    type.__setattr__(Connection, "_listener", _fixed_listener)
+
+
 _patch_transaction_call()
+_patch_listener_id_dispatch()
 
 app = FastAPI()
 
