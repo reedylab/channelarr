@@ -21,7 +21,7 @@ class StreamDiagnosticSnapshot(Base):
     channel_id = Column(String, index=True, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
 
-    source_kind = Column(String, nullable=True)      # "hls" | "relay" | "local" | ... or None
+    source_kind = Column(String, nullable=True)      # "hls" | "relay" | "tab_relay" | "local" | ... or None
     encoder_mode = Column(String, nullable=True)      # "proxy" | "remux" | "single" | "multi" | "copy" | None
 
     encode_speed_ratio = Column(Float, nullable=True)     # None if this stream's mode doesn't re-encode

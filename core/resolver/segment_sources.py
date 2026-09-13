@@ -24,8 +24,23 @@ self-segments at keyframe boundaries on-disk; ffmpeg only ever touches
 finite already-downloaded chunks, same "gentle mirror" rule HlsPlaylistSource
 and remux_stream.py both follow. No ad-break concept here — everything is
 CLASS_SHOW, so there's no StreamProfile involved.
+
+TabRelaySource is the third mechanism — for sources whose real manifest/
+stream request is never visible to network-level capture at all (a WASM-
+obfuscated player, client-side-only decryption, etc; confirmed live: a
+real source's normal manifest-capture found only ad/tracker noise, and a
+blind play-button click never started real playback). Instead of a
+manifest URL, "the upstream" is a real browser tab (driven by multiplex)
+playing the source for real; Python polls multiplex for the tab's
+captureStream()+MediaRecorder output (real decoded audio+video, exactly
+what a viewer's browser produces) and feeds it to ffmpeg, same "gentle
+mirror" shape as ContinuousRelaySource. Real, deliberate cost this session
+was upfront about: unlike every other source here, this keeps one tab
+continuously DECODING AND RENDERING video for the channel's whole
+runtime — genuine sustained CPU load, not just I/O.
 """
 
+import base64
 import logging
 import os
 import random
@@ -902,3 +917,264 @@ class ContinuousRelaySource(SegmentSource):
         # leaking the socket.
         if prefetched_resp is not None:
             prefetched_resp.close()
+
+
+# Per-domain config for TabRelaySource — click_sequence is the only thing
+# that genuinely varies per site (finding real playback), same reasoning
+# as get_relay_source_config() above. Lives in the gitignored
+# scrapers/_tab_relay_configs.py, not here.
+_tab_relay_configs_mod = False
+
+
+def _tab_relay_source_configs() -> dict:
+    global _tab_relay_configs_mod
+    if _tab_relay_configs_mod is False:
+        _tab_relay_configs_mod = None
+        try:
+            import importlib.util
+            path = os.path.join(os.getenv("SCRAPERS_DIR", "/app/scrapers"),
+                                "_tab_relay_configs.py")
+            if os.path.isfile(path):
+                spec = importlib.util.spec_from_file_location("_tab_relay_configs", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _tab_relay_configs_mod = mod
+        except Exception as e:
+            logging.warning("[TAB-RELAY] site config load failed: %s", e)
+    return getattr(_tab_relay_configs_mod, "TAB_RELAY_SOURCE_CONFIGS", {}) if _tab_relay_configs_mod else {}
+
+
+def get_tab_relay_source_config(source_domain: str) -> Optional[dict]:
+    return _tab_relay_source_configs().get(source_domain)
+
+
+class TabRelaySource(SegmentSource):
+    """Browser-tab video relay — see this module's docstring for the full
+    motivation. Multiplex opens a real tab, drives it to real playback via
+    a per-site click_sequence, and captures the DECODED <video> output via
+    captureStream()+MediaRecorder. This class polls multiplex for
+    accumulated chunks and feeds them to one persistent ffmpeg, the same
+    "gentle mirror" shape ContinuousRelaySource uses (Python owns all the
+    I/O -- here, polling multiplex instead of reading a CDN socket -- and
+    explicitly controls every byte handed to ffmpeg's stdin; ffmpeg never
+    touches the network).
+
+    No token-expiry/reconnect dance here (that machinery in
+    ContinuousRelaySource exists purely because of its CDN's short-lived
+    token) — the tab just keeps playing and producing chunks for as long
+    as the multiplex session stays alive. A dead/unreachable session is a
+    hard stop (MAX_CONSECUTIVE_POLL_FAILURES), not a reconnect target --
+    re-establishing playback means re-running the whole click_sequence
+    from scratch, not just reopening a socket, so a fresh SegmentSource
+    instance (a full channel restart) is the right unit of retry here,
+    same as the fallback-chain already does for every other source kind."""
+
+    MIN_CHUNK_BYTES = 16_384
+    MAX_PEND_BYTES = 24_000_000
+    POLL_INTERVAL_SECONDS = 1.5
+    MAX_CONSECUTIVE_POLL_FAILURES = 8
+
+    def __init__(self, *, channel_id: str, page_url: str,
+                 click_sequence: Optional[list] = None,
+                 multiplex_url: str = "",
+                 chunk_target_seconds: float = 4.0,
+                 download_dir: str = "/tmp"):
+        self.channel_id = channel_id
+        self.page_url = page_url
+        self.click_sequence = click_sequence or []
+        if multiplex_url:
+            self.multiplex_url = multiplex_url
+        else:
+            from core.config import get_setting
+            self.multiplex_url = get_setting("SELENIUM_URL", "http://localhost:4446")
+        self.chunk_target_seconds = chunk_target_seconds
+        self._download_dir = download_dir
+        self._session_id: Optional[str] = None
+
+    def _start_session(self) -> bool:
+        try:
+            resp = http_requests.post(f"{self.multiplex_url}/relay/start", json={
+                "url": self.page_url, "click_sequence": self.click_sequence,
+            }, timeout=75)
+            data = resp.json()
+        except Exception as e:
+            logging.warning("[TAB-RELAY] %s couldn't start relay session: %s", self.channel_id, e)
+            return False
+        if not data.get("ok"):
+            logging.warning("[TAB-RELAY] %s relay start failed: %s (click_log=%s)",
+                            self.channel_id, data.get("error"), data.get("click_log"))
+            return False
+        self._session_id = data["session_id"]
+        logging.info("[TAB-RELAY] %s relay session %s started (click_log=%s)",
+                     self.channel_id, self._session_id, data.get("click_log"))
+        return True
+
+    def _stop_session(self):
+        if not self._session_id:
+            return
+        try:
+            http_requests.post(f"{self.multiplex_url}/relay/{self._session_id}/stop", timeout=10)
+        except Exception:
+            pass
+        self._session_id = None
+
+    def _build_transcode_cmd(self) -> list:
+        # Same shape as ContinuousRelaySource._build_transcode_cmd, minus
+        # the ts_offset stitching -- there's no reconnect here to stitch
+        # across, one connection for this source's whole lifetime.
+        return [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-fflags", "+genpts",
+            "-f", "webm", "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-bf", "0", "-x264-params", "threads=2", "-pix_fmt", "yuv420p",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-f", "mpegts", "pipe:1",
+        ]
+
+    def run(self, enqueue: Callable[[QueueItem], None], stop_event: threading.Event) -> None:
+        seg_index = 0
+
+        if not self._start_session():
+            record_event(self.channel_id, "give_up", {"reason": "relay_session_start_failed"})
+            stop_event.set()
+            return
+
+        try:
+            enc_proc = subprocess.Popen(
+                self._build_transcode_cmd(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            logging.warning("[TAB-RELAY] %s couldn't start encoder: %s", self.channel_id, e)
+            self._stop_session()
+            stop_event.set()
+            return
+
+        def _drain_stderr(proc=enc_proc):
+            try:
+                while True:
+                    line = proc.stderr.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if text:
+                        logging.warning("[TAB-RELAY] %s encoder: %s", self.channel_id, text[-200:])
+            except Exception:
+                pass
+
+        def _read_stdout(proc=enc_proc):
+            # Identical chunking approach to ContinuousRelaySource's own
+            # _read_stdout -- plain byte/time cuts of self-synchronizing
+            # MPEG-TS, no boundary-finding needed.
+            nonlocal seg_index
+            buf = bytearray()
+            last_flush = time.time()
+            buf_wall_start = last_flush
+            try:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    due = (time.time() - last_flush) >= self.chunk_target_seconds
+                    forced = len(buf) > self.MAX_PEND_BYTES
+                    if not ((due and len(buf) > self.MIN_CHUNK_BYTES) or forced):
+                        continue
+                    idx = seg_index
+                    seg_index += 1
+                    out_path = os.path.join(self._download_dir,
+                                            f"tabrelay-{self.channel_id}-{idx}.ts")
+                    with open(out_path, "wb") as f:
+                        f.write(bytes(buf))
+                    buf = bytearray()
+                    wall_elapsed = time.time() - buf_wall_start
+                    last_flush = time.time()
+                    buf_wall_start = last_flush
+                    from core.channels import ffprobe_duration
+                    duration = ffprobe_duration(out_path)
+                    duration = duration or self.chunk_target_seconds
+                    if wall_elapsed > 0:
+                        record_sample(self.channel_id, "encode_speed_ratio",
+                                     duration / wall_elapsed)
+                    enqueue(QueueItem(
+                        kind="upstream", source_path=out_path,
+                        duration=duration,
+                        label=f"tabrelay:{idx}",
+                    ))
+            except Exception as e:
+                logging.warning("[TAB-RELAY] %s stdout reader failed: %s", self.channel_id, e)
+
+        threading.Thread(target=_drain_stderr, daemon=True,
+                         name=f"tabrelay-stderr-{self.channel_id}").start()
+        stdout_thread = threading.Thread(target=_read_stdout, daemon=True,
+                                         name=f"tabrelay-stdout-{self.channel_id}")
+        stdout_thread.start()
+
+        consecutive_failures = 0
+        gave_up = False
+        try:
+            while not stop_event.is_set():
+                try:
+                    resp = http_requests.get(
+                        f"{self.multiplex_url}/relay/{self._session_id}/chunks", timeout=15)
+                    data = resp.json()
+                except Exception as e:
+                    consecutive_failures += 1
+                    incr_counter(self.channel_id, "relay_poll_failures")
+                    logging.warning("[TAB-RELAY] %s poll failed (#%d): %s",
+                                    self.channel_id, consecutive_failures, e)
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_POLL_FAILURES:
+                        gave_up = True
+                        break
+                    stop_event.wait(self.POLL_INTERVAL_SECONDS)
+                    continue
+
+                if not data.get("ok"):
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_POLL_FAILURES:
+                        gave_up = True
+                        break
+                    stop_event.wait(self.POLL_INTERVAL_SECONDS)
+                    continue
+
+                consecutive_failures = 0
+                for b64_chunk in data.get("chunks") or []:
+                    try:
+                        raw = base64.b64decode(b64_chunk)
+                    except Exception as e:
+                        logging.warning("[TAB-RELAY] %s bad chunk (skipped): %s", self.channel_id, e)
+                        continue
+                    try:
+                        enc_proc.stdin.write(raw)
+                    except (BrokenPipeError, OSError) as e:
+                        logging.warning("[TAB-RELAY] %s encoder pipe broke: %s", self.channel_id, e)
+                        stop_event.set()
+                        break
+
+                if data.get("ended"):
+                    logging.info("[TAB-RELAY] %s relay session ended upstream (error=%s)",
+                                self.channel_id, data.get("error"))
+                    break
+
+                stop_event.wait(self.POLL_INTERVAL_SECONDS)
+        finally:
+            self._stop_session()
+            try:
+                enc_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                enc_proc.wait(timeout=10)
+            except Exception:
+                try:
+                    enc_proc.kill()
+                except Exception:
+                    pass
+            stdout_thread.join(timeout=5)
+
+        if gave_up:
+            record_event(self.channel_id, "give_up", {"reason": "consecutive_relay_poll_failures",
+                                                       "count": consecutive_failures})
+            stop_event.set()

@@ -68,6 +68,7 @@ BUMPER_WINDOW_SECONDS = 60
 from core.resolver.segment_sources import (  # noqa: E402
     QueueItem, build_bump_sequence, SegmentSource, HlsPlaylistSource,
     ContinuousRelaySource, get_relay_source_config,
+    TabRelaySource, get_tab_relay_source_config,
 )
 
 # ── Resolved channel stream ─────────────────────────────────────────────────
@@ -182,6 +183,23 @@ class ResolvedChannelStream:
                 source_domain=self.source_domain,
                 download_dir=self._download_dir,
                 **relay_cfg,
+            )
+        elif self.source_kind == "tab_relay":
+            # No manifest/playlist involved at all -- manifest_url IS the
+            # real watch-page URL, same convention as "relay" mode.
+            tab_relay_cfg = get_tab_relay_source_config(self.source_domain)
+            if tab_relay_cfg is None:
+                logging.warning(
+                    "[TRANSCODER] %s: source_kind=tab_relay but no config for domain %r "
+                    "-- proceeding with an empty click_sequence (blind captureStream on "
+                    "whatever's already playing, unlikely to be enough for a real site)",
+                    channel_id, self.source_domain)
+                tab_relay_cfg = {}
+            self.source = TabRelaySource(
+                channel_id=channel_id,
+                page_url=manifest_url,
+                download_dir=self._download_dir,
+                **tab_relay_cfg,
             )
         else:
             raise ValueError(f"Unknown source_kind {source_kind!r} and no source given")
