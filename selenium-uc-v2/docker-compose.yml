@@ -21,7 +21,20 @@ services:
     environment:
       - DISPLAY_NUM=93   # channelarr-selenium-uc (v1) already owns :99 in this shared netns
       - CHROME_PROFILE_DIR=/data/chrome-profile
-      - SIDECAR_MAX_TABS=${SIDECAR_MAX_TABS:-3}
+      # Raised from the original conservative default of 3 to 8 after
+      # direct concurrency-ceiling testing: 8-10 concurrent real captures
+      # across distinct sources ran clean (10/10 succeeded, 13.2s total
+      # wall-clock, CPU briefly touched ~93% of this host's 6-core ceiling
+      # then dropped fast, memory recovered after) -- well-evidenced as
+      # safe. 15 concurrent showed real sustained CPU pressure and a drop
+      # in success rate, though confounded by known-flaky sources rather
+      # than cleanly attributable to the concurrency level itself. Real
+      # motivation: keeping a large volume of streams warm (fallback-chain
+      # refresh, background revalidation) is exactly the "1000s of URLs
+      # queued behind one slot" bottleneck this whole rebuild exists to
+      # fix -- 8 concurrent slots is a genuine, substantial upgrade over
+      # v1's single lock, not just a marginal bump.
+      - SIDECAR_MAX_TABS=${SIDECAR_MAX_TABS:-8}
     volumes:
       - selenium_v2_profile:/data
     restart: unless-stopped
