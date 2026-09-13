@@ -116,12 +116,45 @@ def _pick_working_manifest(ch):
     if not primary_id:
         return None, None, None, None
 
-    # Whole chain exhausted — heavy-refresh the primary (sidecar/browser) and
-    # use it best-effort, matching pre-chain behavior exactly.
-    logging.info("[HLS] %s: all %d candidate(s) failed light refresh, heavy-refreshing primary %s",
-                 ch.get("id"), len(candidates), primary_id)
+    # Whole chain exhausted.
+    logging.info("[HLS] %s: all %d candidate(s) failed light refresh",
+                 ch.get("id"), len(candidates))
     record_event(ch.get("id"), "fallback_chain_exhausted", {"candidates_tried": len(candidates)})
     set_meta(ch.get("id"), fallback_active=False)
+
+    from core.resolver.manifest_resolver import _concurrency_mode
+    if _concurrency_mode() == "multi":
+        # Real-time race across EVERY known way back on the air (primary +
+        # every stored fallback + every native multi-player path, all
+        # concurrently) rather than only retrying primary and discovering
+        # alternates too late to help this same waiting request -- see
+        # ManifestResolverService.resolve_any_working_source's own
+        # docstring for the full "assume every source is flaky" reasoning.
+        # On the critical path deliberately (unlike the old fire-and-forget
+        # discovery thread below): the whole point is serving THIS request
+        # with whichever candidate wins, not just enriching data for next
+        # time.
+        winner = ManifestResolverService.resolve_any_working_source(ch.get("id"))
+        if winner:
+            logging.info("[HLS] %s: race won by manifest %s", ch.get("id"), winner["manifest_id"])
+            return (winner["manifest_id"], winner["manifest_url"],
+                    winner["encoder_mode"], winner["source_kind"])
+        logging.warning("[HLS] %s: race found nothing, falling back to primary best-effort", ch.get("id"))
+        # Falls through to the single-mode-equivalent primary-only attempt
+        # below as a last resort -- resolve_any_working_source already
+        # tried primary itself as one of its race candidates, so this is
+        # just reusing today's existing best-effort return, not a second
+        # real attempt.
+        fresh = _reload_manifest_url(primary_id)
+        if fresh:
+            return primary_id, fresh, default_mode, default_kind
+        return primary_id, ch.get("manifest_url"), default_mode, default_kind
+
+    # Single mode: byte-identical to pre-race behavior -- heavy-refresh the
+    # primary (sidecar/browser) and use it best-effort, then piggyback
+    # player-fallback discovery + ranking in the background (too slow to
+    # help this same request, but keeps data warm for next time).
+    logging.info("[HLS] %s: heavy-refreshing primary %s", ch.get("id"), primary_id)
     try:
         ManifestResolverService.refresh_manifest(primary_id)
         fresh = _reload_manifest_url(primary_id)
@@ -129,12 +162,6 @@ def _pick_working_manifest(ch):
         logging.warning("[HLS] Refresh before start failed for %s: %s", primary_id, e)
         fresh = None
 
-    # Piggyback player-fallback discovery + ranking on this already-
-    # expensive, rare moment (see discover_and_store_fallbacks' and
-    # player_health's docstrings) — fire-and-forget in the background since
-    # it can take up to ~45s and must not add to this call's own latency
-    # (it's on the critical path to a player actually getting bytes).
-    # No-ops instantly for any source without this discover-all hook.
     def _discover_and_rank(channel_id, manifest_id):
         from core.resolver import player_health
         ManifestResolverService.discover_and_store_fallbacks(channel_id, manifest_id)

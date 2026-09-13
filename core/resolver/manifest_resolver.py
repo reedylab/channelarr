@@ -979,38 +979,160 @@ class ManifestResolverService:
             path = item.get("path")
             if path == "stream" or not item.get("ok"):
                 continue  # Player 1 / default is the primary, not a fallback; failed paths aren't stored
-            capture = item.get("capture") or {}
-            title = f"{ch_name} (player: {path})"
-            if title in existing_titles:
-                continue  # already tracking this player path as a fallback
-
-            body_text = _sanitize_body(capture.get("body"))
-            if not body_text or "#EXTM3U" not in body_text:
-                continue
-            try:
-                manifest_id = _store_manifest(
-                    page_url=item.get("page_url"),
-                    user_agent=capture.get("user_agent", ""),
-                    manifest_url=capture["manifest_url"],
-                    mime=capture.get("mime"),
-                    resp_headers=capture.get("headers"),
-                    body_text=body_text,
-                    title=title,
-                    context={},
-                    heartbeat=capture.get("heartbeat"),
-                    cookies=capture.get("cookies"),
-                    referer_url=capture.get("referer"),
-                )
+            manifest_id = _store_discovered_player_manifest(
+                channel_id, ch_name, path, item.get("page_url"), item.get("capture") or {}, existing_titles)
+            if manifest_id:
                 shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id)
                 added += 1
-            except Exception as e:
-                logger.warning("[RESOLVER] failed to store discovered player %s for channel %s: %s",
-                              path, channel_id, e)
 
         if added:
             logger.info("[RESOLVER] channel %s: discovered and stored %d new player fallback(s)",
                         channel_id, added)
         return added
+
+    @staticmethod
+    def resolve_any_working_source(channel_id: str, timeout: int = 30) -> dict | None:
+        """Multi-mode-only: when a channel's whole stored chain (primary +
+        fallbacks) is exhausted, race EVERY known way to get this channel
+        back on the air CONCURRENTLY -- primary's own refresh, every stored
+        fallback's own refresh, AND (if this is a recognized multi-player
+        source) every native player path -- and serve whichever succeeds
+        first.
+
+        Built specifically to answer "assume every source is flaky, how
+        fast can we autonomously find ANY working link" rather than lean on
+        historical success-rate scoring, which mathematically can't help in
+        exactly this moment: a chronically flaky source never builds up
+        enough clean history to beat another chronically flaky source by
+        player_health's promotion margin. Real-time concurrent probing
+        sidesteps that entirely -- it doesn't care about history, only
+        about what's actually up right now. Directly motivated by a cold-
+        start scenario: primary down after the system's been idle for
+        hours, first viewer request should still find a working link fast,
+        autonomously, with no manual intervention.
+
+        Single-mode gate: returns None immediately in single mode --
+        v1's one-browser reality can't support real racing at all, and
+        single mode must stay byte-identical to legacy behavior (caller
+        falls back to today's "heavy-refresh primary only" path).
+
+        Returns {"manifest_id", "manifest_url", "encoder_mode",
+        "source_kind"} for whichever candidate won, or None if nothing
+        succeeded within the budget."""
+        if _concurrency_mode() != "multi":
+            return None
+
+        from web import shared_state
+        ch = shared_state.channel_mgr.get_channel(channel_id)
+        if not ch:
+            return None
+
+        primary_id = ch.get("manifest_id")
+        default_mode = ch.get("encoder_mode", "proxy")
+        default_kind = ch.get("source_kind", "hls")
+        fb_modes = ch.get("fallback_encoder_modes") or {}
+        fb_kinds = ch.get("fallback_source_kinds") or {}
+        ch_name = ch.get("name") or channel_id
+        existing_titles = {fb.get("title") for fb in (ch.get("fallback_sources") or [])}
+
+        # Every already-known candidate -- race a REAL refresh for EACH one,
+        # not just primary. Today's exhausted-chain path only ever retries
+        # primary; a fallback whose own underlying source is fine but whose
+        # stored URL is merely stale (e.g. after a long cold period) never
+        # got a chance under the old logic at all.
+        stored = []
+        if primary_id:
+            stored.append((primary_id, default_mode, default_kind))
+        for fb in (ch.get("fallback_sources") or []):
+            mid = fb.get("manifest_id")
+            if mid:
+                stored.append((mid, fb_modes.get(mid, default_mode), fb_kinds.get(mid, default_kind)))
+
+        primary_page_url = None
+        if primary_id:
+            with get_session() as session:
+                row = (session.query(Capture.page_url)
+                       .join(Manifest, Manifest.capture_id == Capture.id)
+                       .filter(Manifest.id == primary_id).first())
+            primary_page_url = row[0] if row else None
+
+        native = _native_resolver()
+        native_candidates = []
+        if native is not None and primary_page_url and hasattr(native, "player_candidate_urls"):
+            try:
+                if native.handles(primary_page_url):
+                    native_candidates = native.player_candidate_urls(primary_page_url) or []
+            except Exception:
+                native_candidates = []
+
+        if not stored and not native_candidates:
+            return None
+
+        def _try_stored(mid, mode, kind):
+            result = ManifestResolverService.refresh_manifest(mid, timeout=timeout, priority="high")
+            if result.get("ok"):
+                return {"manifest_id": mid, "manifest_url": result.get("manifest_url"),
+                        "encoder_mode": mode, "source_kind": kind}
+            return None
+
+        def _try_native_path(cand):
+            if cand["path"] == "stream":
+                return None  # that's the default/primary path, already covered by _try_stored, not a fallback
+            item = native.probe_one_player(cand["url"], cand["path"], timeout=min(timeout, 15))
+            if not item or not item.get("ok"):
+                return None
+            manifest_id = _store_discovered_player_manifest(
+                channel_id, ch_name, cand["path"], primary_page_url, item.get("capture") or {}, existing_titles)
+            if not manifest_id:
+                return None
+            shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id)
+            return {"manifest_id": manifest_id, "manifest_url": item["capture"]["manifest_url"],
+                    "encoder_mode": default_mode, "source_kind": default_kind}
+
+        total_candidates = len(stored) + len(native_candidates)
+        logger.info("[RESOLVER] channel %s: racing %d candidate(s) (%d stored + %d native path) "
+                    "for any working source", channel_id, total_candidates, len(stored), len(native_candidates))
+
+        # Deliberately NOT a `with ThreadPoolExecutor(...) as ex:` block --
+        # that form calls shutdown(wait=True) on exit, which would block
+        # this function's return until EVERY candidate finishes (including
+        # the slowest, up to the full sidecar deadline), completely
+        # defeating the point of racing. Created bare so returning as soon
+        # as a winner is found doesn't wait on the stragglers; they keep
+        # running against this same executor object (kept alive by the
+        # running futures themselves) and their results (new manifests/
+        # fallbacks stored) still land for next time even though nothing
+        # is listening for them anymore.
+        ex = ThreadPoolExecutor(max_workers=max(1, total_candidates))
+        futures = [ex.submit(_try_stored, mid, mode, kind) for mid, mode, kind in stored]
+        futures += [ex.submit(_try_native_path, cand) for cand in native_candidates]
+        ex.shutdown(wait=False)  # stop accepting new work; already-submitted futures run to completion regardless
+
+        winner = None
+        try:
+            for fut in as_completed(futures, timeout=timeout + 45):
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    logger.warning("[RESOLVER] channel %s: a race candidate errored: %s", channel_id, e)
+                    continue
+                if result:
+                    winner = result
+                    break
+        except TimeoutError:
+            # as_completed's OWN overall-wait timeout (distinct from any
+            # individual future's exception) -- means nothing finished
+            # within budget at all, not that something errored. Treat
+            # exactly like "no candidate succeeded."
+            logger.warning("[RESOLVER] channel %s: race hit its overall %ds budget with nothing "
+                            "back yet", channel_id, timeout + 45)
+
+        if winner:
+            logger.info("[RESOLVER] channel %s: race won by manifest %s (%.0fs budget)",
+                        channel_id, winner["manifest_id"], timeout)
+        else:
+            logger.warning("[RESOLVER] channel %s: no race candidate succeeded within budget", channel_id)
+        return winner
 
     @staticmethod
     def get_batch_status():
@@ -1138,6 +1260,42 @@ class ManifestResolverService:
         _batch["running"] = False
         _batch["current_url"] = None
         return result
+
+
+def _store_discovered_player_manifest(channel_id: str, ch_name: str, path: str, page_url: str,
+                                       capture: dict, existing_titles: set) -> str | None:
+    """Shared storage logic for a single successfully-discovered player
+    path's capture result -- used by both discover_and_store_fallbacks
+    (the reactive, chain-exhaustion-triggered sweep) and
+    resolve_any_working_source (the real-time race). Factored out so both
+    callers store a discovered player identically rather than duplicating
+    the title-tagging/sanitize/_store_manifest sequence. Returns the new
+    manifest_id, or None if this path is already tracked or its body isn't
+    a real playlist."""
+    title = f"{ch_name} (player: {path})"
+    if title in existing_titles:
+        return None
+    body_text = _sanitize_body(capture.get("body"))
+    if not body_text or "#EXTM3U" not in body_text:
+        return None
+    try:
+        return _store_manifest(
+            page_url=page_url,
+            user_agent=capture.get("user_agent", ""),
+            manifest_url=capture["manifest_url"],
+            mime=capture.get("mime"),
+            resp_headers=capture.get("headers"),
+            body_text=body_text,
+            title=title,
+            context={},
+            heartbeat=capture.get("heartbeat"),
+            cookies=capture.get("cookies"),
+            referer_url=capture.get("referer"),
+        )
+    except Exception as e:
+        logger.warning("[RESOLVER] failed to store discovered player %s for channel %s: %s",
+                      path, channel_id, e)
+        return None
 
 
 def _store_manifest(
