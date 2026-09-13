@@ -1,5 +1,5 @@
 """
-Sidecar 2.0 — capture logic. Ported from selenium-uc/app.py onto nodriver's
+multiplex — capture logic. Ported from selenium-uc/app.py onto nodriver's
 event-driven CDP model + session_attach.py's iframe-session-attach (see that
 file for why nodriver needs it at all). This module is source-name-free by
 design (see project public-repo hygiene convention) — every constant here is

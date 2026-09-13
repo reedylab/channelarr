@@ -23,7 +23,7 @@ Usage:
   python3 shadow_compare.py --v2-only --count 10
 
 Requires: v1 running as `channelarr-selenium-uc` (port 4445), v2 running as
-`channelarr-selenium-uc-v2` (port 4446) -- both reached via `docker exec`
+`channelarr-multiplex` (port 4446) -- both reached via `docker exec`
 against localhost inside each container, never a published host port.
 """
 import argparse
@@ -35,7 +35,7 @@ import time
 
 V1_CONTAINER = "channelarr-selenium-uc"
 V1_PORT = 4445
-V2_CONTAINER = "channelarr-selenium-uc-v2"
+V2_CONTAINER = "channelarr-multiplex"
 V2_PORT = 4446
 APP_CONTAINER = "channelarr"
 

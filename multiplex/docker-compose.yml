@@ -1,11 +1,15 @@
 services:
-  # Standalone, pre-integration test deployment for sidecar 2.0. Deliberately
-  # NOT part of docker-compose.yml/docker-compose.postgres.yml (the actual
-  # production stack) -- Jake's explicit ask was to stand this up and prove
-  # it separately until integration is ready, without disrupting channelarr
-  # operations. This file lets it run persistently (restart: unless-stopped)
-  # for extended validation instead of ad-hoc `docker run` test containers
-  # that get torn down after every check.
+  # Standalone, pre-integration test deployment for multiplex (nodriver/CDP-
+  # direct sidecar, formerly "selenium-uc-v2" -- renamed since it never used
+  # Selenium at all; "multiplex" names the actual hard-won mechanism this
+  # needed, CDP session multiplexing over one shared connection, see
+  # session_attach.py). Deliberately NOT part of docker-compose.yml/
+  # docker-compose.postgres.yml (the actual production stack) -- Jake's
+  # explicit ask was to stand this up and prove it separately until
+  # integration is ready, without disrupting channelarr operations. This
+  # file lets it run persistently (restart: unless-stopped) for extended
+  # validation instead of ad-hoc `docker run` test containers that get torn
+  # down after every check.
   #
   # Shares gluetun's network namespace by referencing the ALREADY-RUNNING
   # channelarr-vpn container by name (works across separate compose
@@ -13,9 +17,9 @@ services:
   # under the hood, not compose-project-scoped). Same VPN egress as
   # production and the v1 sidecar, deliberately -- real source testing needs
   # the same egress posture production uses.
-  selenium-uc-v2:
+  multiplex:
     build: .
-    container_name: channelarr-selenium-uc-v2
+    container_name: channelarr-multiplex
     network_mode: "container:channelarr-vpn"
     shm_size: 2g
     environment:
@@ -36,7 +40,7 @@ services:
       # v1's single lock, not just a marginal bump.
       - SIDECAR_MAX_TABS=${SIDECAR_MAX_TABS:-8}
     volumes:
-      - selenium_v2_profile:/data
+      - multiplex_profile:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys;r=urllib.request.urlopen('http://localhost:4446/health',timeout=10);sys.exit(0 if r.status==200 else 1)"]
@@ -48,7 +52,7 @@ services:
       driver: syslog
       options:
         syslog-address: "${SYSLOG_ADDRESS:-tcp://localhost:1514}"
-        tag: "channelarr-selenium-uc-v2"
+        tag: "channelarr-multiplex"
 
 volumes:
-  selenium_v2_profile:
+  multiplex_profile:

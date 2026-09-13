@@ -1,5 +1,5 @@
 """
-Sidecar 2.0 — Phase 2: bounded concurrent captures via ephemeral per-capture
+multiplex — Phase 2: bounded concurrent captures via ephemeral per-capture
 tabs in one shared, persistent nodriver browser instance, dispatched through
 a priority-aware slot limiter.
 

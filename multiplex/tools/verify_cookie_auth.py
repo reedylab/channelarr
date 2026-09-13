@@ -32,7 +32,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-V2_CONTAINER = "channelarr-selenium-uc-v2"
+V2_CONTAINER = "channelarr-multiplex"
 V2_PORT = 4446
 APP_CONTAINER = "channelarr"
 

@@ -1,5 +1,5 @@
 """
-Sidecar 2.0 -- Phase 0 spike, part 2: CDP session-attach for iframe drilling.
+multiplex -- Phase 0 spike, part 2: CDP session-attach for iframe drilling.
 
 nodriver's core Connection/Transaction/_listener has NO support for the
 flattened Target.attachToTarget session-multiplexing mode -- confirmed by
