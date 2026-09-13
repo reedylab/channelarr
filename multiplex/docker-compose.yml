@@ -22,6 +22,14 @@ services:
     container_name: channelarr-multiplex
     network_mode: "container:channelarr-vpn"
     shm_size: 2g
+    # tini as PID 1 reaps dead Chrome children automatically -- without
+    # this, uvicorn (our entrypoint) is PID 1 and can't reap zombies (they
+    # accumulate across the container's lifetime). Confirmed as a real,
+    # observed issue during tonight's validation (repeated recreates left
+    # dozens of defunct chrome/chrome_crashpad processes); confirmed fixed
+    # in the production compose files' matching entry -- killing chrome
+    # directly left zero processes, not even zombies, immediately after.
+    init: true
     environment:
       - DISPLAY_NUM=93   # channelarr-selenium-uc (v1) already owns :99 in this shared netns
       - CHROME_PROFILE_DIR=/data/chrome-profile
