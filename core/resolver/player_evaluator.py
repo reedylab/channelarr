@@ -64,6 +64,22 @@ _WATCHDOG_INTERVAL_SECONDS = 10
 _STARTUP_DELAY_SECONDS = 20  # let the rest of app startup settle first
 _EMPTY_QUEUE_BACKOFF_SECONDS = 15  # nothing live/multi-player right now
 
+# Real, confirmed bug (found live): a resolve failure returns almost
+# instantly (a connection actively refused, not a slow timeout) while
+# _evaluate_one's own 30s sample only ever runs on the SUCCESS path -- so
+# when a source is blocking us (or genuinely down site-wide), every probe
+# fails in well under a second and the loop just re-queues the next batch
+# immediately. Confirmed live: this rotation cycled through a blocked
+# source's candidate paths roughly once per second, actively hammering it
+# harder while blocked than while healthy -- the opposite of the backoff
+# a real client would apply, and plausibly self-perpetuating the block.
+# A whole batch finishing this fast is a strong, cheap-to-check signal
+# that something is being refused/blocked rather than genuinely probed --
+# a real per-item check (even one that legitimately times out) takes
+# meaningfully longer than this.
+_FAST_BATCH_THRESHOLD_SECONDS = 5
+_FAST_BATCH_MAX_BACKOFF_SECONDS = 300
+
 
 def _native_resolver():
     from core.resolver.manifest_resolver import _native_resolver as _load
@@ -176,18 +192,34 @@ def _build_warming_queue() -> list:
 
 def _warming_loop() -> None:
     time.sleep(_STARTUP_DELAY_SECONDS)
+    consecutive_fast_batches = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         while True:
             try:
                 queue = _build_warming_queue()
                 if not queue:
                     time.sleep(_EMPTY_QUEUE_BACKOFF_SECONDS)
+                    consecutive_fast_batches = 0
                     continue
                 batch = queue[:_MAX_WORKERS]
+                batch_start = time.monotonic()
                 futures = [pool.submit(_evaluate_one, it["channel_id"], it["page_url"], it["path"])
                           for it in batch]
                 for f in futures:
                     f.result()
+                elapsed = time.monotonic() - batch_start
+                if elapsed < _FAST_BATCH_THRESHOLD_SECONDS:
+                    consecutive_fast_batches += 1
+                    backoff = min(_FAST_BATCH_MAX_BACKOFF_SECONDS,
+                                  _EMPTY_QUEUE_BACKOFF_SECONDS * (2 ** min(consecutive_fast_batches, 6)))
+                    logger.warning(
+                        "[PLAYER-EVAL] batch finished in %.1fs (< %ds) -- likely a source-wide "
+                        "block/outage rather than real per-item checks; backing off %ds "
+                        "(%d consecutive fast batch(es))",
+                        elapsed, _FAST_BATCH_THRESHOLD_SECONDS, backoff, consecutive_fast_batches)
+                    time.sleep(backoff)
+                else:
+                    consecutive_fast_batches = 0
             except Exception as e:
                 logger.error("[PLAYER-EVAL] warming loop error: %s", e)
                 time.sleep(_EMPTY_QUEUE_BACKOFF_SECONDS)
