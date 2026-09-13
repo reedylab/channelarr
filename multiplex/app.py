@@ -27,13 +27,15 @@ Endpoints (per the plan's confirmed load-bearing set, plus a debug/vision
 capability added for AI/human troubleshooting -- /tab/* and /restart stay
 out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
 /restart isn't called by any core/web code):
-  POST /capture                              {url, timeout, switch_iframe, priority, debug}
+  POST /capture                              {url, timeout, switch_iframe, priority, debug, click_sequence}
   POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority}
   POST /test/watch-channel                   {channel_id, duration_seconds, poll_interval_seconds, priority}
   POST /relay/start                          {url, click_sequence} -> {session_id}
   GET  /relay/{session_id}/chunks            drains accumulated captureStream()+MediaRecorder chunks
   POST /relay/{session_id}/stop
   POST /relay/{session_id}/debug-eval        {expression} -- interactive tuning only, not called by channelarr
+  GET  /relay/{session_id}/debug-targets     lists every raw CDP target (incl. workers) -- tuning only
+  POST /debug/sniff-network                  {url, click_sequence, url_substrings} -- investigation tool only
   GET  /health
   POST /cookies/youtube
   GET  /screenshot                           live snapshot of the persistent main_tab
@@ -733,6 +735,13 @@ class CaptureRequest(BaseModel):
     # viewer work. Only matters once every tab slot is in use — see
     # PrioritySemaphore.
     priority: str = "high"
+    # Optional per-site interaction steps (relay_capture.py's action-keyed
+    # vocabulary) run right after the initial settle, before the generic
+    # iframe-drilling/click-play fallback -- for sources whose real
+    # manifest is genuinely visible to normal capture (MATCH_PATTERNS
+    # already matches it), but only ever gets requested after a specific
+    # click sequence the generic fallback doesn't know how to perform.
+    click_sequence: list | None = None
 
 
 @app.post("/capture")
@@ -756,7 +765,9 @@ async def capture(req: CaptureRequest):
         outcome = await asyncio.wait_for(
             nc.run_capture(browser, tab, req.url, timeout=req.timeout,
                             switch_iframe=req.switch_iframe,
-                            debug=req.debug, debug_id=debug_id),
+                            debug=req.debug, debug_id=debug_id,
+                            click_sequence=req.click_sequence,
+                            click_sequence_fn=rc.run_click_sequence),
             timeout=deadline,
         )
         _capture_count += 1
@@ -1000,6 +1011,61 @@ async def relay_debug_eval(session_id: str, req: RelayDebugEvalRequest):
                             detail=f"context_index out of range (0..{len(contexts)-1})")
     result = await rc._eval_json(contexts[req.context_index], req.expression)
     return {"ok": True, "result": result, "context_count": len(contexts)}
+
+
+@app.get("/relay/{session_id}/debug-targets")
+async def relay_debug_targets(session_id: str):
+    """Not called by channelarr -- lists every raw CDP target the browser
+    currently knows about (type/url/target_id), including types
+    _find_child_frame_contexts/_find_iframe_candidates don't cover at all
+    (workers, shared/service workers) -- e.g. a WASM decoder running in a
+    dedicated Worker has its own real CDP target regardless of Site
+    Isolation, but isn't a frame and won't show up in either of those."""
+    session = _relay_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="unknown or closed session")
+    browser = await _get_browser()
+    await browser.update_targets()
+    targets = [{"type": str(getattr(t.target, "type_", None)),
+                "url": str(getattr(t.target, "url", "") or ""),
+                "target_id": getattr(t.target, "target_id", None)}
+               for t in browser.targets]
+    return {"ok": True, "targets": targets}
+
+
+class SniffNetworkRequest(BaseModel):
+    url: str
+    click_sequence: list | None = None
+    url_substrings: list
+    settle_seconds: float = 8.0
+    priority: str = "low"
+
+
+@app.post("/debug/sniff-network")
+async def debug_sniff_network(req: SniffNetworkRequest):
+    """Not called by channelarr -- a one-off investigation tool. Captures
+    every response body whose URL contains any of req.url_substrings,
+    regardless of MATCH_PATTERNS/JSON_STREAM_PATTERNS (see
+    relay_capture.sniff_network's docstring for why /capture itself can't
+    already do this)."""
+    await _slots.acquire(req.priority)
+    tab = None
+    try:
+        browser = await _get_browser()
+        tab = await _open_tracked_tab(browser, "about:blank")
+        keep_target_id = _tab_target_id(tab)
+        results = await asyncio.wait_for(
+            rc.sniff_network(tab, browser, keep_target_id, req.url,
+                              req.click_sequence, req.url_substrings, req.settle_seconds),
+            timeout=90,
+        )
+        return {"ok": True, "results": results}
+    except Exception as e:
+        logger.exception("sniff-network failed for %s", req.url)
+        return {"ok": False, "error": str(e), "results": []}
+    finally:
+        await _close_tab_safely(tab)
+        _slots.release()
 
 
 def _tracked_tabs_status() -> dict:

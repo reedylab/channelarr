@@ -618,13 +618,27 @@ def _detach_capture(capture_tab, label: str = "?"):
 
 
 async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: bool = True,
-                       debug: bool = False, debug_id: str | None = None) -> CaptureOutcome:
+                       debug: bool = False, debug_id: str | None = None,
+                       click_sequence: list | None = None, click_sequence_fn=None) -> CaptureOutcome:
     """Full capture pipeline against an already-open tab (ephemeral or
     persistent, this module doesn't care -- see module docstring): attach
     capture handlers, navigate, drill into an iframe if warranted (trying
     EACH non-skip candidate in turn, not just the first — the iframe-
     selection-robustness improvement from the sidecar-2.0 plan), scan for
     skip-phrases, click play, wait for a manifest.
+
+    click_sequence/click_sequence_fn: an optional site-specific interaction
+    sequence (relay_capture.py's action-keyed vocabulary), run right after
+    the initial settle, before the generic iframe-drilling/click-play
+    fallback below. click_sequence_fn is dependency-injected (app.py passes
+    relay_capture.run_click_sequence) rather than imported here -- this
+    module deliberately doesn't import relay_capture (which itself imports
+    THIS module for iframe-candidate lookup; a direct import here would be
+    circular). Real, confirmed-live motivation: a source whose generic
+    click-play fallback (PLAY_SELECTORS-based) never actually reaches real
+    playback at all -- the manifest IS visible to this module's existing
+    MATCH_PATTERNS, the only missing piece was running the RIGHT click
+    sequence first.
 
     debug=True (with a caller-supplied debug_id) saves checkpoint
     screenshots to DEBUG_DIR/{debug_id}/ -- see _debug_screenshot."""
@@ -642,7 +656,7 @@ async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: 
         return await _run_capture_body(
             browser, tab, url, timeout, switch_iframe,
             outcome, found_event, req_headers, iframe_sessions, t0, _log,
-            debug_dir,
+            debug_dir, click_sequence, click_sequence_fn,
         )
     finally:
         # Always detach, success or failure or exception -- see
@@ -657,12 +671,24 @@ async def run_capture(browser, tab, url: str, timeout: int = 60, switch_iframe: 
 
 async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
                              outcome, found_event, req_headers, iframe_sessions, t0, _log,
-                             debug_dir=None):
+                             debug_dir=None, click_sequence=None, click_sequence_fn=None):
     await attach_capture(tab, outcome, found_event, req_headers, t0, "top")
     _log(f"navigating to {url[:120]}")
     await tab.get(url)
     _log("tab.get() returned, sleeping 3s to let the page settle")
     await asyncio.sleep(3)
+
+    if click_sequence and click_sequence_fn and not found_event.is_set():
+        try:
+            tid = None
+            try:
+                tid = tab.target.target_id
+            except Exception:
+                pass
+            click_log = await click_sequence_fn(tab, browser, tid, click_sequence)
+            _log(f"click_sequence done: {click_log}")
+        except Exception as e:
+            _log(f"click_sequence failed: {e}")
     _log(f"post-settle: found_event.is_set()={found_event.is_set()}")
     if debug_dir:
         await _debug_screenshot(tab, debug_dir, "01_after_load")

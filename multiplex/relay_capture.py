@@ -32,6 +32,7 @@ separately from the ephemeral-capture tab-slot pool.
 """
 
 import asyncio
+import base64
 import json
 import logging
 
@@ -456,7 +457,8 @@ async def _close_popup_tabs(browser, keep_target_id: str):
         logger.info("[RELAY] closed %d popup tab(s)", closed)
 
 
-async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: list) -> list:
+async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: list,
+                              contexts: list | None = None) -> list:
     """Walks a per-site config list of steps (the same 'action'-keyed
     vocabulary selenium-uc/tab_proxy.py's dead engine used -- see this
     module's docstring for why that's worth carrying forward):
@@ -472,10 +474,21 @@ async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: 
                                              config ported verbatim from
                                              TAB_PROXY_CONFIG doesn't need
                                              editing.
-    Also accepts two simpler, generic step shapes for future non-iframe
-    sites that don't need any of the above:
+    Also accepts simpler, generic step shapes:
       {"action": "click_selector", "selector": "...", "seconds": N}
       {"action": "click_coords", "x": N, "y": N, "seconds": N}
+      {"action": "click_selector_any_context", "selector": "...", "seconds": N}
+        -- searches every context in `contexts` (top tab AND every
+        attached/isolated-world frame) for the selector and clicks
+        whichever one has it, via a JS-level .click() (not a trusted CDP
+        click -- confirmed live this session that a player library's OWN
+        play button doesn't require one; only the browser's autoplay gate
+        on a bare <video>.play() does). Real, confirmed-live motivation:
+        a source whose actual player control (e.g. a JW Player-style
+        .jw-icon-display button) only exists inside a same-process
+        cross-origin frame reachable solely via an isolated world -- the
+        outer click_iframe_center/iframe_dom_click steps only ever
+        reached the popunder-bait layer, never this control.
     Returns a per-step log -- this is expected to need real tuning per
     site, and a silent failure here is the hardest thing to diagnose from
     outside (see /relay/{id}/debug-eval for interactive tuning)."""
@@ -519,6 +532,25 @@ async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: 
             elif action == "click_coords":
                 await _dispatch_click(tab, step["x"], step["y"])
                 log.append({"step": step, "ok": True})
+            elif action == "click_selector_any_context":
+                selector = step["selector"]
+                click_js = (
+                    "(function(){var el=document.querySelector(%s);"
+                    "if(!el)return null;var r=el.getBoundingClientRect();"
+                    "if(r.width<=0||r.height<=0)return null;"
+                    "el.click();return JSON.stringify({w:r.width,h:r.height});})()"
+                    % json.dumps(selector)
+                )
+                hit = None
+                for i, ctx in enumerate(contexts or []):
+                    try:
+                        result = await _eval_json(ctx, click_js)
+                    except Exception:
+                        continue
+                    if result:
+                        hit = i
+                        break
+                log.append({"step": step, "ok": hit is not None, "context_index": hit})
             else:
                 log.append({"step": step, "ok": False, "error": f"unknown action {action!r}"})
         except Exception as e:
@@ -526,31 +558,15 @@ async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: 
     return log
 
 
-async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_sequence: list) -> dict:
-    """Navigate, run the site's click sequence to reach real playback, then
-    inject the captureStream()+MediaRecorder JS into EVERY plausible
-    execution context: the top-level tab AND every cross-origin iframe
-    candidate (via the same CDP session-attach machinery
-    network_capture.py's iframe drilling already uses -- see
-    _find_iframe_candidates/attach_to_target). This is deliberate, not
-    over-cautious: confirmed live against a real source this session that
-    the actual <video> element can be reachable ONLY from a genuinely
-    cross-origin nested iframe -- contentDocument-based same-origin
-    reaches (iframe_dom_click's approach) can never see it at all,
-    same-origin-policy, regardless of how the click sequence itself is
-    tuned. Each injected context's own _RELAY_START_JS retries
-    independently for up to 120s; only whichever one actually has the
-    real <video> will ever start recording, but there's no reliable way
-    to know which one ahead of time without site-specific knowledge, so
-    every candidate gets a shot. Returns {"ok", "error", "click_log",
-    "contexts": [tab_or_session, ...]} -- TabRelaySource's caller stores
-    the whole context list and polls all of them every tick."""
-    await tab.get(page_url)
-    await asyncio.sleep(PAGE_SETTLE_SECONDS)
-    click_log = await run_click_sequence(tab, browser, keep_target_id,
-                                          click_sequence if click_sequence is not None
-                                          else DEFAULT_CLICK_SEQUENCE)
-
+async def _build_contexts(tab, browser) -> tuple:
+    """Enumerates every plausible execution context for a page: the
+    top-level tab, every genuinely separate cross-origin iframe TARGET
+    (via network_capture.py's iframe-candidate/session-attach machinery),
+    and every same-process cross-origin frame that has NO separate target
+    at all (Site Isolation disabled -- see _IsolatedWorldContext's
+    docstring; confirmed live this session to be exactly where a real
+    source's actual player lived). Returns (contexts, attached_count,
+    isolated_count) for logging."""
     contexts = [tab]
     try:
         candidates = await _find_iframe_candidates(browser)
@@ -566,9 +582,6 @@ async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_se
         except Exception as e:
             logger.debug("[RELAY] attach_to_target failed for a candidate: %s", e)
 
-    # Covers the (confirmed live, this session's actual case) scenario
-    # where a cross-origin iframe has NO separate CDP target at all
-    # (Site Isolation disabled) -- see _IsolatedWorldContext's docstring.
     isolated_count = 0
     try:
         isolated_contexts = await _find_child_frame_contexts(tab)
@@ -577,8 +590,44 @@ async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_se
     except Exception as e:
         logger.warning("[RELAY] isolated-world frame lookup failed: %s", e)
 
-    logger.info("[RELAY] injecting capture into top tab + %d attached iframe target(s) "
-                "+ %d isolated-world frame context(s)", attached_count, isolated_count)
+    return contexts, attached_count, isolated_count
+
+
+async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_sequence: list) -> dict:
+    """Navigate, build every plausible execution context (see
+    _build_contexts), run the site's click sequence to reach real
+    playback -- steps can act on the top tab (iframe_dom_click,
+    click_iframe_center, popup/modal handling) OR on ANY specific found
+    context (click_selector_any_context, for a control -- e.g. a player
+    library's own play button -- that only exists inside a same-process
+    cross-origin frame reachable solely via an isolated world) -- then
+    inject the captureStream()+MediaRecorder JS into every context.
+    Real, confirmed-live motivation for context-aware clicks: a source
+    whose <video> loaded real segment data and set duration/seekable
+    metadata but never actually started decoding (readyState stuck at 0,
+    zero segment fetches) until the PLAYER LIBRARY'S OWN play button
+    (inside the real cross-origin frame, not the outer iframe/popunder
+    layer click_iframe_center handles) was clicked -- calling video.play()
+    directly bypassed the player's own internal state machine entirely.
+
+    Each context's own _RELAY_START_JS retries independently for up to
+    120s; only whichever one actually has the real <video> will ever
+    start recording, but there's no reliable way to know which one ahead
+    of time without site-specific knowledge, so every candidate gets a
+    shot. Returns {"ok", "error", "click_log", "contexts": [...]} --
+    TabRelaySource's caller stores the whole context list and polls all
+    of them every tick."""
+    await tab.get(page_url)
+    await asyncio.sleep(PAGE_SETTLE_SECONDS)
+
+    contexts, attached_count, isolated_count = await _build_contexts(tab, browser)
+    logger.info("[RELAY] built %d context(s): top tab + %d attached iframe target(s) "
+                "+ %d isolated-world frame context(s)", len(contexts), attached_count, isolated_count)
+
+    click_log = await run_click_sequence(tab, browser, keep_target_id,
+                                          click_sequence if click_sequence is not None
+                                          else DEFAULT_CLICK_SEQUENCE,
+                                          contexts=contexts)
 
     any_ok = False
     last_error = "no context accepted the capture JS"
@@ -642,3 +691,81 @@ async def stop_relay(contexts: list):
             await asyncio.wait_for(_eval_json(ctx, _RELAY_STOP_JS), timeout=5.0)
         except Exception:
             pass
+
+
+async def sniff_network(tab, browser, keep_target_id: str, page_url: str, click_sequence: list,
+                         url_substrings: list, settle_seconds: float = 8.0) -> list:
+    """Diagnostic-only, not called by channelarr: captures every response
+    whose URL contains any of url_substrings, body included -- unlike
+    network_capture.py's real /capture pipeline, which only ever inspects
+    a response's body if its URL/mime already matched MATCH_PATTERNS or
+    JSON_STREAM_PATTERNS first. Real, confirmed-live gap this exists to
+    investigate: a small XHR/fetch endpoint (e.g. a real source's own
+    "/fetch" call) can carry a hidden key/token/disguised-manifest payload
+    that never gets its body checked at all today, simply because its URL
+    doesn't happen to contain any of the handful of known substrings.
+    Existing disguised-body-sniff logic (network_capture.py's #EXTM3U-in-
+    first-4096-chars check) already handles a body once it's fetched --
+    this tool is for finding responses that check needs to be reached
+    for at all, not a replacement for it."""
+    seen = []
+    seen_lock = asyncio.Lock()
+    req_headers: dict = {}
+
+    async def on_request(event):
+        try:
+            req_headers[event.request_id] = {
+                "headers": dict(getattr(event.request, "headers", {}) or {}),
+                "url": event.request.url,
+            }
+        except Exception:
+            pass
+
+    async def on_response(event):
+        try:
+            url_ = event.response.url
+            if not any(s in url_ for s in url_substrings):
+                return
+            rid = event.request_id
+            mime = getattr(event.response, "mime_type", "") or ""
+            status = getattr(event.response, "status", None)
+            body_b64 = None
+            try:
+                cdp_result = await asyncio.wait_for(
+                    tab.send(uc.cdp.network.get_response_body(request_id=rid)), timeout=5.0)
+                if cdp_result:
+                    body_str, already_b64 = cdp_result
+                    # Always hand back real base64 of the raw bytes -- callers
+                    # that need to inspect binary/obfuscated payloads (the
+                    # whole point of this tool) can't do that through a
+                    # decode(errors="replace") text string, which silently
+                    # corrupts exactly the bytes worth looking at.
+                    body_b64 = body_str if already_b64 else base64.b64encode(
+                        body_str.encode("utf-8", errors="surrogateescape")).decode("ascii")
+            except Exception as e:
+                body_b64 = None
+            async with seen_lock:
+                seen.append({
+                    "url": url_, "status": status, "mime": mime,
+                    "request_headers": (req_headers.get(rid) or {}).get("headers"),
+                    "body_b64": body_b64,
+                })
+        except Exception as e:
+            logger.debug("[SNIFF] on_response error: %s", e)
+
+    await tab.send(uc.cdp.network.enable())
+    tab.add_handler(uc.cdp.network.RequestWillBeSent, lambda e: asyncio.create_task(on_request(e)))
+    tab.add_handler(uc.cdp.network.ResponseReceived, lambda e: asyncio.create_task(on_response(e)))
+
+    await tab.get(page_url)
+    await asyncio.sleep(PAGE_SETTLE_SECONDS)
+    await run_click_sequence(tab, browser, keep_target_id, click_sequence or [])
+    await asyncio.sleep(settle_seconds)
+
+    for evt in (uc.cdp.network.RequestWillBeSent, uc.cdp.network.ResponseReceived):
+        try:
+            tab.remove_handler(evt)
+        except Exception:
+            pass
+
+    return seen
