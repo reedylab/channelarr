@@ -1048,10 +1048,21 @@ class TabRelaySource(SegmentSource):
             stop_event.set()
             return
 
+        def _raise_priority():
+            # Same reasoning/pattern as ContinuousRelaySource's own
+            # _raise_priority (see its docstring for the full context) --
+            # this encoder has the same real, continuous CPU cost. Best-
+            # effort, never a hard dependency (see that docstring for why).
+            try:
+                os.nice(-10)
+            except OSError:
+                pass
+
         try:
             enc_proc = subprocess.Popen(
                 self._build_transcode_cmd(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                preexec_fn=_raise_priority,
             )
         except Exception as e:
             logging.warning("[TAB-RELAY] %s couldn't start encoder: %s", self.channel_id, e)
