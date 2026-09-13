@@ -943,9 +943,21 @@ async def relay_start(req: RelayStartRequest):
         tab = await browser.get("about:blank", new_tab=True)
         keep_target_id = _tab_target_id(tab)
         logger.info("Starting relay session %s: %s", session_id, req.url)
+        # 180s, not 90s -- real, confirmed-live failure mode: start_relay's
+        # own CDP calls (navigate, click_sequence, frame-tree/isolated-
+        # world setup) share the SAME browser process as every ephemeral
+        # capture, so a real fleet-wide backlog (e.g. post-VPN-rotation,
+        # 10+ queued captures) can genuinely slow them down past 90s even
+        # though the work would have completed fine given more patience.
+        # Giving up this fast under a transient burst meant a relay
+        # session essentially could never start during exactly the
+        # conditions (heavy background load) it's most likely to be
+        # needed in. TabRelaySource's own client-side timeout (120s, see
+        # segment_sources.py) already needs raising in lockstep with this
+        # -- see that comment for why the two must stay aligned.
         result = await asyncio.wait_for(
             rc.start_relay(tab, browser, keep_target_id, req.url, req.click_sequence),
-            timeout=90,
+            timeout=180,
         )
         if not result.get("ok"):
             logger.warning("Relay session %s failed to start: %s (click_log=%s)",
