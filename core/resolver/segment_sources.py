@@ -993,9 +993,16 @@ class TabRelaySource(SegmentSource):
 
     def _start_session(self) -> bool:
         try:
+            # Must comfortably exceed /relay/start's own internal deadline
+            # (90s, app.py) -- a real, confirmed-live bug found deploying
+            # this for the first time: this timeout was 75s, shorter than
+            # the server's own deadline, so under real contention (the
+            # shared browser mid-heavy-refresh-batch) this client gave up
+            # and logged a false "couldn't start" before the server would
+            # have finished on its own.
             resp = http_requests.post(f"{self.multiplex_url}/relay/start", json={
                 "url": self.page_url, "click_sequence": self.click_sequence,
-            }, timeout=75)
+            }, timeout=120)
             data = resp.json()
         except Exception as e:
             logging.warning("[TAB-RELAY] %s couldn't start relay session: %s", self.channel_id, e)

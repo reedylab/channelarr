@@ -107,12 +107,33 @@ _RELAY_START_JS = r"""
     recorder.ondataavailable = function(e) {
       if (e.data && e.data.size > 0) {
         var reader = new FileReader();
-        reader.onload = function() { window.__relay.state.chunks.push(reader.result.split(',')[1]); };
+        reader.onload = function() {
+          // NOT reader.result.split(',')[1], and NOT indexOf(',') either
+          // -- the data: URL's own MIME type can itself contain a comma
+          // (e.g. "codecs=vp9,opus"), which comes BEFORE the real
+          // ";base64," separator. Both of those naive splits land on
+          // that inner comma, leaving "opus;base64," prepended to the
+          // real payload -- invalid base64 characters (the semicolon)
+          // that Python's lenient b64decode silently drops rather than
+          // rejecting, shifting the length just enough to break padding
+          // on every single chunk. The base64 payload itself can NEVER
+          // contain a comma (comma isn't in the base64 alphabet), so the
+          // LAST comma in the string is always the real, unambiguous
+          // separator, regardless of how many commas the MIME type has.
+          var r = reader.result;
+          window.__relay.state.chunks.push(r.substring(r.lastIndexOf(',') + 1));
+        };
         reader.readAsDataURL(e.data);
       }
     };
     recorder.onstop = function() { window.__relay.state.ended = true; };
     recorder.onerror = function(e) { window.__relay.state.ended = true; window.__relay.state.error = String(e); };
+    // 1s timeslice -- confirmed via direct testing that Runtime.evaluate
+    // round-trips a 500KB+ string cleanly; the "large chunks corrupt"
+    // theory (which briefly lived here as 250ms + a faster poll
+    // interval) was wrong. The real bug was the data: URL comma-split
+    // above -- fixed at the source, no need to trade quality/overhead
+    // for smaller chunks.
     recorder.start(1000);
     window.__relay.recorder = recorder;
     window.__relay.state.mimeType = mimeType;
