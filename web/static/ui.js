@@ -549,6 +549,8 @@ function openEditor(ch) {
     const isTranscode = (mode === "single" || mode === "multi");
     $("#ch-transcode-options").style.display = isTranscode ? "" : "none";
     $("#ch-resolved-bump-section").style.display = isTranscode ? "" : "none";
+    $("#ch-resolved-source-kind").value = ch.source_kind || "hls";
+    $("#ch-resolved-source-kind-wrap").style.display = isTranscode ? "" : "none";
     const bc = ch.bump_config || {};
     const selected = bc.folders || (bc.folder ? [bc.folder] : []);
     loadResolvedBumpFolders(selected);
@@ -637,11 +639,14 @@ function renderFallbackSources(ch) {
       const modeHint = s.encoder_mode
         ? `<span class="muted" style="font-size:11px"> · mode: ${esc(s.encoder_mode)}</span>`
         : "";
+      const kindHint = (s.source_kind && s.source_kind !== "hls")
+        ? `<span class="muted" style="font-size:11px"> · kind: ${esc(s.source_kind)}</span>`
+        : "";
       const upBtn = `<button type="button" class="btn btn-sm" data-fb-up="${i}" ${i === 0 ? "disabled" : ""} title="Move up">&uarr;</button>`;
       const downBtn = `<button type="button" class="btn btn-sm" data-fb-down="${i}" ${i === sources.length - 1 ? "disabled" : ""} title="Move down">&darr;</button>`;
       const rmBtn = `<button type="button" class="btn btn-sm-danger" data-fb-remove="${esc(s.manifest_id)}" title="Remove">&times;</button>`;
       return `<div class="fallback-row" style="display:flex;align-items:center;gap:6px;padding:3px 0">
-        <span style="flex:1">${i + 1}. ${label}${modeHint}${expiryHint}</span>
+        <span style="flex:1">${i + 1}. ${label}${modeHint}${kindHint}${expiryHint}</span>
         ${upBtn} ${downBtn} ${rmBtn}
       </div>`;
     }).join("");
@@ -719,13 +724,14 @@ $("#ch-fallback-add-btn").addEventListener("click", async () => {
   const manifestId = sel.value;
   if (!manifestId) return;
   const encoderMode = $("#ch-fallback-add-mode").value || undefined;
+  const sourceKind = $("#ch-fallback-add-kind").value || undefined;
   const btn = $("#ch-fallback-add-btn");
   btn.disabled = true;
   try {
     const r = await fetch(`${API}/channels/${editingChannel.id}/fallback-sources`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ manifest_id: manifestId, encoder_mode: encoderMode }),
+      body: JSON.stringify({ manifest_id: manifestId, encoder_mode: encoderMode, source_kind: sourceKind }),
     });
     if (r.ok) { toast("success", "Added fallback source"); refreshFallbackSources(); }
     else { const j = await r.json(); toast("error", j.error || "Add failed"); }
@@ -930,6 +936,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const isTranscode = (sel.value === "single" || sel.value === "multi");
       $("#ch-transcode-options").style.display = isTranscode ? "" : "none";
       $("#ch-resolved-bump-section").style.display = isTranscode ? "" : "none";
+      $("#ch-resolved-source-kind-wrap").style.display = isTranscode ? "" : "none";
     });
   }
 });
@@ -1340,6 +1347,7 @@ async function saveChannel() {
       transcode_mediated: isTranscode,
       profile_name: $("#ch-resolved-profile").value || "auto",
       encoder_mode: encoderMode,
+      source_kind: isTranscode ? ($("#ch-resolved-source-kind").value || "hls") : "hls",
       branding_logo: $("#ch-resolved-branding").value || null,
       event_start: evStart ? new Date(evStart).toISOString() : null,
       event_end: evEnd ? new Date(evEnd).toISOString() : null,

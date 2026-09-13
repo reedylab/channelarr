@@ -232,7 +232,8 @@ async def api_add_fallback_source(channel_id: str, request: Request):
     if isinstance(guard, JSONResponse):
         return guard
     ch = shared_state.channel_mgr.add_fallback_source(channel_id, manifest_id,
-                                                        encoder_mode=data.get("encoder_mode"))
+                                                        encoder_mode=data.get("encoder_mode"),
+                                                        source_kind=data.get("source_kind"))
     if not ch:
         return JSONResponse({"error": "Manifest not found"}, status_code=404)
     return _enrich(ch)
