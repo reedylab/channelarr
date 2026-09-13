@@ -129,6 +129,46 @@ def record_probe(channel_id: str, player_path: str, ok: bool,
         row.last_latency_ms = latency_ms
         row.last_error = error
 
+    # The moment a score changes is the moment the chain's try-order should
+    # reflect it — this is deliberately separate from (and much less
+    # conservative than) maybe_promote_best_player's primary-promotion
+    # decision: reordering which *fallback* gets tried first costs nothing
+    # (no stream restart, nobody's watching a fallback slot), so there's no
+    # flapping risk to guard against the way there is for swapping primary.
+    _reorder_fallbacks_by_score(channel_id)
+
+
+def _reorder_fallbacks_by_score(channel_id: str) -> None:
+    """Keep the fallback chain's actual try-order continuously in sync with
+    current scores, so _pick_working_manifest (hls.py) tries the
+    best-tracked candidate first the next time the primary needs one —
+    without that, a candidate could accumulate a real track record while
+    still sitting behind long-dead legacy fallbacks that simply happened to
+    be added first."""
+    from web import shared_state
+
+    ch = shared_state.channel_mgr.get_channel(channel_id)
+    if not ch or ch.get("type") != "resolved":
+        return
+    fallbacks = ch.get("fallback_sources") or []
+    if len(fallbacks) < 2:
+        return  # nothing to reorder
+
+    scores = get_scores(channel_id)
+
+    def _score_for(fb):
+        title = fb.get("title") or ""
+        if "(player: " not in title:
+            return 0.5  # untagged/legacy fallback -- no history to judge it by
+        path = title.rsplit("(player: ", 1)[1].rstrip(")")
+        return score_of(scores.get(path))
+
+    ranked = sorted(fallbacks, key=_score_for, reverse=True)
+    ranked_ids = [fb.get("manifest_id") for fb in ranked]
+    current_ids = [fb.get("manifest_id") for fb in fallbacks]
+    if ranked_ids != current_ids:
+        shared_state.channel_mgr.set_fallback_sources(channel_id, ranked_ids)
+
 
 def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int = 20):
     """Probe every known player path for this channel's stream id and
