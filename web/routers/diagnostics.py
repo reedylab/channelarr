@@ -117,6 +117,34 @@ def diagnostics_reload(channel_id: str):
     return {"ok": ok, "message": msg}
 
 
+@router.post("/diagnostics/{channel_id}/simulate-stall")
+def diagnostics_simulate_stall(channel_id: str, count: int = 2):
+    """TEST-ONLY: injects real source_stall events into the same live
+    diagnostics store the switch watchdog (core/resolver/player_evaluator.
+    py's _channel_is_struggling) reads, without needing to actually break
+    the real upstream connection — attempting that externally (blocking
+    DNS for the CDN host) had zero effect on an already-open keep-alive
+    connection (2026-09-13), and there was no other side-channel into the
+    live process's in-memory diagnostics state from outside it.
+
+    This lets the ACTUAL watchdog code run unmodified on its normal ~10s
+    cycle against a genuine (if synthetic-origin) signal — timing from this
+    call to the resulting "promoted ... restarting now" log line is a real
+    measurement of end-to-end switchover latency, not a guess. Causes a
+    REAL promotion + hot-restart of the channel if it has a scored
+    candidate that beats the current primary — same as a genuine stall
+    would, on purpose.
+
+    `count` defaults to 2 — _STRUGGLING_SOURCE_STALLS_5M's threshold — so
+    the default call is exactly enough to cross it, no more.
+    """
+    from core.diagnostics import record_event, incr_counter
+    for _ in range(max(1, count)):
+        record_event(channel_id, "source_stall", {"gap_seconds": 999, "simulated": True})
+        incr_counter(channel_id, "source_stalls")
+    return {"ok": True, "injected": count}
+
+
 @router.post("/diagnostics/{channel_id}/client-event")
 async def diagnostics_client_event(channel_id: str, request: Request):
     """The video element itself reporting a stall or a live-catch-up seek —
