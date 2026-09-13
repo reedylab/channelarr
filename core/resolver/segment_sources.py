@@ -1136,6 +1136,22 @@ class TabRelaySource(SegmentSource):
 
         consecutive_failures = 0
         gave_up = False
+        # Real, confirmed-live gap this closes: multiplex's poll_relay
+        # aggregates ALL contexts (top tab + every isolated-world frame),
+        # and any_ok only requires ONE of them to respond -- so once the
+        # SPECIFIC context that actually found the video and started
+        # recording dies (a wedged/crashed CDP connection), the other
+        # 2-3 contexts that never had a video keep answering normally
+        # forever (they're just idling, not yet at their own internal
+        # 120s give-up), making every poll look like "ok:true, chunks:[]"
+        # indefinitely -- consecutive_failures above never sees this as a
+        # failure at all, and the channel sits "running" serving a
+        # frozen/stale playlist forever with zero error signal anywhere.
+        # A recording context that goes silent is never supposed to un-
+        # recover -- once real recording has started, "still recording"
+        # should hold for the rest of the session, so losing it is
+        # unambiguously fatal, distinct from "still searching for video".
+        was_recording = False
         try:
             while not stop_event.is_set():
                 try:
@@ -1153,8 +1169,13 @@ class TabRelaySource(SegmentSource):
                     stop_event.wait(self.POLL_INTERVAL_SECONDS)
                     continue
 
-                if not data.get("ok"):
+                lost_recording = (was_recording and not data.get("recording")
+                                  and not (data.get("chunks") or []))
+                if not data.get("ok") or lost_recording:
                     consecutive_failures += 1
+                    reason = "lost recording context" if lost_recording else data.get("error")
+                    logging.warning("[TAB-RELAY] %s poll unhealthy (#%d): %s",
+                                    self.channel_id, consecutive_failures, reason)
                     if consecutive_failures >= self.MAX_CONSECUTIVE_POLL_FAILURES:
                         gave_up = True
                         break
@@ -1162,6 +1183,8 @@ class TabRelaySource(SegmentSource):
                     continue
 
                 consecutive_failures = 0
+                if data.get("recording"):
+                    was_recording = True
                 for b64_chunk in data.get("chunks") or []:
                     try:
                         raw = base64.b64decode(b64_chunk)
