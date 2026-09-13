@@ -53,6 +53,63 @@ import network_capture as nc
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def _patch_transaction_call():
+    """Fix a real, general bug in nodriver's own Connection/Transaction
+    machinery, found via a live hang (a real capture went silent right after
+    page-settle and never logged anything again until the outer deadline
+    killed it -- no iframe-candidate discovery, nothing).
+
+    nodriver.core.connection.Transaction.__call__ parses a command response
+    against its typed cdp.* schema (`self.__cdp_obj__.send(response["result"])`).
+    If that schema doesn't match what THIS Chrome version actually sent (a
+    missing/renamed field -- already confirmed to happen at least twice this
+    session: Cookie.from_json()'s 'sameParty', and whatever field disagreement
+    killed the capture above), it catches the KeyError but only re-raises it
+    -- never calling self.set_exception(), so the awaiting Transaction's
+    future never resolves, AND the bare re-raise propagates out of
+    Connection._listener's unguarded `tx(**message)` call (no try/except
+    there, unlike the sibling event-parsing branch a few lines below it,
+    which already handles this correctly). That silently kills the whole
+    connection's listener task -- every future `.send()` on it hangs forever,
+    with zero log output, until whatever outer deadline eventually fires.
+
+    This isn't a one-field bug -- it's structural, and can be triggered by
+    ANY typed command response Chrome's actual shape has drifted on. Patched
+    generally here rather than chasing individual field names as they turn
+    up (already found two; a newer Chrome will likely find more). Process-
+    local monkeypatch only, nothing written to the installed package."""
+    from nodriver.core.connection import Transaction, ProtocolException
+
+    def _fixed_call(self, **response):
+        if "error" in response:
+            return self.set_exception(ProtocolException(response["error"]))
+        try:
+            self.__cdp_obj__.send(response["result"])
+        except StopIteration as e:
+            if not self.done():
+                self.set_result(e.value)
+        except Exception as e:
+            # Broad on purpose, not just KeyError -- a Chrome/cdp schema
+            # mismatch can surface as several exception shapes depending on
+            # which field the typed generator was mid-parsing when it hit
+            # something unexpected (renamed/missing/differently-typed field).
+            # Any of them must resolve this Transaction rather than escape
+            # unguarded into Connection._listener, which has no try/except
+            # around its `tx(**message)` call site.
+            logger.warning(
+                "Transaction typed-response parse failed for %s (Chrome/cdp "
+                "schema drift, not fatal to the connection): %s: %s",
+                self.method, type(e).__name__, e,
+            )
+            if not self.done():
+                self.set_exception(e)
+
+    Transaction.__call__ = _fixed_call
+
+
+_patch_transaction_call()
+
 app = FastAPI()
 
 _STARTUP_TIMEOUT = int(os.getenv("CHROME_STARTUP_TIMEOUT", "60"))
@@ -319,7 +376,29 @@ async def _get_browser():
         _clear_stale_profile_locks()
         try:
             _browser = await asyncio.wait_for(
-                uc.start(headless=False, user_data_dir=_PROFILE_DIR),
+                uc.start(
+                    headless=False,
+                    user_data_dir=_PROFILE_DIR,
+                    # Matches v1's exact flags (selenium-uc/app.py) -- confirmed
+                    # to be the real reason v1 reliably sees a multi-iframe
+                    # source's manifest request regardless of which iframe is
+                    # actually streaming, while this sidecar's per-target CDP
+                    # capture could miss it entirely: with Site Isolation on
+                    # (the default), a cross-origin iframe is a separate
+                    # out-of-process renderer/CDP target, invisible to the
+                    # top-level tab's own network handlers unless the iframe-
+                    # candidate loop happens to attach to it before its
+                    # request fires. Disabling Site Isolation keeps same-
+                    # process (in most cases no longer even a separate CDP
+                    # target at all) iframes' network traffic visible on the
+                    # top-level tab's session directly -- the same browser-
+                    # wide visibility v1's performance-log polling gets for
+                    # free, independent of iframe-candidate selection.
+                    browser_args=[
+                        "--disable-site-isolation-trials",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                    ],
+                ),
                 timeout=_STARTUP_TIMEOUT,
             )
         except Exception as e:
