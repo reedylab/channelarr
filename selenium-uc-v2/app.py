@@ -259,6 +259,32 @@ async def _start_sweeper():
     asyncio.create_task(_sweep_stale_tabs())
 
 
+def _clear_stale_profile_locks():
+    """Chrome's process-singleton mechanism (SingletonLock/SingletonCookie/
+    SingletonSocket, symlinks in the profile dir) only gets cleaned up on a
+    GRACEFUL Chrome exit -- an abrupt kill (container OOM, force-recreate,
+    crash) leaves them behind, and every future launch against that same
+    profile dir then fails immediately with "profile appears to be in use
+    by another Google Chrome process" even though that process is long
+    dead. Real, confirmed failure mode (not hypothetical): hit this exact
+    thing after a chain of container recreates during testing -- 20.3s
+    consistent failures on every single capture until these were cleared
+    by hand. v1 (selenium-uc/app.py) already does exactly this before its
+    own browser startup; v2 never ported it. _PROFILE_DIR is a persistent
+    named volume (survives container recreate) specifically so the cookie/
+    session state carries over -- but that means a stale lock survives
+    right along with it unless something clears it, unlike a fresh-each-
+    time temp profile that would never have this problem."""
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = os.path.join(_PROFILE_DIR, name)
+        try:
+            if os.path.lexists(path):
+                os.remove(path)
+                logger.info("Removed stale %s", name)
+        except Exception as e:
+            logger.warning("Failed to remove stale %s: %s", name, e)
+
+
 async def _get_browser():
     """Lazily create the persistent browser, or recreate it if the existing
     one has died. One shared instance; concurrency comes from multiple
@@ -290,6 +316,7 @@ async def _get_browser():
     async with _browser_lock:
         if _browser is not None:  # another concurrent caller may have won the race
             return _browser
+        _clear_stale_profile_locks()
         try:
             _browser = await asyncio.wait_for(
                 uc.start(headless=False, user_data_dir=_PROFILE_DIR),
