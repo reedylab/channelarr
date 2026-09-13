@@ -29,6 +29,7 @@ out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
 /restart isn't called by any core/web code):
   POST /capture                              {url, timeout, switch_iframe, priority, debug}
   POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority}
+  POST /test/watch-channel                   {channel_id, duration_seconds, poll_interval_seconds, priority}
   GET  /health
   POST /cookies/youtube
   GET  /screenshot                           live snapshot of the persistent main_tab
@@ -228,6 +229,11 @@ app = FastAPI()
 _STARTUP_TIMEOUT = int(os.getenv("CHROME_STARTUP_TIMEOUT", "60"))
 _PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", "/data/chrome-profile")
 _MAX_TABS = int(os.getenv("SIDECAR_MAX_TABS", "3"))
+# channelarr itself, reachable at this address because multiplex shares its
+# network_mode: service:gluetun namespace (confirmed via compose) -- used
+# only by /test/watch-channel to drive channelarr's own /diagnostics-wall
+# page for repeatable browser+diagnostics playback testing.
+_CHANNELARR_BASE_URL = os.getenv("CHANNELARR_BASE_URL", "http://localhost:5045")
 # A tab that's still tracked as "open" this long after being opened is
 # almost certainly leaked, not legitimately still running -- deadline is
 # req.timeout+45 and req.timeout defaults to 60 (callers can set it higher,
@@ -780,6 +786,48 @@ async def capture_multi_player(req: MultiPlayerCaptureRequest):
     except Exception as e:
         logger.exception("Multi-player capture failed for %s", req.wrapper_url)
         return {"ok": False, "error": str(e), "results": []}
+    finally:
+        await _close_tab_safely(tab)
+        _slots.release()
+
+
+class WatchTestRequest(BaseModel):
+    channel_id: str
+    duration_seconds: int = 60
+    poll_interval_seconds: float = 2.0
+    priority: str = "low"
+
+
+@app.post("/test/watch-channel")
+async def test_watch_channel(req: WatchTestRequest):
+    """The repeatable browser+diagnostics test harness -- drives
+    channelarr's own /diagnostics-wall page exactly the way a human would
+    (real Hls.js <video>, real SSE diagnostics overlay) and reports
+    time-to-first-frame, stall episodes, client-side video errors, and
+    active-source-label changes over a fixed window. See
+    network_capture.run_watch_test's docstring for the full motivation --
+    real browser playback catches things Jellyfin/server-log checks miss."""
+    deadline = req.duration_seconds + 45
+    await _slots.acquire(req.priority)
+    tab = None
+    try:
+        browser = await _get_browser()
+        tab = await _open_tracked_tab(browser, "about:blank")
+        logger.info("Starting watch-test: channel=%s duration=%ds", req.channel_id, req.duration_seconds)
+        result = await asyncio.wait_for(
+            nc.run_watch_test(tab, _CHANNELARR_BASE_URL, req.channel_id,
+                               duration_seconds=req.duration_seconds,
+                               poll_interval_seconds=req.poll_interval_seconds),
+            timeout=deadline,
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.error("Watch-test deadline exceeded for channel %s (%ds)", req.channel_id, deadline)
+        return {"ok": False, "error": f"Watch-test deadline exceeded ({deadline}s)",
+                "channel_id": req.channel_id, "samples": []}
+    except Exception as e:
+        logger.exception("Watch-test failed for channel %s", req.channel_id)
+        return {"ok": False, "error": str(e), "channel_id": req.channel_id, "samples": []}
     finally:
         await _close_tab_safely(tab)
         _slots.release()

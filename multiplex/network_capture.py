@@ -877,3 +877,184 @@ async def run_multi_player_capture(tab, wrapper_url: str, candidates: list,
             })
 
     return results
+
+
+_SELECT_CHANNEL_JS = """
+(function() {
+  var sel = document.querySelector('.wall-picker');
+  if (!sel) return false;
+  sel.value = %s;
+  sel.dispatchEvent(new Event('change'));
+  return sel.value === %s;
+})()
+"""
+
+_READ_VIDEO_STATE_JS = """
+(function() {
+  var v = document.querySelector('video');
+  if (!v) return null;
+  return JSON.stringify({
+    currentTime: v.currentTime,
+    readyState: v.readyState,
+    paused: v.paused,
+    ended: v.ended,
+    networkState: v.networkState,
+    error: v.error ? {code: v.error.code, message: v.error.message} : null
+  });
+})()
+"""
+
+# How long to poll for the wall page's channel picker to actually render
+# before giving up -- covers page load + Hls.js/EventSource wiring, not
+# meant to be tuned per call.
+_PICKER_APPEAR_TIMEOUT_SECONDS = 15
+_PICKER_POLL_INTERVAL_SECONDS = 0.5
+
+
+async def _eval_json(tab, expression: str):
+    """Runtime.evaluate a JS expression, unwrapped the same
+    tuple-vs-object way as everywhere else in this module (see
+    try_click_play). Booleans/numbers/null come back as native Python
+    values via return_by_value already -- no parsing needed. Only a
+    JSON.stringify()'d string payload (e.g. _READ_VIDEO_STATE_JS) needs a
+    json.loads() pass; a plain string that isn't valid JSON (e.g. a bare
+    boolean-ish check) is returned as-is rather than raising, since callers
+    here treat any truthy return as success either way."""
+    result = await tab.send(uc.cdp.runtime.evaluate(expression=expression, return_by_value=True))
+    remote_obj = result[0] if isinstance(result, tuple) else result
+    raw = getattr(remote_obj, "value", None)
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+    return raw
+
+
+async def run_watch_test(tab, base_url: str, channel_id: str, duration_seconds: int = 60,
+                          poll_interval_seconds: float = 2.0) -> dict:
+    """The repeatable browser+diagnostics test harness Jake asked for:
+    "use our channelarr browser hls player ... same way every time ... and I
+    want you to use channelarr diagnostics also." Real browser playback is a
+    more sensitive test than server-log-checking or Jellyfin -- streams have
+    been observed to play fine in Jellyfin while stalling/erroring in a real
+    browser <video> element. This drives channelarr's OWN existing
+    /diagnostics-wall page (a real Hls.js player + SSE diagnostics overlay,
+    built earlier this session) exactly the way a human would: load the
+    wall, pick a channel in slot 0, then watch both the real <video> element
+    AND the diagnostics API together over a fixed window.
+
+    Deliberately reuses the production wall page rather than building a
+    separate synthetic player -- the whole point is testing the SAME code
+    path a real viewer hits, not a purpose-built proxy for it.
+
+    Returns a structured result: time-to-first-frame, stall episodes
+    (video wasn't paused/ended but currentTime failed to advance across a
+    poll), client-side video errors, and every distinct active_source_label
+    seen (source switches show up as a change in this over the window) --
+    plus the raw per-poll samples for anyone who wants to dig deeper."""
+    wall_url = f"{base_url.rstrip('/')}/diagnostics-wall"
+    diag_url = f"{base_url.rstrip('/')}/api/diagnostics/{channel_id}"
+
+    t_start = time.time()
+    await tab.get(wall_url)
+
+    # Poll for the picker to actually exist rather than a fixed sleep --
+    # page load + Hls.js wiring time varies, and a fixed sleep either wastes
+    # time or races the DOM on a slow load.
+    picker_ready = False
+    picker_deadline = time.time() + _PICKER_APPEAR_TIMEOUT_SECONDS
+    while time.time() < picker_deadline:
+        try:
+            exists = await _eval_json(tab, "document.querySelector('.wall-picker') !== null")
+        except Exception:
+            exists = None
+        if exists:
+            picker_ready = True
+            break
+        await asyncio.sleep(_PICKER_POLL_INTERVAL_SECONDS)
+
+    if not picker_ready:
+        return {"ok": False, "error": "diagnostics-wall channel picker never appeared",
+                "channel_id": channel_id, "samples": []}
+
+    try:
+        selected = await _eval_json(tab, _SELECT_CHANNEL_JS % (json.dumps(channel_id), json.dumps(channel_id)))
+    except Exception as e:
+        return {"ok": False, "error": f"channel selection failed: {e}", "channel_id": channel_id, "samples": []}
+    if not selected:
+        return {"ok": False, "error": f"channel_id {channel_id!r} not found in wall picker options",
+                "channel_id": channel_id, "samples": []}
+
+    logger.info("[watch-test] %s: channel selected, watching for %ds (poll every %.1fs)",
+                channel_id, duration_seconds, poll_interval_seconds)
+
+    samples = []
+    window_deadline = time.time() + duration_seconds
+    while time.time() < window_deadline:
+        t_elapsed = round(time.time() - t_start, 2)
+        try:
+            video = await _eval_json(tab, _READ_VIDEO_STATE_JS)
+        except Exception as e:
+            video = {"eval_error": str(e)}
+        try:
+            diag_resp = await asyncio.to_thread(requests.get, diag_url, timeout=5)
+            diag = diag_resp.json() if diag_resp.ok else {"fetch_error": f"HTTP {diag_resp.status_code}"}
+        except Exception as e:
+            diag = {"fetch_error": str(e)}
+        samples.append({"t": t_elapsed, "video": video, "diag": diag})
+        await asyncio.sleep(poll_interval_seconds)
+
+    # --- Summarize ---
+    time_to_first_frame_s = None
+    stall_episodes = 0
+    in_stall = False
+    client_errors = []
+    source_labels_seen = []
+    prev_current_time = None
+    prev_active_label = None
+
+    for s in samples:
+        v = s.get("video") or {}
+        d = s.get("diag") or {}
+
+        cur = v.get("currentTime")
+        if time_to_first_frame_s is None and isinstance(cur, (int, float)) and cur > 0.05:
+            time_to_first_frame_s = s["t"]
+
+        err = v.get("error")
+        if err:
+            client_errors.append({"t": s["t"], "error": err})
+
+        if isinstance(cur, (int, float)) and prev_current_time is not None:
+            advanced = (cur - prev_current_time) > 0.1
+            not_settled = bool(v.get("paused")) or bool(v.get("ended"))
+            if not advanced and not not_settled:
+                if not in_stall:
+                    stall_episodes += 1
+                    in_stall = True
+            else:
+                in_stall = False
+        if isinstance(cur, (int, float)):
+            prev_current_time = cur
+
+        label = d.get("active_source_label")
+        if label and label != prev_active_label:
+            source_labels_seen.append({"t": s["t"], "label": label})
+            prev_active_label = label
+
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "duration_seconds": duration_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "time_to_first_frame_s": time_to_first_frame_s,
+        "stall_episodes": stall_episodes,
+        "client_errors": client_errors,
+        "source_label_changes": source_labels_seen,
+        "final_active_source_label": prev_active_label,
+        "sample_count": len(samples),
+        "samples": samples,
+    }
