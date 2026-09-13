@@ -28,6 +28,7 @@ capability added for AI/human troubleshooting -- /tab/* and /restart stay
 out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
 /restart isn't called by any core/web code):
   POST /capture                              {url, timeout, switch_iframe, priority, debug}
+  POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority}
   GET  /health
   POST /cookies/youtube
   GET  /screenshot                           live snapshot of the persistent main_tab
@@ -729,6 +730,59 @@ async def capture(req: CaptureRequest):
         _slots.release()
         if debug_id:
             _evict_old_debug_dirs()
+
+
+class PlayerCandidate(BaseModel):
+    path: str
+    url: str
+
+
+class MultiPlayerCaptureRequest(BaseModel):
+    wrapper_url: str
+    candidates: list[PlayerCandidate]
+    per_candidate_timeout: int = 15
+    priority: str = "low"
+
+
+@app.post("/capture/multi-player")
+async def capture_multi_player(req: MultiPlayerCaptureRequest):
+    """New capability: browser-render every candidate player path for a
+    multi-player source in one real page session, not just whichever the
+    page loads by default. See network_capture.run_multi_player_capture's
+    docstring for the full motivation/mechanism.
+
+    One shared deadline for the WHOLE sweep (not per-candidate) since the
+    caller (the native-resolver plugin, via player_health.py) already only
+    invokes this as an expensive, rare fallback when pure-HTTP discovery
+    found nothing across every path -- bound the total cost explicitly
+    rather than letting len(candidates) x per_candidate_timeout run
+    unbounded if the caller passes a long candidate list."""
+    deadline = len(req.candidates) * req.per_candidate_timeout + 45
+    await _slots.acquire(req.priority)
+    tab = None
+    try:
+        browser = await _get_browser()
+        tab = await _open_tracked_tab(browser, "about:blank")
+        logger.info("Starting multi-player capture: wrapper=%s candidates=%d deadline=%ds",
+                    req.wrapper_url, len(req.candidates), deadline)
+        results = await asyncio.wait_for(
+            nc.run_multi_player_capture(
+                tab, req.wrapper_url,
+                [{"path": c.path, "url": c.url} for c in req.candidates],
+                per_candidate_timeout=req.per_candidate_timeout,
+            ),
+            timeout=deadline,
+        )
+        return {"ok": True, "results": results}
+    except asyncio.TimeoutError:
+        logger.error("Multi-player capture deadline exceeded for %s (%ds)", req.wrapper_url, deadline)
+        return {"ok": False, "error": f"Multi-player capture deadline exceeded ({deadline}s)", "results": []}
+    except Exception as e:
+        logger.exception("Multi-player capture failed for %s", req.wrapper_url)
+        return {"ok": False, "error": str(e), "results": []}
+    finally:
+        await _close_tab_safely(tab)
+        _slots.release()
 
 
 def _tracked_tabs_status() -> dict:

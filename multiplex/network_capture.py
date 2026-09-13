@@ -772,3 +772,108 @@ async def _run_capture_body(browser, tab, url, timeout, switch_iframe,
         outcome.cookies = await get_cookies(source)
 
     return outcome
+
+
+async def run_multi_player_capture(tab, wrapper_url: str, candidates: list,
+                                    per_candidate_timeout: int = 15) -> list:
+    """New capability: browser-render EVERY known alternate player path for a
+    multi-player source, not just whichever one the page loads by default.
+
+    Real-world motivation: the native (pure-HTTP) resolver already tries
+    every known player path (see the plugin's own player-path list) via
+    plain requests -- fast and cheap, but limited to whatever's visible in
+    static HTML/JS. When a specific player's page uses obfuscation the
+    native extractors don't handle (or simply needs real JS execution),
+    native discovery reports that path as a clean failure even though a
+    real browser can see it fine. Confirmed directly: a manually-injected
+    iframe for one such path found a real manifest from a COMPLETELY
+    different backend CDN than the site's own default player uses --
+    genuine redundancy, not just an alternate front-end for the same
+    upstream.
+
+    Mechanism: load wrapper_url (the real watch-page) ONCE, establishing
+    real cookies/context, then for each candidate inject an iframe
+    pointing at its player URL directly into the DOM -- exactly what the
+    site's own player-switch buttons do client-side. Site Isolation is
+    disabled for this browser (see app.py's uc.start() call) specifically
+    so a cross-origin iframe's network traffic is visible on the
+    TOP-LEVEL tab's own attach_capture session without needing per-iframe
+    CDP session-attach -- confirmed working in the investigation that
+    motivated this function. One candidate at a time (detach + re-attach
+    between each) rather than trying all iframes at once, so a manifest
+    response is unambiguously attributable to whichever candidate is
+    currently under test.
+
+    Returns a list shaped identically to the native resolver's own
+    discover_all_players(): [{"path", "ok", "error", "latency_ms",
+    "capture"}], "capture" only set when ok=True, shaped like a normal
+    /capture response dict -- so callers (player_health.py) can treat
+    native and browser-discovered results interchangeably."""
+    results = []
+    t_wrapper = time.time()
+    await tab.get(wrapper_url)
+    await asyncio.sleep(3)
+    logger.info("[multi-player] wrapper loaded (%.2fs), testing %d candidate(s)",
+                time.time() - t_wrapper, len(candidates))
+
+    for cand in candidates:
+        path, url = cand["path"], cand["url"]
+        outcome = CaptureOutcome()
+        found_event = asyncio.Event()
+        req_headers = {}
+        t0 = time.time()
+        await attach_capture(tab, outcome, found_event, req_headers, t0, f"mp:{path}")
+        try:
+            await tab.send(uc.cdp.runtime.evaluate(expression=f"""
+                (function() {{
+                    var old = document.getElementById('mp_probe_iframe');
+                    if (old) old.remove();
+                    var f = document.createElement('iframe');
+                    f.id = 'mp_probe_iframe';
+                    f.src = {json.dumps(url)};
+                    f.width = '640'; f.height = '360';
+                    document.body.appendChild(f);
+                }})()
+            """))
+        except Exception as e:
+            logger.warning("[multi-player] %s: iframe injection failed: %s", path, e)
+
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=per_candidate_timeout)
+        except asyncio.TimeoutError:
+            pass
+
+        if outcome.ok:
+            try:
+                ua_result = await asyncio.wait_for(
+                    tab.send(uc.cdp.runtime.evaluate(expression="navigator.userAgent", return_by_value=True)),
+                    timeout=5.0,
+                )
+                ua_obj = ua_result[0] if isinstance(ua_result, tuple) else ua_result
+                outcome.user_agent = getattr(ua_obj, "value", None)
+            except Exception:
+                pass
+            outcome.cookies = await get_cookies(tab)
+
+        _detach_capture(tab, f"mp:{path}")
+        elapsed_ms = (time.time() - t0) * 1000
+        logger.info("[multi-player] %s: ok=%s (%.0fms)", path, outcome.ok, elapsed_ms)
+
+        if outcome.ok:
+            results.append({
+                "path": path, "ok": True, "error": None, "latency_ms": elapsed_ms,
+                "capture": {
+                    "ok": True, "manifest_url": outcome.manifest_url, "body": outcome.body,
+                    "mime": outcome.mime, "headers": outcome.headers,
+                    "user_agent": outcome.user_agent, "referer": outcome.referer or wrapper_url,
+                    "cookies": outcome.cookies, "heartbeat": None,
+                },
+            })
+        else:
+            results.append({
+                "path": path, "ok": False,
+                "error": outcome.error or f"no manifest found within {per_candidate_timeout}s",
+                "latency_ms": elapsed_ms, "capture": None,
+            })
+
+    return results
