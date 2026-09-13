@@ -36,6 +36,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections import deque
 
 import nodriver as uc
@@ -52,10 +53,25 @@ app = FastAPI()
 _STARTUP_TIMEOUT = int(os.getenv("CHROME_STARTUP_TIMEOUT", "60"))
 _PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", "/data/chrome-profile")
 _MAX_TABS = int(os.getenv("SIDECAR_MAX_TABS", "3"))
+# A tab that's still tracked as "open" this long after being opened is
+# almost certainly leaked, not legitimately still running -- deadline is
+# req.timeout+45 and req.timeout defaults to 60 (callers can set it higher,
+# but this is generous headroom over any realistic capture, matching
+# "definitely stale" rather than "might still be working").
+_TAB_STALE_SECONDS = int(os.getenv("SIDECAR_TAB_STALE_SECONDS", "300"))
+_TAB_SWEEP_INTERVAL = int(os.getenv("SIDECAR_TAB_SWEEP_INTERVAL", "60"))
 
 _browser = None
 _browser_lock = asyncio.Lock()
 _capture_count = 0
+
+# target_id -> opened_at timestamp, for every tab opened via _open_tracked_tab
+# and not yet confirmed closed via _close_tab_safely. See that function's
+# docstring and _sweep_stale_tabs for why this exists: PrioritySemaphore
+# gates how many NEW captures can start, not whether every previously-opened
+# tab actually got closed -- this dict plus the sweeper is what actually
+# bounds real Chrome tab count over a long-running session.
+_active_tabs: dict[str, float] = {}
 
 
 class PrioritySemaphore:
@@ -127,32 +143,95 @@ def _stop_browser_safely(browser, timeout=8):
         logger.warning("browser.stop() didn't return within %ds — abandoning it", timeout)
 
 
+def _tab_target_id(tab):
+    try:
+        return tab.target.target_id
+    except Exception:
+        return None
+
+
+async def _open_tracked_tab(browser, url: str):
+    """Wraps browser.get(url, new_tab=True) with registration into
+    _active_tabs, so a tab that never gets confirmed-closed (see
+    _close_tab_safely) is visible to _sweep_stale_tabs even if the request
+    that opened it dies in some way that skips its own finally block
+    (shouldn't happen given /capture's try/finally, but tracked at open
+    time rather than only at close time so there's no gap where a tab
+    exists but isn't yet trackable)."""
+    tab = await browser.get(url, new_tab=True)
+    tid = _tab_target_id(tab)
+    if tid:
+        _active_tabs[tid] = time.time()
+    return tab
+
+
 async def _close_tab_safely(tab, timeout=5):
     """Tab.close() sends Target.closeTarget over that tab's own CDP
     connection — if THIS tab's listener already died (the same failure mode
     fixed in network_capture.py's timeout-wrapped tail calls), this would
-    otherwise hang forever too. Timeout-wrapped for the same reason; a tab
-    that fails to close cleanly just leaks until the whole browser is
-    eventually recycled (existing _get_browser() health check), not a
-    request-blocking hang.
+    otherwise hang forever too. Timeout-wrapped for the same reason.
 
-    Known residual risk, not yet mitigated: nothing tracks or bounds actual
-    live Chrome tab count independently of PrioritySemaphore's logical slot
-    count -- the semaphore gates how many NEW captures can start, not
-    whether every previously-opened tab actually got closed. If close
-    silently times out occasionally over many hours of real operation,
-    leaked tabs (each a real renderer process) could accumulate slowly
-    until the next full browser recycle. Worth watching via the sustained
-    resource-observation loop (chrome process count) rather than fixing
-    preemptively tonight -- a real fix would mean tracking open tab IDs and
-    reconciling against browser.targets periodically, more Phase 2.5 scope
-    than a quick patch."""
+    On success, untracks the tab immediately. On failure/timeout, the tab
+    stays in _active_tabs -- _sweep_stale_tabs (a periodic background task,
+    see its own docstring) is what actually bounds real Chrome tab count
+    over a long-running session by force-closing anything that's been
+    tracked open far longer than any legitimate capture could take."""
     if tab is None:
         return
+    tid = _tab_target_id(tab)
     try:
         await asyncio.wait_for(tab.close(), timeout=timeout)
+        if tid:
+            _active_tabs.pop(tid, None)
     except Exception:
-        pass
+        if tid:
+            logger.warning("Tab %s failed to close within %ds -- leaving it "
+                            "tracked for the stale-tab sweeper", tid, timeout)
+
+
+async def _sweep_stale_tabs():
+    """Background loop, started at app startup: periodically reconciles
+    _active_tabs against wall-clock time and force-closes anything that's
+    been tracked open longer than _TAB_STALE_SECONDS -- a tab this old can
+    only be one _close_tab_safely already tried and failed on (see that
+    function), since a normal capture's own try/finally always attempts a
+    close well before this threshold. This is the actual fix for the
+    tab-leak residual risk found during tonight's code review: without it,
+    PrioritySemaphore's logical slot count has no relationship to how many
+    real Chrome renderer processes are actually still alive.
+
+    Force-close goes straight through browser.main_tab (always kept alive
+    by _get_browser's own health check) rather than needing the original
+    Tab object -- Target.closeTarget only needs a target_id, and the
+    original object may itself be part of why closing failed the first
+    time."""
+    while True:
+        await asyncio.sleep(_TAB_SWEEP_INTERVAL)
+        if _browser is None or not _active_tabs:
+            continue
+        now = time.time()
+        stale = [tid for tid, opened_at in list(_active_tabs.items())
+                 if now - opened_at > _TAB_STALE_SECONDS]
+        for tid in stale:
+            try:
+                await asyncio.wait_for(
+                    _browser.main_tab.send(uc.cdp.target.close_target(target_id=tid)),
+                    timeout=5.0,
+                )
+                logger.warning("Stale-tab sweeper force-closed leaked tab %s "
+                                "(open %ds)", tid, int(now - _active_tabs[tid]))
+            except Exception as e:
+                logger.warning("Stale-tab sweeper failed to force-close %s: %s", tid, e)
+            # Remove regardless of outcome -- a target_id that's already
+            # gone (closed some other way) would otherwise re-trigger this
+            # every sweep forever; one force-close attempt per stale tab is
+            # enough effort, not an infinite retry loop.
+            _active_tabs.pop(tid, None)
+
+
+@app.on_event("startup")
+async def _start_sweeper():
+    asyncio.create_task(_sweep_stale_tabs())
 
 
 async def _get_browser():
@@ -178,6 +257,10 @@ async def _get_browser():
             logger.warning("Existing browser unresponsive, recreating")
             _stop_browser_safely(_browser)
             _browser = None
+            # Any tracked tabs belonged to the now-dead instance -- clear
+            # them rather than leaving the sweeper trying to force-close
+            # target_ids on a browser process that no longer exists.
+            _active_tabs.clear()
 
     async with _browser_lock:
         if _browser is not None:  # another concurrent caller may have won the race
@@ -215,7 +298,7 @@ async def capture(req: CaptureRequest):
         browser = await _get_browser()
         # Fresh tab per capture (see module docstring for why) — run_capture
         # does its own navigation to req.url, so open blank here.
-        tab = await browser.get("about:blank", new_tab=True)
+        tab = await _open_tracked_tab(browser, "about:blank")
 
         logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d, priority=%s)",
                     req.url, req.timeout, deadline, _capture_count, req.priority)
@@ -253,6 +336,16 @@ async def capture(req: CaptureRequest):
         _slots.release()
 
 
+def _tracked_tabs_status() -> dict:
+    now = time.time()
+    ages = [now - t for t in _active_tabs.values()]
+    return {
+        "tracked_open": len(_active_tabs),
+        "oldest_open_seconds": int(max(ages)) if ages else 0,
+        "stale_threshold_seconds": _TAB_STALE_SECONDS,
+    }
+
+
 @app.get("/health")
 async def health():
     """Never hangs (fixed timeout on the probe) — any response, even a
@@ -260,7 +353,7 @@ async def health():
     global _browser
     if _browser is None:
         return {"ready": True, "browser_alive": False, "capture_count": _capture_count,
-                "tabs": _slots.status()}
+                "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status()}
     try:
         await asyncio.wait_for(
             _browser.main_tab.send(uc.cdp.runtime.evaluate(expression="1")),
@@ -270,7 +363,7 @@ async def health():
     except Exception:
         alive = False
     return {"ready": True, "browser_alive": alive, "capture_count": _capture_count,
-            "tabs": _slots.status()}
+            "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status()}
 
 
 @app.post("/cookies/youtube")
@@ -284,7 +377,7 @@ async def cookies_youtube():
     tab = None
     try:
         browser = await _get_browser()
-        tab = await browser.get("https://youtube.com", new_tab=True)
+        tab = await _open_tracked_tab(browser, "https://youtube.com")
         await asyncio.sleep(2)
         cookies = await nc.get_cookies(tab, scoped=True)
     except Exception as e:
