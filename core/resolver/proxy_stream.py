@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests as http_requests
 
@@ -68,6 +68,20 @@ DECRYPT_FAILURES_BEFORE_REFRESH = 3
 # Don't kick another refresh more often than this — gives the new manifest
 # time to land + the player time to re-fetch the playlist.
 DECRYPT_REFRESH_DEBOUNCE_SECONDS = 60
+
+# Same idea, for plain segment-fetch HTTP errors (403/503/connection errors,
+# not a decrypt failure) — a real, confirmed gap found live: these were only
+# ever logged (the bare `except Exception` below), with NO escalation path
+# at all. A CDN blocking/rate-limiting segment fetches (confirmed live: a
+# backend returning 503 on every segment while the playlist itself
+# kept resolving fine) meant the stream could sit at zero downloaded
+# segments indefinitely -- never reaching MIN_STARTUP_SEGMENTS, never
+# writing a playlist, the client just times out after 90s with no
+# self-healing attempt in between. Mirrors the decrypt-failure pattern
+# exactly: after N consecutive segment errors, try a fresh manifest (a new
+# resolve may land on a different, currently-unblocked backend/token).
+SEGMENT_ERRORS_BEFORE_REFRESH = 3
+SEGMENT_REFRESH_DEBOUNCE_SECONDS = 60
 
 # production_speed_ratio window — same concept as RemuxStream's (see there
 # for the full rationale): sum(new segment duration)/wall-clock elapsed over
@@ -270,6 +284,11 @@ class ProxyStream:
         # debounce refresh attempts so we don't hammer the resolver.
         self._consecutive_decrypt_failures = 0
         self._last_decrypt_refresh_at = 0.0
+
+        # Same idea for plain segment-fetch HTTP errors -- see
+        # SEGMENT_ERRORS_BEFORE_REFRESH's docstring.
+        self._consecutive_segment_errors = 0
+        self._last_segment_refresh_at = 0.0
 
         # AES key cache, keyed by absolute key URL — populated lazily as
         # encrypted playlists are seen. Key URLs rotate as the upstream
@@ -579,6 +598,7 @@ class ProxyStream:
                     new_count += 1
                     prod_window_dur += seg["duration"]
                     self._consecutive_decrypt_failures = 0
+                    self._consecutive_segment_errors = 0
                 except _DecryptError as e:
                     self._consecutive_decrypt_failures += 1
                     incr_counter(self.channel_id, "decrypt_failures")
@@ -586,8 +606,16 @@ class ProxyStream:
                                     self.channel_id, uri[:80], e,
                                     self._consecutive_decrypt_failures)
                 except Exception as e:
-                    logging.warning("[PROXY] %s download failed for %s: %s",
-                                    self.channel_id, uri[:80], e)
+                    self._consecutive_segment_errors += 1
+                    logging.warning("[PROXY] %s download failed for %s: %s (#%d consecutive)",
+                                    self.channel_id, uri[:80], e,
+                                    self._consecutive_segment_errors)
+                    if isinstance(e, http_requests.exceptions.ConnectionError):
+                        try:
+                            from core.block_detector import record_possible_block
+                            record_possible_block(urlparse(uri).netloc)
+                        except Exception:
+                            pass
 
             # If decrypt has been failing for several segments in a row, the
             # upstream session is stale — kick the resolver to re-establish
@@ -614,6 +642,31 @@ class ProxyStream:
                         self._consecutive_decrypt_failures = 0
                         logging.info("[PROXY] %s manifest refreshed, switched to new variant",
                                      self.channel_id)
+
+            # Same escalation for plain segment HTTP errors -- see
+            # SEGMENT_ERRORS_BEFORE_REFRESH's docstring. A fresh resolve may
+            # land on a different backend/token that isn't currently
+            # blocked/rate-limited, self-healing without ever needing the
+            # 90s cold-start timeout to fire client-side.
+            if self._consecutive_segment_errors >= SEGMENT_ERRORS_BEFORE_REFRESH:
+                now_mono = time.monotonic()
+                since_last = now_mono - self._last_segment_refresh_at
+                if since_last >= SEGMENT_REFRESH_DEBOUNCE_SECONDS:
+                    record_event(self.channel_id, "session_refresh",
+                                {"reason": "consecutive_segment_errors",
+                                 "count": self._consecutive_segment_errors})
+                    logging.warning("[PROXY] %s triggering manifest refresh after %d "
+                                    "consecutive segment errors (blocked/rate-limited CDN?)",
+                                    self.channel_id, self._consecutive_segment_errors)
+                    self._last_segment_refresh_at = now_mono
+                    fresh = self._refresh_manifest_url()
+                    if fresh:
+                        self.manifest_url = fresh
+                        variant_url = self._resolve_variant_url(fresh)
+                        self._key_cache.clear()
+                        self._consecutive_segment_errors = 0
+                        logging.info("[PROXY] %s manifest refreshed after segment errors, "
+                                     "switched to new variant", self.channel_id)
 
             # Trim old segments and write playlist
             if segment_files:
