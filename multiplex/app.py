@@ -714,7 +714,40 @@ async def _get_browser():
                     # free, independent of iframe-candidate selection.
                     browser_args=[
                         "--disable-site-isolation-trials",
-                        "--disable-features=IsolateOrigins,site-per-process",
+                        # Real, confirmed-live bug this fixes: tab_relay's
+                        # <video> froze (repeating/stalling its last real
+                        # frame) after several minutes of real playback,
+                        # while audio kept flowing perfectly and every
+                        # server-side diagnostic stayed healthy --
+                        # `ffmpeg -c copy` just passes through whatever
+                        # frames captureStream() actually produces, frozen
+                        # or not, so this was invisible to every metric
+                        # that only checks container/timing structure, not
+                        # actual pixel motion. Every multiplex tab is a
+                        # real Chrome tab that's never in the OS-level
+                        # foreground -- by default Chrome throttles
+                        # rendering (requestAnimationFrame, timers) for
+                        # any backgrounded/occluded tab, which is exactly
+                        # what would stall real-time video capture like
+                        # this while leaving the separate, cheaper audio
+                        # pipeline unaffected (matches the reported
+                        # symptom exactly: video froze first, audio kept
+                        # playing, then audio eventually stopped too once
+                        # throttling escalated further). These are the
+                        # standard flags browser-automation tooling uses
+                        # to disable that throttling outright.
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                        # Combined into ONE --disable-features flag,
+                        # deliberately -- Chrome only honors the LAST
+                        # occurrence of a repeated switch, so a second
+                        # separate --disable-features= here would have
+                        # silently overridden (not added to) the
+                        # Site-Isolation disable above, breaking the
+                        # cross-origin iframe network visibility this
+                        # whole feature depends on.
+                        "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion",
                     ],
                 ),
                 timeout=_STARTUP_TIMEOUT,
