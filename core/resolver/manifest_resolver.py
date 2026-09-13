@@ -88,7 +88,29 @@ def _pool_for_priority(priority: str):
 # Kept well under that danger zone even after the bump (was 3) — the real
 # fix for the backlog is the ORDER BY below (fair rotation through the
 # candidate pool), this just raises throughput a bit on top of that.
+#
+# This is the SINGLE-mode budget only, unchanged — single mode's sequential
+# per-item pipeline_lock loop means a bigger batch here directly multiplies
+# one tick's own wall-clock (batch x ~60-105s each), which would delay every
+# subsequent tick (max_instances=1) far longer than is safe. See
+# HEAVY_REFRESH_BUDGET_PER_TICK_MULTI below for the mode-gated, much higher
+# multi-mode equivalent -- raising THIS constant would still be unsafe even
+# with multiplex's real concurrency, since single mode never uses the pool
+# that concurrency depends on.
 HEAVY_REFRESH_BUDGET_PER_TICK = 5
+
+# Multi-mode-only budget, deliberately much higher than the single-mode one
+# above. Safe to raise well past the pool size: submitting more than
+# RESOLVER_HIGH_SLOTS+RESOLVER_LOW_SLOTS items to the tick's
+# ThreadPoolExecutor doesn't cause extra concurrency (resolve()'s own pool
+# acquire still throttles actual concurrent sidecar dispatch) -- it just
+# means the excess queues on the pool WITHIN this same tick instead of
+# waiting 3-4+ future ticks for its turn, which is exactly the "we're only
+# ever reacting" gap this raises. Read live (get_setting, not a module-level
+# constant) so it can be tuned without a restart, unlike the pool sizes
+# below (which size actual Semaphore objects at import time).
+def _heavy_refresh_budget_multi() -> int:
+    return int(get_setting("HEAVY_REFRESH_BUDGET_PER_TICK_MULTI", "15"))
 
 
 def _default_resolved_name(title: str | None, manifest_url: str, source_domain: str | None) -> str:
@@ -383,7 +405,7 @@ def refresh_due_manifests():
     # already does for items still queued once the capture starts.
     needs_heavy.sort(key=lambda mid: priority_by_id.get(mid, "high") != "high")
 
-    budget = HEAVY_REFRESH_BUDGET_PER_TICK
+    budget = _heavy_refresh_budget_multi() if _concurrency_mode() == "multi" else HEAVY_REFRESH_BUDGET_PER_TICK
     logger.info("[RESOLVER] Heavy refresh queue: %d due, processing up to %d this tick",
                 len(needs_heavy), budget)
     batch = needs_heavy[:budget]
