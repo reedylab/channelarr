@@ -30,6 +30,10 @@ out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
   POST /capture                              {url, timeout, switch_iframe, priority, debug}
   POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority}
   POST /test/watch-channel                   {channel_id, duration_seconds, poll_interval_seconds, priority}
+  POST /relay/start                          {url, click_sequence} -> {session_id}
+  GET  /relay/{session_id}/chunks            drains accumulated captureStream()+MediaRecorder chunks
+  POST /relay/{session_id}/stop
+  POST /relay/{session_id}/debug-eval        {expression} -- interactive tuning only, not called by channelarr
   GET  /health
   POST /cookies/youtube
   GET  /screenshot                           live snapshot of the persistent main_tab
@@ -52,6 +56,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 import network_capture as nc
+import relay_capture as rc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -274,6 +279,26 @@ _capture_count = 0
 # bounds real Chrome tab count over a long-running session.
 _active_tabs: dict[str, float] = {}
 
+# Long-lived browser-tab-relay sessions (see relay_capture.py) -- a
+# fundamentally different lifecycle than every other tab in this service
+# (open, single-shot, close): a relay tab stays open, playing, for the
+# whole channel's runtime. Deliberately NOT registered in _active_tabs /
+# _sweep_stale_tabs -- that sweeper's whole job is killing tabs that have
+# been open "too long", which is exactly wrong for a tab that's SUPPOSED
+# to run for hours. Idle sweep here means "hasn't been polled recently"
+# (the consumer, TabRelaySource, almost certainly died) rather than "has
+# been open too long".
+# session_id -> {"tab": Tab, "started_at": float, "last_poll_at": float}
+_relay_sessions: dict[str, dict] = {}
+_relay_sessions_lock = asyncio.Lock()
+# session_ids reserved (counted against _RELAY_MAX_SESSIONS) while their tab
+# is still starting up -- kept OUT of _relay_sessions itself so a
+# concurrent sweep-loop tick can never iterate a half-built entry.
+_relay_sessions_starting: set = set()
+_RELAY_MAX_SESSIONS = int(os.getenv("SIDECAR_MAX_RELAY_SESSIONS", "2"))
+_RELAY_IDLE_TIMEOUT_SECONDS = int(os.getenv("SIDECAR_RELAY_IDLE_TIMEOUT_SECONDS", "45"))
+_RELAY_SWEEP_INTERVAL = int(os.getenv("SIDECAR_RELAY_SWEEP_INTERVAL", "15"))
+
 
 class PrioritySemaphore:
     """A counting semaphore where, once every slot is taken, a newly-freed
@@ -461,6 +486,28 @@ async def _sweep_stale_tabs():
             _active_tabs.pop(tid, None)
 
 
+async def _sweep_idle_relay_sessions():
+    """Background loop, started at app startup: closes any relay session
+    that hasn't been polled in _RELAY_IDLE_TIMEOUT_SECONDS. A relay tab is
+    SUPPOSED to stay open for a long time, so age-since-open (the metric
+    _sweep_stale_tabs uses) is the wrong signal here -- age-since-last-poll
+    is what actually indicates the consumer (TabRelaySource, in channelarr)
+    died or stopped without calling /relay/{id}/stop (container restart,
+    crash, network blip) and this tab is now just burning CPU decoding
+    video nobody is reading."""
+    while True:
+        await asyncio.sleep(_RELAY_SWEEP_INTERVAL)
+        if not _relay_sessions:
+            continue
+        now = time.time()
+        idle = [sid for sid, s in list(_relay_sessions.items())
+                if now - s["last_poll_at"] > _RELAY_IDLE_TIMEOUT_SECONDS]
+        for sid in idle:
+            logger.warning("[relay-sweeper] session %s idle >%ds (no poll) -- closing",
+                            sid, _RELAY_IDLE_TIMEOUT_SECONDS)
+            await _close_relay_session(sid)
+
+
 def _proc_age_seconds(pid: int) -> float | None:
     """Process age via /proc/<pid>/stat's starttime field (clock ticks since
     boot, field 22) compared against /proc/uptime -- the standard, precise
@@ -578,6 +625,11 @@ async def _start_sweeper():
             logger.error("[sweeper] background task died: %s: %s", type(exc).__name__, exc, exc_info=exc)
 
     task.add_done_callback(_log_if_died)
+
+    logger.info("[relay-sweeper] starting background task (interval=%ds, idle_timeout=%ds)",
+                _RELAY_SWEEP_INTERVAL, _RELAY_IDLE_TIMEOUT_SECONDS)
+    relay_task = asyncio.create_task(_sweep_idle_relay_sessions())
+    relay_task.add_done_callback(_log_if_died)
 
 
 def _clear_stale_profile_locks():
@@ -833,6 +885,123 @@ async def test_watch_channel(req: WatchTestRequest):
         _slots.release()
 
 
+async def _close_relay_session(session_id: str):
+    session = _relay_sessions.pop(session_id, None)
+    if not session:
+        return
+    try:
+        await asyncio.wait_for(rc.stop_relay(session["contexts"]), timeout=10.0)
+    except Exception:
+        pass
+    await _close_tab_safely(session["tab"])
+
+
+class RelayStartRequest(BaseModel):
+    url: str
+    # Per-site interaction steps to reach real playback -- see
+    # relay_capture.py's run_click_sequence docstring for the step shapes.
+    # Lives in the CALLER's config (scrapers/_tab_relay_configs.py via
+    # core.resolver.segment_sources.get_tab_relay_source_config), not
+    # hardcoded here -- this service stays source-name-free. None (not
+    # just an empty list) falls back to relay_capture.DEFAULT_CLICK_SEQUENCE.
+    click_sequence: list | None = None
+
+
+@app.post("/relay/start")
+async def relay_start(req: RelayStartRequest):
+    """Starts a long-lived browser-tab relay session: opens a tab, drives
+    it to real playback via click_sequence, and starts capturing the
+    decoded <video> output via captureStream()+MediaRecorder. The tab
+    stays open and playing until /relay/{session_id}/stop is called or the
+    idle sweeper decides nobody's polling it anymore.
+
+    Deliberately NOT gated by the ephemeral-capture PrioritySemaphore
+    (_slots) -- that's sized/tuned for short-lived captures that come and
+    go in seconds; a relay session occupies a tab for the channel's whole
+    runtime, a completely different resource-commitment shape. Gated by
+    its own, much smaller cap (_RELAY_MAX_SESSIONS) instead."""
+    async with _relay_sessions_lock:
+        if len(_relay_sessions) + len(_relay_sessions_starting) >= _RELAY_MAX_SESSIONS:
+            return {"ok": False, "error": f"relay session cap reached ({_RELAY_MAX_SESSIONS})"}
+        session_id = uuid.uuid4().hex[:12]
+        _relay_sessions_starting.add(session_id)
+
+    tab = None
+    try:
+        browser = await _get_browser()
+        tab = await browser.get("about:blank", new_tab=True)
+        keep_target_id = _tab_target_id(tab)
+        logger.info("Starting relay session %s: %s", session_id, req.url)
+        result = await asyncio.wait_for(
+            rc.start_relay(tab, browser, keep_target_id, req.url, req.click_sequence),
+            timeout=90,
+        )
+        if not result.get("ok"):
+            logger.warning("Relay session %s failed to start: %s (click_log=%s)",
+                            session_id, result.get("error"), result.get("click_log"))
+            await _close_tab_safely(tab)
+            return {"ok": False, "error": result.get("error"), "click_log": result.get("click_log")}
+
+        now = time.time()
+        async with _relay_sessions_lock:
+            _relay_sessions[session_id] = {"tab": tab, "contexts": result["contexts"],
+                                            "started_at": now, "last_poll_at": now}
+        logger.info("Relay session %s started (contexts=%d, click_log=%s)",
+                    session_id, len(result["contexts"]), result.get("click_log"))
+        return {"ok": True, "session_id": session_id, "click_log": result.get("click_log")}
+    except Exception as e:
+        logger.exception("Relay session %s start failed", session_id)
+        await _close_tab_safely(tab)
+        return {"ok": False, "error": str(e)}
+    finally:
+        _relay_sessions_starting.discard(session_id)
+
+
+@app.get("/relay/{session_id}/chunks")
+async def relay_chunks(session_id: str):
+    session = _relay_sessions.get(session_id)
+    if not session:
+        return {"ok": False, "error": "unknown or closed session", "chunks": [], "ended": True}
+    session["last_poll_at"] = time.time()
+    try:
+        result = await asyncio.wait_for(rc.poll_relay(session["contexts"]), timeout=15.0)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "chunks": [], "ended": False}
+    return result
+
+
+@app.post("/relay/{session_id}/stop")
+async def relay_stop(session_id: str):
+    await _close_relay_session(session_id)
+    return {"ok": True}
+
+
+class RelayDebugEvalRequest(BaseModel):
+    expression: str
+    # Index into start_relay's context list -- 0 is always the top-level
+    # tab; 1+ are attached cross-origin iframe candidates in the order
+    # _find_iframe_candidates returned them. Lets tuning work probe
+    # exactly the context that turns out to actually hold the real
+    # <video>, not just the top tab.
+    context_index: int = 0
+
+
+@app.post("/relay/{session_id}/debug-eval")
+async def relay_debug_eval(session_id: str, req: RelayDebugEvalRequest):
+    """Not called by channelarr -- an interactive tool for tuning a new
+    site's click_sequence (finding real selectors/coordinates, checking
+    <video> state) without a full deploy/test/redeploy cycle per guess."""
+    session = _relay_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="unknown or closed session")
+    contexts = session["contexts"]
+    if req.context_index < 0 or req.context_index >= len(contexts):
+        raise HTTPException(status_code=400,
+                            detail=f"context_index out of range (0..{len(contexts)-1})")
+    result = await rc._eval_json(contexts[req.context_index], req.expression)
+    return {"ok": True, "result": result, "context_count": len(contexts)}
+
+
 def _tracked_tabs_status() -> dict:
     now = time.time()
     ages = [now - t for t in _active_tabs.values()]
@@ -848,9 +1017,12 @@ async def health():
     """Never hangs (fixed timeout on the probe) — any response, even a
     ready=False one, reads as "sidecar alive" to core's check_selenium()."""
     global _browser
+    relay_status = {"active": len(_relay_sessions), "starting": len(_relay_sessions_starting),
+                     "cap": _RELAY_MAX_SESSIONS}
     if _browser is None:
         return {"ready": True, "browser_alive": False, "capture_count": _capture_count,
-                "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status()}
+                "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status(),
+                "relay_sessions": relay_status}
     try:
         await asyncio.wait_for(
             _browser.main_tab.send(uc.cdp.runtime.evaluate(expression="1")),
@@ -860,7 +1032,8 @@ async def health():
     except Exception:
         alive = False
     return {"ready": True, "browser_alive": alive, "capture_count": _capture_count,
-            "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status()}
+            "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status(),
+            "relay_sessions": relay_status}
 
 
 @app.post("/cookies/youtube")

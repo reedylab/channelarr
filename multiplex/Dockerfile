@@ -57,7 +57,7 @@ assert "range(40)" in s, "nodriver connect-window patch did not apply"
 print("nodriver connect-window patched:", f)
 PY
 
-COPY app.py network_capture.py session_attach.py entrypoint.sh ./
+COPY app.py network_capture.py relay_capture.py session_attach.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 ENV DISPLAY=:99
