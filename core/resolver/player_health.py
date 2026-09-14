@@ -218,6 +218,14 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
     except Exception:
         return None
 
+    from urllib.parse import urlparse
+    from core.source_registry import is_domain_enabled
+    enabled, reason = is_domain_enabled(urlparse(page_url).netloc)
+    if not enabled:
+        logger.info("[PLAYER-HEALTH] Skipping discovery for channel %s — source disabled (%s)",
+                    channel_id, reason)
+        return None
+
     try:
         results = native.discover_all_players(page_url, timeout)
     except Exception as e:

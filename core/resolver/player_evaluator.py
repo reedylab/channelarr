@@ -155,6 +155,12 @@ def _evaluate_one(channel_id: str, page_url: str, path: str) -> None:
     native = _native_resolver()
     if native is None or not hasattr(native, "probe_one_player"):
         return
+    from urllib.parse import urlparse
+    from core.source_registry import is_domain_enabled
+    enabled, reason = is_domain_enabled(urlparse(page_url).netloc)
+    if not enabled:
+        logger.info("[PLAYER-EVAL] Skipping %s/%s probe — source disabled (%s)", channel_id, path, reason)
+        return
     try:
         result = native.probe_one_player(page_url, path, _PROBE_TIMEOUT)
     except Exception as e:

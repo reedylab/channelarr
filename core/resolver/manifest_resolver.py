@@ -1112,7 +1112,22 @@ class ManifestResolverService:
         if native is not None and primary_page_url and hasattr(native, "player_candidate_urls"):
             try:
                 if native.handles(primary_page_url):
-                    native_candidates = native.player_candidate_urls(primary_page_url) or []
+                    # Every native candidate for a channel shares the same
+                    # front-door apex as primary_page_url (same family/
+                    # channel id, different player path) -- one check here
+                    # gates the whole set. _try_native_path below calls
+                    # native.probe_one_player() directly, which (unlike
+                    # _try_stored's refresh_manifest()) never passes through
+                    # _call_sidecar's own enforcement check -- this is the
+                    # only gate that path gets.
+                    from urllib.parse import urlparse
+                    from core.source_registry import is_domain_enabled
+                    enabled, reason = is_domain_enabled(urlparse(primary_page_url).netloc)
+                    if not enabled:
+                        logger.info("[RESOLVER] channel %s: skipping native player-path race — "
+                                    "source disabled (%s)", channel_id, reason)
+                    else:
+                        native_candidates = native.player_candidate_urls(primary_page_url) or []
             except Exception:
                 native_candidates = []
 
