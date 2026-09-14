@@ -245,12 +245,31 @@
           </div>
         </div>
 
+        <div class="panel" id="source-toggles-panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h3>Plugin Sources</h3>
+            <div class="panel-actions">
+              <span class="text-muted" style="font-size:12px">Manual on/off per plugin-declared source, plus live auto-hold status on sustained failures</span>
+              <button class="btn btn-ghost btn-sm-header" onclick="channelarr.loadSourcesPanel()">Refresh</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <table class="tbl sources-tbl" id="source-toggles-table">
+              <thead>
+                <tr><th>Source</th><th>Categories</th><th>Status</th><th>Manual</th></tr>
+              </thead>
+              <tbody id="source-toggles-tbody">
+                <tr><td colspan="4" class="empty-state">No plugin sources declared.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div class="panel" id="sources-panel" style="margin-top:16px">
           <div class="panel-head">
-            <h3>Sources</h3>
+            <h3>Domain Failure History</h3>
             <div class="panel-actions">
               <span class="text-muted" style="font-size:12px">Domains with recent connection-level failures -- raw signal only, no down/blocked verdict (see tooltip)</span>
-              <button class="btn btn-ghost btn-sm-header" onclick="channelarr.loadSourcesPanel()">Refresh</button>
             </div>
           </div>
           <div class="panel-body" style="padding:16px">

@@ -14,7 +14,8 @@ from core.models.scraped_event import ScrapedEvent
 from core.models.vpn_server import VpnServer
 from core.models.diagnostics import StreamDiagnosticSnapshot
 from core.models.player_health import PlayerHealthScore
+from core.models.source_toggle import SourceToggle
 
 __all__ = ["Base", "Channel", "EpgPwCache", "Capture", "Manifest", "Variant",
            "HeaderProfile", "ScrapedEvent", "VpnServer", "StreamDiagnosticSnapshot",
-           "PlayerHealthScore"]
+           "PlayerHealthScore", "SourceToggle"]

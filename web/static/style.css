@@ -90,6 +90,17 @@ button,input,select,textarea{font-family:inherit}
 .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:500;background:var(--bg-hover);border:1px solid var(--border)}
 .badge-running{border-color:var(--ok);color:var(--ok);background:transparent}
 .badge-stopped{border-color:var(--danger);color:var(--danger);background:transparent}
+.badge-source-held{border-color:var(--warn);color:var(--warn);background:transparent}
+
+/* Sources panel manual toggle -- small on/off switch, same interaction
+   pattern as a native checkbox but visually clearer at a glance across a
+   table of many rows. */
+.switch{position:relative;display:inline-block;width:34px;height:18px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.switch-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--bg-hover);border:1px solid var(--border);border-radius:18px;transition:.15s}
+.switch-slider:before{position:absolute;content:"";height:12px;width:12px;left:2px;bottom:2px;background:var(--text-muted);border-radius:50%;transition:.15s}
+.switch input:checked + .switch-slider{border-color:var(--ok);background:rgba(63,185,80,.12)}
+.switch input:checked + .switch-slider:before{transform:translateX(16px);background:var(--ok)}
 
 /* htmx loading states */
 .htmx-request .btn-primary,

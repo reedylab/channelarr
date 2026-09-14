@@ -71,8 +71,17 @@ def _pick_working_manifest(ch):
     behavior: heavy-refresh the primary via the sidecar and use it
     best-effort, so a channel with no working fallback is no worse off than
     before this existed.
+
+    A candidate whose source (per core.source_registry) is currently
+    disabled -- manually, or auto-held on sustained failures -- is skipped
+    outright, without even a light-refresh attempt, exactly like every
+    other exhausted candidate. This is the "a domain that's down doesn't
+    need to be tried on every channel that lists it as primary" enforcement
+    point from the Sources panel design -- see [[project_source_health_panel]].
     """
+    from urllib.parse import urlparse
     from core.resolver.manifest_resolver import ManifestResolverService
+    from core.source_registry import is_domain_enabled
 
     primary_id = ch.get("manifest_id")
     default_mode = ch.get("encoder_mode", "proxy")
@@ -88,6 +97,12 @@ def _pick_working_manifest(ch):
     for i, cand in enumerate(candidates):
         mid, murl = cand.get("manifest_id"), cand.get("manifest_url")
         if not mid or not murl:
+            continue
+        cand_domain = urlparse(murl).netloc
+        cand_enabled, cand_reason = is_domain_enabled(cand_domain)
+        if not cand_enabled:
+            logging.info("[HLS] %s: skipping candidate #%d (%s) — %s",
+                         ch.get("id"), i, mid, cand_reason)
             continue
         mode = fb_modes.get(mid, default_mode) if i > 0 else default_mode
         kind = fb_kinds.get(mid, default_kind) if i > 0 else default_kind

@@ -517,6 +517,14 @@ def _call_sidecar(url: str, timeout: int, priority: str = "high") -> dict:
     on-demand) request. See selenium-uc/app.py's _PriorityLock. Anything but
     an explicit "low" behaves like a plain mutex on the sidecar side, so the
     default here preserves prior behavior for every existing caller."""
+    from urllib.parse import urlparse
+    from core.source_registry import is_domain_enabled
+    domain = urlparse(url).netloc
+    enabled, reason = is_domain_enabled(domain)
+    if not enabled:
+        logger.info("[RESOLVER] Skipping %s — source disabled (%s)", url, reason)
+        return {"ok": False, "error": f"source disabled: {reason}"}
+
     native = _native_resolver()
     if native is not None:
         try:

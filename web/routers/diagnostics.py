@@ -66,13 +66,34 @@ def diagnostics_sources():
     fine from a direct, non-VPN connection at the same moment) -- the UI
     shows the raw data, a human makes the call. Must be registered before
     /diagnostics/{channel_id} (below) so "sources" doesn't get swallowed
-    as a channel_id path param."""
+    as a channel_id path param.
+
+    Pass 2 adds `sources`: every plugin-declared Source (core/
+    source_registry.py), its manual toggle state, whether it's currently
+    auto-held on sustained failures, and the ANDed effective_enabled --
+    the actual data backing enforcement in _call_sidecar and
+    _pick_working_manifest, not a separate parallel view of it."""
     from core.block_detector import get_all_domain_status
     from core.vpn_monitor import get_block_rotation_status
+    from core.source_registry import list_source_status
     return {
         "domains": sorted(get_all_domain_status(), key=lambda d: d["last_failure_at"], reverse=True),
         "vpn_block_rotation": get_block_rotation_status(),
+        "sources": list_source_status(),
     }
+
+
+@router.post("/diagnostics/sources/{source_id}/toggle")
+def diagnostics_toggle_source(source_id: str, body: dict):
+    """Manual on/off for a plugin-declared Source -- the only write path
+    into SourceToggle (core/source_registry.py::set_manual_enabled). Body:
+    {"enabled": bool}. This never touches auto_held -- that stays a live,
+    self-healing computation off block_detector's failure history, not a
+    stored flag this endpoint could get out of sync with."""
+    from core.source_registry import set_manual_enabled, list_source_status
+    enabled = bool(body.get("enabled", True))
+    set_manual_enabled(source_id, enabled)
+    return {"ok": True, "sources": list_source_status()}
 
 
 @router.get("/diagnostics/{channel_id}/stream")

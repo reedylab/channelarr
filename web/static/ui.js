@@ -4132,7 +4132,52 @@ function loadSourcesPanel() {
   fetch(`${API}/diagnostics/sources`).then(r => r.json()).then(renderSourcesPanel).catch(() => {});
 }
 
+function renderSourceTogglesPanel(sources) {
+  const tbody = $("#source-toggles-tbody");
+  if (!tbody) return;
+  if (!sources || !sources.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No plugin sources declared.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = sources.map(s => {
+    let statusHtml;
+    if (!s.manual_enabled) {
+      statusHtml = '<span class="badge badge-stopped">Off (manual)</span>';
+    } else if (s.auto_held) {
+      statusHtml = `<span class="badge badge-source-held" title="Auto-held: sustained failures on ${esc(s.auto_hold_domain || "")}">Auto-held</span>`;
+    } else {
+      statusHtml = '<span class="badge badge-running">Active</span>';
+    }
+    return `
+    <tr>
+      <td>${esc(s.display_name)}<div class="text-muted" style="font-size:11px">${esc((s.domains || []).join(", "))}</div></td>
+      <td>${esc((s.categories || []).join(", "))}</td>
+      <td>${statusHtml}</td>
+      <td>
+        <label class="switch" title="${s.manual_enabled ? 'Click to manually disable' : 'Click to re-enable'}">
+          <input type="checkbox" ${s.manual_enabled ? "checked" : ""}
+                 onchange="channelarr.toggleSource('${esc(s.source_id)}', this.checked)">
+          <span class="switch-slider"></span>
+        </label>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function toggleSource(sourceId, enabled) {
+  fetch(`${API}/diagnostics/sources/${encodeURIComponent(sourceId)}/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  }).then(r => r.json()).then(data => {
+    if (data.sources) renderSourceTogglesPanel(data.sources);
+  }).catch(() => { loadSourcesPanel(); });
+}
+
+channelarr.toggleSource = toggleSource;
+
 function renderSourcesPanel(data) {
+  renderSourceTogglesPanel(data.sources);
   const vpn = data.vpn_block_rotation || {};
   const backoffEl = $("#vpn-backoff-status");
   if (vpn.last_block_domains && vpn.last_block_domains.length) {
