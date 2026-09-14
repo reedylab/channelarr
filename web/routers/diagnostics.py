@@ -99,14 +99,38 @@ def diagnostics_player_rankings(channel_id: str):
         return {"channel_id": channel_id, "primary_path": None, "paths": []}
 
     ch = shared_state.channel_mgr.get_channel(channel_id)
-    primary_path = (player_health.get_primary_player_path(ch["manifest_id"])
-                     if ch and ch.get("manifest_id") else None)
+    primary_manifest_id = ch.get("manifest_id") if ch else None
+    primary_path = (player_health.get_primary_player_path(primary_manifest_id)
+                     if primary_manifest_id else None)
+
+    # Map each tracked path back to a real, switchable manifest_id where one
+    # exists -- "(player: X)" tagged fallbacks for intra-source sub-paths,
+    # or the manifest_id itself for foreign-fallback-tracked rows (see
+    # player_evaluator._foreign_fallback_targets, which uses the raw
+    # manifest_id AS the player_path key). Lets the UI offer "make primary"
+    # only for candidates that actually correspond to a real, resolvable
+    # manifest -- an untested sub-path with no stored fallback yet has
+    # nothing to switch to.
+    manifest_id_by_path = {}
+    for fb in (ch.get("fallback_sources") or []) if ch else []:
+        mid = fb.get("manifest_id")
+        if not mid:
+            continue
+        title = fb.get("title") or ""
+        path = title.rsplit("(player: ", 1)[1].rstrip(")") if "(player: " in title else mid
+        manifest_id_by_path[path] = mid
 
     paths = [
         {
             "path": path,
+            # Opaque display text sourced from whichever plugin/manifest
+            # discovered this candidate (see PlayerHealthScore.label) --
+            # falls back to the bare path for older/unlabeled rows.
+            "label": row.label or path,
             "score": round(player_health.score_of(row), 3),
             "is_primary": path == primary_path,
+            "manifest_id": (primary_manifest_id if path == primary_path
+                           else manifest_id_by_path.get(path)),
             "success_count": row.success_count,
             "failure_count": row.failure_count,
             "consecutive_failures": row.consecutive_failures,

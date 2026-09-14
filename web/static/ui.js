@@ -4134,6 +4134,34 @@ channelarr.diagReload = async function(channelId) {
   }
 };
 
+channelarr.makePrimary = async function(channelId, manifestId) {
+  // Cheap and reversible on the backend (the old primary just becomes the
+  // first fallback — calling this again with its manifest_id swaps back),
+  // but it does stop whatever's currently playing, so still worth a
+  // confirm rather than a stray click silently interrupting a viewer.
+  if (!confirm("Switch the primary source to this candidate? The channel will restart on the next play request.")) return;
+  toast("info", "Switching primary source…");
+  try {
+    const r = await fetch(`${API}/channels/${encodeURIComponent(channelId)}/set-primary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest_id: manifestId }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      toast("error", d.error || "Failed to switch primary source.");
+      return;
+    }
+    toast("success", "Primary source switched — will take effect on next play.");
+    if (diagModalChannelId === channelId) {
+      loadDiagModalData();
+      loadDiagModalPlayerRankings();
+    }
+  } catch (e) {
+    toast("error", "Failed to switch primary source.");
+  }
+};
+
 channelarr.showDiagnostics = function(id, name) {
   diagModalChannelId = id;
   diagModalChannelName = name;
@@ -4198,12 +4226,19 @@ async function loadDiagModalPlayerRankings() {
       const age = p.last_probed_at ? formatRelativeTime(p.last_probed_at) : "never";
       const statusIcon = p.last_ok === true ? "&#10003;" : p.last_ok === false ? "&#10007;" : "?";
       const statusColor = p.last_ok === true ? "var(--ok)" : p.last_ok === false ? "var(--danger)" : "var(--muted)";
+      // Only a candidate with a real, stored manifest behind it can
+      // actually be switched to -- an untested sub-path that's never
+      // resolved into a stored fallback yet has nothing to point at.
+      const switchBtn = (!p.is_primary && p.manifest_id)
+        ? `<button class="btn-sm" onclick="channelarr.makePrimary('${diagModalChannelId}','${p.manifest_id}')" title="Make this the primary source">Make Primary</button>`
+        : "";
       return `<div class="player-rank-row${p.is_primary ? " player-rank-primary" : ""}">
-        <span class="player-rank-path">${esc(p.path)}${p.is_primary ? " <b>(primary)</b>" : ""}</span>
+        <span class="player-rank-path">${esc(p.label || p.path)}${p.is_primary ? " <b>(primary)</b>" : ""}</span>
         <span class="player-rank-bar-track"><span class="player-rank-bar" style="width:${pct}%;background:${barColor}"></span></span>
         <span class="player-rank-pct">${pct}%</span>
         <span style="color:${statusColor}" title="${p.last_error ? esc(p.last_error) : "ok"}">${statusIcon}</span>
         <span class="text-muted" style="font-size:11px">${age}</span>
+        ${switchBtn}
       </div>`;
     }).join("");
     el.innerHTML = `<div class="player-rank-title text-muted">Player path rankings</div>${rows}`;
