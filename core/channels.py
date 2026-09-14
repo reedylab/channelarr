@@ -164,12 +164,18 @@ def _db_upsert(channel: dict):
 
 def _db_delete(channel_id: str):
     from core.database import get_session
-    from core.models import Channel as ChannelRow
+    from core.models import Channel as ChannelRow, PlayerHealthScore
 
     with get_session() as session:
         row = session.query(ChannelRow).filter_by(id=channel_id).first()
         if row is not None:
             session.delete(row)
+        # No FK/cascade between player_health_scores and channels (channel_id
+        # there is a plain string, not a relationship) -- without this a
+        # deleted channel's tracked candidate scores just sit orphaned
+        # forever, since nothing ever queries them again for a dead
+        # channel_id. Delete unconditionally, even if row was already gone.
+        session.query(PlayerHealthScore).filter_by(channel_id=channel_id).delete()
 
 
 # B5: JSON safety net is retired. Postgres is the only source of truth.
@@ -1082,7 +1088,7 @@ def cleanup_expired_event_channels():
 
     try:
         from core.database import get_session
-        from core.models import Channel as ChannelRow, Manifest
+        from core.models import Channel as ChannelRow, Manifest, PlayerHealthScore
         now = datetime.now(timezone.utc)
         grace_cutoff = now - timedelta(hours=CLEANUP_GRACE_HOURS)
         fallback = timedelta(hours=EVENT_FALLBACK_HOURS)
@@ -1121,6 +1127,7 @@ def cleanup_expired_event_channels():
                 mid = row.manifest_id
                 cid = row.id
                 session.delete(row)
+                session.query(PlayerHealthScore).filter_by(channel_id=cid).delete()
                 session.flush()
                 if mid:
                     other = session.query(ChannelRow.id).filter(ChannelRow.manifest_id == mid).first()
