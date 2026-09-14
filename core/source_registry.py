@@ -42,6 +42,7 @@ import importlib.util
 import logging
 import os
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,23 @@ SCRAPERS_DIR = os.getenv("SCRAPERS_DIR", "/app/scrapers")
 AUTO_HOLD_MIN_CONSECUTIVE_FAILURES = 5
 AUTO_HOLD_MIN_DURATION_SECONDS = 300  # 5 minutes of continuous failure
 
+# Once held, is_domain_enabled() skips the caller's network call entirely --
+# which means block_detector's failure/success history for that domain
+# stops updating too (nothing left to record), freezing it "held" for a
+# full DOMAIN_HISTORY_STALE_SECONDS (1h) even if the underlying source
+# would have worked on the very next attempt. Confirmed real 2026-09-14:
+# a channel resolved successfully MINUTES before its own domain tripped
+# back into auto_held on the next failure streak -- proving a real,
+# non-trivial hit rate, not "hard down." A pure hold can't tell
+# "mostly down" from "fully down" apart, so it lets exactly one probe
+# through per cooldown window instead of a blind hour-long blackout --
+# still far less frequent than an unthrottled retry storm, but detects
+# real recovery in minutes instead of up to an hour.
+AUTO_HOLD_PROBE_COOLDOWN_SECONDS = 120
+
 _lock = threading.Lock()
 _declared_cache: list[dict] | None = None
+_last_probe_allowed_at: dict[str, float] = {}
 
 
 def _load_module(path: str, name: str):
@@ -183,9 +199,7 @@ def _auto_held_domains() -> dict[str, dict]:
     out of get_all_domain_status() entirely, so it drops out of this set on
     the very next call too -- no separate reset path needed."""
     from core.block_detector import get_all_domain_status
-    import time
     held = {}
-    now = time.time()
     for status in get_all_domain_status():
         if status["consecutive_failures"] < AUTO_HOLD_MIN_CONSECUTIVE_FAILURES:
             continue
@@ -196,11 +210,35 @@ def _auto_held_domains() -> dict[str, dict]:
     return held
 
 
+def _probe_allowed(domain: str) -> bool:
+    """Rate-limited escape hatch for an auto_held domain: lets exactly one
+    caller through per AUTO_HOLD_PROBE_COOLDOWN_SECONDS so real recovery
+    gets detected instead of a domain sitting fully blacked out until it
+    goes stale. See AUTO_HOLD_PROBE_COOLDOWN_SECONDS's own comment for why
+    this exists. Keyed under _lock so a burst of concurrent callers (e.g.
+    several race candidates checking at once) only ever lets ONE through
+    per window, not all of them at once."""
+    now = time.time()
+    with _lock:
+        last = _last_probe_allowed_at.get(domain, 0.0)
+        if now - last < AUTO_HOLD_PROBE_COOLDOWN_SECONDS:
+            return False
+        _last_probe_allowed_at[domain] = now
+        return True
+
+
 def is_domain_enabled(domain: str) -> tuple:
     """(enabled, reason) for a domain about to be resolved/served. Reason is
     None when enabled, else a short human-readable string. A domain with no
     declared source at all always passes through enabled -- this can only
-    gate sources that actually declared themselves, never an unknown host."""
+    gate sources that actually declared themselves, never an unknown host.
+
+    An auto_held domain isn't a hard block -- see _probe_allowed's own
+    docstring. If the caller's attempt succeeds, block_detector.
+    record_success() clears the domain's failure history and it drops out
+    of _auto_held_domains() on the very next check; if it fails, the normal
+    record_possible_block() call refreshes last_failure_at and the domain
+    stays held for another cooldown window."""
     if not domain:
         return True, None
     sources = find_sources_for_domain(domain)
@@ -213,6 +251,9 @@ def is_domain_enabled(domain: str) -> tuple:
     held = _auto_held_domains()
     for held_domain in held:
         if _domain_matches(domain, held_domain):
+            if _probe_allowed(held_domain):
+                logger.info("[SOURCES] %s: auto_held but cooldown elapsed -- letting one probe through", held_domain)
+                return True, None
             return False, f"auto-held: sustained failures on {held_domain}"
     return True, None
 
