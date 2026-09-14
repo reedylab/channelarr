@@ -664,7 +664,7 @@ class ProxyStream:
                         if isinstance(err, http_requests.exceptions.ConnectionError):
                             try:
                                 from core.block_detector import record_possible_block
-                                record_possible_block(urlparse(uri).netloc)
+                                record_possible_block(urlparse(uri).netloc, error=str(err))
                             except Exception:
                                 pass
 

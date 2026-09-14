@@ -48,6 +48,31 @@ _last_block_rotation_domains: frozenset = frozenset()
 _BLOCK_BACKOFF_CAP_MULTIPLIER = 32  # e.g. 10min base -> capped at ~5h20m
 
 
+def get_block_rotation_status() -> dict:
+    """Read-only snapshot for the Diagnostics Sources panel: what domains
+    (if any) last triggered a block-based auto-rotation, how many times
+    in a row it's had to back off, and when the next block-triggered
+    rotation attempt is actually eligible to fire. Pure computation, no
+    I/O -- safe to call from a request handler."""
+    from core.config import get_setting
+    try:
+        block_minutes = int(get_setting("vpn_block_rotate_min_interval_minutes", "10") or "10")
+    except (ValueError, TypeError):
+        block_minutes = 10
+    effective_minutes = min(block_minutes * _block_rotation_backoff_multiplier,
+                            block_minutes * _BLOCK_BACKOFF_CAP_MULTIPLIER)
+    next_eligible_at = None
+    if _last_rotate_at:
+        next_eligible_at = _last_rotate_at + timedelta(minutes=effective_minutes)
+    return {
+        "last_block_domains": sorted(_last_block_rotation_domains),
+        "backoff_multiplier": _block_rotation_backoff_multiplier,
+        "effective_interval_minutes": effective_minutes,
+        "last_rotate_at": _last_rotate_at.isoformat() if _last_rotate_at else None,
+        "next_eligible_rotation_at": next_eligible_at.isoformat() if next_eligible_at else None,
+    }
+
+
 def _get_auth_and_url():
     """Resolve gluetun control config from env vars via core.config."""
     from core.config import get_setting

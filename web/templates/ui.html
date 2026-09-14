@@ -244,6 +244,27 @@
             </div>
           </div>
         </div>
+
+        <div class="panel" id="sources-panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h3>Sources</h3>
+            <div class="panel-actions">
+              <span class="text-muted" style="font-size:12px">Domains with recent connection-level failures -- raw signal only, no down/blocked verdict (see tooltip)</span>
+              <button class="btn btn-ghost btn-sm-header" onclick="channelarr.loadSourcesPanel()">Refresh</button>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div id="vpn-backoff-status" class="text-muted" style="font-size:13px;margin-bottom:12px"></div>
+            <table class="tbl sources-tbl" id="sources-table">
+              <thead>
+                <tr><th>Domain</th><th>Consecutive Failures</th><th>First Failure</th><th>Last Failure</th><th>Last Error</th></tr>
+              </thead>
+              <tbody id="sources-tbody">
+                <tr><td colspan="5" class="empty-state">No domains with recent failures.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <!-- SCRAPERS -->

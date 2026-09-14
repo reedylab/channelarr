@@ -88,7 +88,7 @@ function switchView(view) {
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
   if (view === "resolver") loadResolver();
-  if (view === "diagnostics") loadDiagnostics();
+  if (view === "diagnostics") { loadDiagnostics(); loadSourcesPanel(); }
   if (view === "settings") {
     // Auto-expand subnav and load active sub-tab
     const parentBtn = document.querySelector('[data-view="settings"]');
@@ -4106,6 +4106,61 @@ function renderDiagnosticsGrid(streams) {
       </div>`;
   }).join("");
 }
+
+// Relative-time formatter shared by the Sources panel below — no existing
+// helper for this in the file, small enough not to warrant a new module.
+function relTimeAgo(isoOrEpoch) {
+  if (!isoOrEpoch) return "--";
+  const then = typeof isoOrEpoch === "number" ? isoOrEpoch * 1000 : new Date(isoOrEpoch).getTime();
+  const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  if (diffSec < 3600) return `${Math.round(diffSec / 60)}m ago`;
+  if (diffSec < 86400) return `${Math.round(diffSec / 3600)}h ago`;
+  return `${Math.round(diffSec / 86400)}d ago`;
+}
+
+function relTimeUntil(iso) {
+  if (!iso) return null;
+  const diffSec = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (diffSec <= 0) return "eligible now";
+  if (diffSec < 60) return `${diffSec}s`;
+  if (diffSec < 3600) return `${Math.round(diffSec / 60)}m`;
+  return `${Math.round(diffSec / 3600)}h ${Math.round((diffSec % 3600) / 60)}m`;
+}
+
+function loadSourcesPanel() {
+  fetch(`${API}/diagnostics/sources`).then(r => r.json()).then(renderSourcesPanel).catch(() => {});
+}
+
+function renderSourcesPanel(data) {
+  const vpn = data.vpn_block_rotation || {};
+  const backoffEl = $("#vpn-backoff-status");
+  if (vpn.last_block_domains && vpn.last_block_domains.length) {
+    const until = relTimeUntil(vpn.next_eligible_rotation_at);
+    backoffEl.innerHTML = `VPN auto-rotation last triggered by: <strong>${esc(vpn.last_block_domains.join(", "))}</strong>` +
+      ` &middot; backoff &times;${vpn.backoff_multiplier} (${vpn.effective_interval_minutes}min interval)` +
+      (until ? ` &middot; next eligible rotation: <strong>${until}</strong>` : "");
+  } else {
+    backoffEl.innerHTML = "No VPN block-rotation currently active.";
+  }
+
+  const tbody = $("#sources-tbody");
+  const domains = data.domains || [];
+  if (!domains.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No domains with recent failures.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = domains.map(d => `
+    <tr>
+      <td>${esc(d.domain)}</td>
+      <td>${d.consecutive_failures}</td>
+      <td>${relTimeAgo(d.first_failure_at)}</td>
+      <td>${relTimeAgo(d.last_failure_at)}</td>
+      <td class="text-muted" style="font-size:12px">${esc((d.last_error || "").slice(0, 100))}</td>
+    </tr>`).join("");
+}
+
+channelarr.loadSourcesPanel = loadSourcesPanel;
 
 // Physical stop / stall-recovery reload — same operation whether fired from
 // a dashboard card or the drill-down modal. There's no per-viewer session

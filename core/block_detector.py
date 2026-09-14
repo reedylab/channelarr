@@ -41,15 +41,69 @@ MIN_DISTINCT_DOMAINS = 2
 _lock = threading.Lock()
 _recent: dict[str, float] = {}  # domain -> last-seen-blocked-at (monotonic-ish, time.time())
 
+# Richer per-domain history, kept alongside _recent rather than replacing
+# it -- _recent/WINDOW_SECONDS stays exactly as-is (the cross-domain IP-
+# block signal this module was built for), this is additive state for the
+# Diagnostics "Sources" panel: how long has THIS domain specifically been
+# failing, how many times in a row, what was the last error. Deliberately
+# NOT auto-pruned on the same short WINDOW_SECONDS -- a domain that's been
+# failing for an hour should still show that full streak, not just
+# whatever's left in the last 180s. Pruned instead by DOMAIN_HISTORY_
+# STALE_SECONDS (a success, or just enough quiet time, retires an entry).
+DOMAIN_HISTORY_STALE_SECONDS = 3600  # 1h with no new failure -> drop it
+_domain_history: dict[str, dict] = {}
+# domain -> {"first_failure_at": float, "last_failure_at": float,
+#            "consecutive_failures": int, "last_error": str|None}
 
-def record_possible_block(domain: str) -> None:
+
+def record_possible_block(domain: str, error: str | None = None) -> None:
     """Call this from a genuine connection-level failure only (refused/
     reset/DNS-failed) -- see module docstring for why generic HTTP errors
-    don't belong here."""
+    don't belong here. `error` is optional (most call sites already have
+    the exception message in hand) -- purely informational, shown on the
+    Diagnostics Sources panel, never used for any decision-making here."""
+    if not domain:
+        return
+    now = time.time()
+    with _lock:
+        _recent[domain] = now
+        h = _domain_history.get(domain)
+        if h is None:
+            h = {"first_failure_at": now, "consecutive_failures": 0}
+            _domain_history[domain] = h
+        h["last_failure_at"] = now
+        h["consecutive_failures"] += 1
+        h["last_error"] = error
+
+
+def record_success(domain: str) -> None:
+    """Call this once a request to `domain` genuinely succeeds -- ends
+    whatever failure streak _domain_history was tracking for it. Separate
+    from _recent (the cross-domain block-signal window) deliberately --
+    a single success doesn't retroactively un-flag an IP block that was
+    real a moment ago, it just means THIS domain specifically is reachable
+    again right now."""
     if not domain:
         return
     with _lock:
-        _recent[domain] = time.time()
+        _domain_history.pop(domain, None)
+
+
+def get_all_domain_status() -> list[dict]:
+    """Snapshot of every domain with a recent failure streak, for the
+    Diagnostics Sources panel. Prunes anything stale (no new failure in
+    DOMAIN_HISTORY_STALE_SECONDS) while it's at it. Returns dicts with
+    domain, first_failure_at, last_failure_at, consecutive_failures,
+    last_error -- deliberately NOT a "status" verdict (down/blocked/ok) --
+    see this module's own docstring on why that distinction can't be
+    determined from our own network's failures alone; the UI shows the
+    raw signal and leaves the judgment call to a human."""
+    cutoff = time.time() - DOMAIN_HISTORY_STALE_SECONDS
+    with _lock:
+        stale = [d for d, h in _domain_history.items() if h["last_failure_at"] < cutoff]
+        for d in stale:
+            _domain_history.pop(d, None)
+        return [dict(domain=d, **h) for d, h in _domain_history.items()]
 
 
 def distinct_recent_blocked_domains() -> list[str]:

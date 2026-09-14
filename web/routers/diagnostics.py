@@ -53,6 +53,28 @@ def diagnostics_live():
     return {"streams": get_live_snapshot(statuses)}
 
 
+@router.get("/diagnostics/sources")
+def diagnostics_sources():
+    """Read-only source/domain health panel -- Pass 1 of the "source
+    control panel" design: raw failure signal (which domains, how long,
+    how many times in a row, last error) plus the VPN block-rotation
+    backoff state (when the next block-triggered rotation is actually
+    eligible to fire), all in one place. Deliberately does NOT classify
+    a domain as "down" vs "blocked" -- confirmed live this session that
+    distinction can't be reliably made from our own network's failures
+    alone (a domain that looked identically dead from here was reachable
+    fine from a direct, non-VPN connection at the same moment) -- the UI
+    shows the raw data, a human makes the call. Must be registered before
+    /diagnostics/{channel_id} (below) so "sources" doesn't get swallowed
+    as a channel_id path param."""
+    from core.block_detector import get_all_domain_status
+    from core.vpn_monitor import get_block_rotation_status
+    return {
+        "domains": sorted(get_all_domain_status(), key=lambda d: d["last_failure_at"], reverse=True),
+        "vpn_block_rotation": get_block_rotation_status(),
+    }
+
+
 @router.get("/diagnostics/{channel_id}/stream")
 async def diagnostics_channel_stream(channel_id: str, request: Request):
     from core.diagnostics import get_summary, subscribe, unsubscribe
