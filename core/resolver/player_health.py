@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 _ScoreSnapshot = namedtuple(
     "_ScoreSnapshot",
     "player_path success_count failure_count consecutive_successes "
-    "consecutive_failures last_probed_at last_ok last_latency_ms last_error",
+    "consecutive_failures last_probed_at last_ok last_latency_ms last_error "
+    "label",
 )
 
 # A tracked path's score is trusted as current for this long before the
@@ -95,6 +96,7 @@ def get_scores(channel_id: str) -> dict:
                 last_ok=r.last_ok,
                 last_latency_ms=r.last_latency_ms,
                 last_error=r.last_error,
+                label=r.label,
             )
             for r in rows
         }
@@ -107,7 +109,8 @@ def _is_stale(row: "_ScoreSnapshot | None") -> bool:
 
 
 def record_probe(channel_id: str, player_path: str, ok: bool,
-                  latency_ms: float | None = None, error: str | None = None) -> None:
+                  latency_ms: float | None = None, error: str | None = None,
+                  label: str | None = None) -> None:
     with get_session() as session:
         row = (session.query(PlayerHealthScore)
                .filter_by(channel_id=channel_id, player_path=player_path).first())
@@ -128,6 +131,12 @@ def record_probe(channel_id: str, player_path: str, ok: bool,
         row.last_ok = ok
         row.last_latency_ms = latency_ms
         row.last_error = error
+        # Only overwrite when this probe actually carried one -- a re-probe
+        # that fails before discovering a label (e.g. a candidate path
+        # never resolved a manifest this round) shouldn't erase one
+        # recorded earlier.
+        if label:
+            row.label = label
 
     # The moment a score changes is the moment the chain's try-order should
     # reflect it — this is deliberately separate from (and much less
@@ -157,10 +166,19 @@ def _reorder_fallbacks_by_score(channel_id: str) -> None:
     scores = get_scores(channel_id)
 
     def _score_for(fb):
+        # "(player: X)" fallbacks are sub-paths of the SAME source's own
+        # multi-player picker, tracked under that path name (discover_and_
+        # record). A fallback without that tag is a genuinely separate
+        # source entirely -- manually added, or from a different plugin/
+        # site -- tracked under its own manifest_id instead (see
+        # player_evaluator.py's warming rotation, which probes both kinds
+        # into this same table). Either way: real history if we have it,
+        # neutral 0.5 if this candidate has never been probed yet.
         title = fb.get("title") or ""
-        if "(player: " not in title:
-            return 0.5  # untagged/legacy fallback -- no history to judge it by
-        path = title.rsplit("(player: ", 1)[1].rstrip(")")
+        if "(player: " in title:
+            path = title.rsplit("(player: ", 1)[1].rstrip(")")
+        else:
+            path = fb.get("manifest_id")
         return score_of(scores.get(path))
 
     ranked = sorted(fallbacks, key=_score_for, reverse=True)
@@ -208,7 +226,8 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
 
     for item in results:
         record_probe(channel_id, item["path"], item["ok"],
-                     latency_ms=item.get("latency_ms"), error=item.get("error"))
+                     latency_ms=item.get("latency_ms"), error=item.get("error"),
+                     label=item.get("label"))
         item["page_url"] = page_url
 
     logger.info("[PLAYER-HEALTH] channel %s: probed %d player path(s), %d healthy",
@@ -265,7 +284,10 @@ def maybe_promote_best_player(channel_id: str) -> bool:
     (has a stored Manifest for) — a path scoring well in player_health but
     with no corresponding fallback manifest yet (e.g. discovery hasn't
     stored it, or it failed the probe this round) can't be promoted to,
-    there'd be nothing to actually stream.
+    there'd be nothing to actually stream. This now includes fallbacks from
+    entirely different sources/plugins, not just sub-paths of the primary's
+    own multi-player picker — see _reorder_fallbacks_by_score's docstring
+    for the same "(player: X)" vs. manifest_id-keyed distinction.
     """
     from web import shared_state
 
@@ -278,14 +300,13 @@ def maybe_promote_best_player(channel_id: str) -> bool:
     scores = get_scores(channel_id)
     primary_score = score_of(scores.get(primary_path))
 
-    # Map each stored fallback manifest back to its player_path via the
-    # title convention discover_and_store_fallbacks uses ("... (player: X)").
     best_path, best_manifest_id, best_score = None, None, primary_score
     for fb in (ch.get("fallback_sources") or []):
         title = fb.get("title") or ""
-        if "(player: " not in title:
-            continue
-        path = title.rsplit("(player: ", 1)[1].rstrip(")")
+        if "(player: " in title:
+            path = title.rsplit("(player: ", 1)[1].rstrip(")")
+        else:
+            path = fb.get("manifest_id")
         row = scores.get(path)
         if row is None or (row.success_count + row.failure_count) < PROMOTE_MIN_SAMPLES:
             continue
@@ -315,6 +336,32 @@ def maybe_promote_best_player(channel_id: str) -> bool:
 # line and a dashboard badge.
 _STRUGGLING_SOURCE_STALLS_5M = 2
 
+# A channel stuck in a fail/refresh loop (confirmed live: FOX's entire
+# player family down at once, repeatedly 403ing) stops producing
+# samples entirely rather than producing bad ones -- quality's rolling
+# window just keeps averaging whatever it had from BEFORE things broke,
+# reading "good" for minutes after a channel has actually gone completely
+# silent. seconds_since_last_activity is the direct complement: it doesn't
+# care what the old samples say, only whether new ones are still arriving.
+# Threshold is deliberately looser than SOURCE_STALL_SECONDS (15s, proxy_
+# stream's own "upstream playlist stopped advancing" detector on an
+# otherwise-succeeding stream) -- this is a coarser, independent backstop
+# for total silence, not a replacement for that finer-grained one, so it's
+# fine (better, even) if it reacts a bit slower.
+_SILENT_FAILURE_SECONDS = 45.0
+
+# A channel that produced a real sample this recently is not struggling,
+# full stop — checked BEFORE quality/error-count below, not just alongside
+# them. Confirmed live (2026-09-14): a Cartoon Network stream got forcibly
+# restarted onto a worse-scoring alternate one second after successfully
+# downloading a segment, because quality/error-count reflected stale data
+# (an old player_health score from an earlier probe, an error from
+# minutes ago still sitting in the 5-minute window) that had nothing to do
+# with how the stream was actually doing that second. Recent, real
+# production is the highest-trust signal there is and overrides every
+# other (necessarily backward-looking) signal below it.
+_RECENT_ACTIVITY_GRACE_SECONDS = 15.0
+
 
 def _channel_is_struggling(channel_id: str) -> bool:
     from core.diagnostics import get_summary
@@ -322,8 +369,16 @@ def _channel_is_struggling(channel_id: str) -> bool:
         summary = get_summary(channel_id)
     except Exception:
         return False
-    return (summary.get("quality") == "bad"
-            or (summary.get("source_stalls_last_5m") or 0) >= _STRUGGLING_SOURCE_STALLS_5M)
+
+    seconds_since = summary.get("seconds_since_last_activity")
+    if seconds_since is not None and seconds_since < _RECENT_ACTIVITY_GRACE_SECONDS:
+        return False
+
+    if summary.get("quality") == "bad":
+        return True
+    if (summary.get("source_stalls_last_5m") or 0) >= _STRUGGLING_SOURCE_STALLS_5M:
+        return True
+    return seconds_since is not None and seconds_since >= _SILENT_FAILURE_SECONDS
 
 
 def _restart_channel(channel_id: str) -> None:

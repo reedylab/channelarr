@@ -29,6 +29,14 @@ class PlayerHealthScore(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     channel_id = Column(String, nullable=False, index=True)
     player_path = Column(String, nullable=False)
+    # Opaque display text for this candidate -- e.g. a source page's own
+    # "Server 3" / "CBS" label, or a resolved player host. Comes from
+    # whichever plugin/manifest discovered the candidate; this table
+    # and everything that reads it just carries the string through without
+    # knowing what it means, so no target-site name ever needs to live here.
+    # None for older rows / candidates discovered before this existed --
+    # callers fall back to player_path itself for display in that case.
+    label = Column(String, nullable=True)
 
     success_count = Column(Integer, nullable=False, default=0)
     failure_count = Column(Integer, nullable=False, default=0)
