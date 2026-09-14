@@ -300,6 +300,25 @@ _relay_sessions_starting: set = set()
 _RELAY_MAX_SESSIONS = int(os.getenv("SIDECAR_MAX_RELAY_SESSIONS", "2"))
 _RELAY_IDLE_TIMEOUT_SECONDS = int(os.getenv("SIDECAR_RELAY_IDLE_TIMEOUT_SECONDS", "45"))
 _RELAY_SWEEP_INTERVAL = int(os.getenv("SIDECAR_RELAY_SWEEP_INTERVAL", "15"))
+# Real, confirmed-live incident that motivated this: a relay session's own
+# tab/recording is a genuinely different resource-commitment shape than an
+# ephemeral capture (see the "Deliberately NOT gated" docstring below), but
+# it still shares the SAME Chrome process/CPU/Xvfb display as every
+# ephemeral capture running concurrently. Not being gated by _slots means
+# it never *queues* for a tab, but does nothing to protect it from CPU
+# contention once it's running -- confirmed live: a burst of concurrent
+# background captures (player_health re-probing a fully-down source
+# repeatedly) pinned CPU high enough that a live relay session's own poll
+# responses stopped arriving in time, misread as "recording died" even
+# though the actual <video>/MediaRecorder inside the tab was fine the
+# whole time (direct debug-eval check confirmed this). Same principle as
+# proxy_stream.py's adaptive catch-up threading -- escalate/reserve real
+# resources only when something specific needs protecting, not as a
+# blanket always-on cost -- applied to the opposite lever here: shrink
+# ephemeral capture concurrency automatically, only while a relay session
+# actually needs the headroom, by having each active relay session reserve
+# real slots out of the SAME _slots pool ephemeral captures draw from.
+_RELAY_RESERVED_TABS = int(os.getenv("SIDECAR_RELAY_RESERVED_TABS", "2"))
 
 
 class PrioritySemaphore:
@@ -532,6 +551,12 @@ def _proc_age_seconds(pid: int) -> float | None:
 
 
 _protected_renderer_pids: set[int] = set()
+# Incrementally-adopted protection for renderers belonging to active relay
+# sessions -- see _reap_orphaned_renderers' docstring for the full story on
+# why the startup-time-only _protected_renderer_pids baseline above isn't
+# enough once tab_relay (long-lived tabs) exists alongside it.
+_relay_protected_pids: set[int] = set()
+_relay_sessions_were_active = False
 
 
 def _renderer_pids_now() -> set[int]:
@@ -590,10 +615,58 @@ async def _reap_orphaned_renderers(grace_seconds: int = 120):
     ephemeral capture tab lives anywhere near that long -- and gets killed
     directly by PID. grace_seconds defaults well above the ~105s outer
     per-capture deadline specifically so a real, still-in-flight capture
-    is never mistaken for a leak."""
+    is never mistaken for a leak.
+
+    THIS WAS WRONG FOR RELAY SESSIONS, confirmed live via a dedicated
+    diagnostic instrumenting real CDP Target.crashed events: a tab_relay
+    session's renderer (and its cross-origin iframe/worker renderers) is
+    exactly as invisible to the startup-time baseline as a genuine leak --
+    the baseline is only ever snapshotted once, before any capture OR
+    relay session has run -- and a relay session is DELIBERATELY meant to
+    outlive grace_seconds by hours. The diagnostic caught this reaper
+    SIGKILL-ing 4 renderer targets simultaneously (including the relay's
+    own top-level page target) at almost exactly 120.3s into a session,
+    every single time, completely independent of CPU load, VPN, or which
+    container ran it -- explains essentially every "lost recording
+    context"/~2min-failure symptom investigated tonight; the CPU-
+    contention fixes helped a real, separate problem but were never going
+    to fix THIS one, since this fires unconditionally on a fixed clock.
+
+    Fix: incrementally adopt any renderer PID that's alive while at least
+    one relay session exists into _relay_protected_pids (module-level,
+    below) -- this tick's newly-seen PIDs, not a one-time snapshot, so a
+    renderer that appears mid-session (e.g. an ad iframe reloading) gets
+    protected too, on the very next tick after it's born (this loop runs
+    every _TAB_SWEEP_INTERVAL=60s by default, well under grace_seconds),
+    long before it could ever reach grace_seconds old. Deliberately NOT a
+    precise target-to-PID attribution (CDP has no reliable mapping for
+    that -- see _snapshot_protected_renderer_pids' own docstring on why
+    SystemInfo.getProcessInfo() didn't work either) -- broader than
+    strictly necessary, but bounded: the moment the LAST relay session
+    ends, _relay_protected_pids is dropped entirely (see the transition
+    check below), so anything still alive at that point re-enters normal
+    age-based reaping immediately, on its own real process age -- a
+    renderer that leaked past its own relay session's end doesn't get an
+    indefinite free pass, it just isn't punished for existing WHILE a
+    relay legitimately needed it."""
+    global _relay_protected_pids, _relay_sessions_were_active
+    now_alive = _renderer_pids_now()
+    if _relay_sessions:
+        _relay_protected_pids |= now_alive
+        _relay_sessions_were_active = True
+    elif _relay_sessions_were_active:
+        # Last relay session just ended -- drop the adopted protection
+        # entirely rather than leaving it to decay by attrition; anything
+        # still alive goes back to being judged purely on its own age.
+        _relay_protected_pids = set()
+        _relay_sessions_were_active = False
+    else:
+        _relay_protected_pids &= now_alive  # prune anything no longer alive
+
+    protected = _protected_renderer_pids | _relay_protected_pids
     killed = 0
-    for pid in _renderer_pids_now():
-        if pid in _protected_renderer_pids:
+    for pid in now_alive:
+        if pid in protected:
             continue
         age = _proc_age_seconds(pid)
         if age is None or age < grace_seconds:
@@ -713,6 +786,23 @@ async def _get_browser():
                     # wide visibility v1's performance-log polling gets for
                     # free, independent of iframe-candidate selection.
                     browser_args=[
+                        # Xvfb's screen is 1920x1080 (entrypoint.sh), and
+                        # Chrome's own default new-window size (nodriver's
+                        # default is 1280x1024 -- not even 16:9) was neither
+                        # matching the source's aspect ratio nor its real
+                        # resolution. Tried the full 1920x1080 first;
+                        # confirmed live it renders real 1080p (ffprobe), but
+                        # also confirmed live it pushes real-time rendering +
+                        # captureStream() encode cost high enough (~250%+ CPU
+                        # for one relay tab) to destabilize the recording
+                        # itself -- "lost recording context" mid-stream,
+                        # visible corruption, within ~3 minutes, tracing back
+                        # to this same change. 1280x720 is the middle ground:
+                        # correct 16:9 aspect (unlike the old default), a real
+                        # resolution bump, but ~55% fewer pixels than 1080p to
+                        # render/encode in real time.
+                        "--window-size=1280,720",
+                        "--window-position=0,0",
                         "--disable-site-isolation-trials",
                         # Real, confirmed-live bug this fixes: tab_relay's
                         # <video> froze (repeating/stalling its last real
@@ -933,6 +1023,8 @@ async def _close_relay_session(session_id: str):
     session = _relay_sessions.pop(session_id, None)
     if not session:
         return
+    for _ in range(session.get("reserved_slots", 0)):
+        _slots.release()
     try:
         await asyncio.wait_for(rc.stop_relay(session["contexts"]), timeout=10.0)
     except Exception:
@@ -959,11 +1051,14 @@ async def relay_start(req: RelayStartRequest):
     stays open and playing until /relay/{session_id}/stop is called or the
     idle sweeper decides nobody's polling it anymore.
 
-    Deliberately NOT gated by the ephemeral-capture PrioritySemaphore
+    Starting itself is NOT gated by the ephemeral-capture PrioritySemaphore
     (_slots) -- that's sized/tuned for short-lived captures that come and
     go in seconds; a relay session occupies a tab for the channel's whole
     runtime, a completely different resource-commitment shape. Gated by
-    its own, much smaller cap (_RELAY_MAX_SESSIONS) instead."""
+    its own, much smaller cap (_RELAY_MAX_SESSIONS) instead. It DOES,
+    however, reserve real capacity out of that same _slots pool once
+    running -- see _RELAY_RESERVED_TABS -- to protect it from CPU
+    contention with ephemeral captures sharing the same browser process."""
     async with _relay_sessions_lock:
         if len(_relay_sessions) + len(_relay_sessions_starting) >= _RELAY_MAX_SESSIONS:
             return {"ok": False, "error": f"relay session cap reached ({_RELAY_MAX_SESSIONS})"}
@@ -1007,9 +1102,24 @@ async def relay_start(req: RelayStartRequest):
         now = time.time()
         async with _relay_sessions_lock:
             _relay_sessions[session_id] = {"tab": tab, "contexts": result["contexts"],
-                                            "started_at": now, "last_poll_at": now}
+                                            "started_at": now, "last_poll_at": now,
+                                            "reserved_slots": 0}
         logger.info("Relay session %s started (contexts=%d, click_log=%s)",
                     session_id, len(result["contexts"]), result.get("click_log"))
+        # Reserve capacity out of the ephemeral-capture pool AFTER the
+        # session is already registered/playing -- see _RELAY_RESERVED_TABS.
+        # High priority so this jumps any already-queued background/low
+        # captures once slots free up, rather than waiting behind them
+        # indefinitely. Best-effort: playback already succeeded either way,
+        # this only affects how soon it's protected from future contention.
+        for _ in range(_RELAY_RESERVED_TABS):
+            await _slots.acquire(priority="high")
+            async with _relay_sessions_lock:
+                s = _relay_sessions.get(session_id)
+                if s is None:  # stopped/swept already -- give the slot straight back
+                    _slots.release()
+                    break
+                s["reserved_slots"] += 1
         return {"ok": True, "session_id": session_id, "click_log": result.get("click_log")}
     except Exception as e:
         logger.exception("Relay session %s start failed", session_id)
@@ -1029,6 +1139,46 @@ async def relay_chunks(session_id: str):
         result = await asyncio.wait_for(rc.poll_relay(session["contexts"]), timeout=15.0)
     except Exception as e:
         return {"ok": False, "error": str(e), "chunks": [], "ended": False}
+
+    dead = result.pop("dead_context_indices", None) or []
+    if dead:
+        contexts = session["contexts"]
+        session["contexts"] = [c for i, c in enumerate(contexts) if i not in dead]
+        if result.get("recording"):
+            # Some OTHER context is still genuinely recording -- just drop
+            # the dead one(s) and carry on, nothing to recover.
+            logger.info("Relay session %s: dropped %d dead context(s), recording continues elsewhere",
+                        session_id, len(dead))
+        else:
+            # Nothing is recording anymore AND we just lost context(s) --
+            # very plausibly the frame that held playback reloaded/
+            # re-navigated (common for ad-supported embeds), invalidating
+            # its execution context for good. Try to find and re-attach
+            # to whatever's live now instead of assuming dead-for-good --
+            # see rebuild_recording_contexts' docstring for why this is a
+            # general recovery, not a fix for one site's specific layout.
+            # Rate-limited so a source that's ACTUALLY gone for good
+            # doesn't get a full rebuild attempt (browser.get + context
+            # enumeration + JS injection, real cost) on every single ~1.5s
+            # poll -- one attempt is enough to know if recovery is even
+            # possible; if it isn't, TabRelaySource's own consecutive-
+            # failure give-up handles the rest.
+            last_attempt = session.get("last_rebuild_attempt_at", 0.0)
+            if time.time() - last_attempt > 20.0:
+                session["last_rebuild_attempt_at"] = time.time()
+                try:
+                    browser = await _get_browser()
+                    rebuilt = await rc.rebuild_recording_contexts(session["tab"], browser)
+                except Exception as e:
+                    rebuilt = []
+                    logger.warning("Relay session %s: context rebuild raised: %s", session_id, e)
+                if rebuilt:
+                    session["contexts"] = rebuilt
+                    logger.info("Relay session %s: rebuilt %d context(s) after losing the recording context",
+                                session_id, len(rebuilt))
+                else:
+                    logger.warning("Relay session %s: lost the recording context, rebuild found nothing",
+                                    session_id)
     return result
 
 
@@ -1134,8 +1284,9 @@ async def health():
     """Never hangs (fixed timeout on the probe) — any response, even a
     ready=False one, reads as "sidecar alive" to core's check_selenium()."""
     global _browser
+    reserved_total = sum(s.get("reserved_slots", 0) for s in _relay_sessions.values())
     relay_status = {"active": len(_relay_sessions), "starting": len(_relay_sessions_starting),
-                     "cap": _RELAY_MAX_SESSIONS}
+                     "cap": _RELAY_MAX_SESSIONS, "reserved_tab_slots": reserved_total}
     if _browser is None:
         return {"ready": True, "browser_alive": False, "capture_count": _capture_count,
                 "tabs": _slots.status(), "tracked_tabs": _tracked_tabs_status(),

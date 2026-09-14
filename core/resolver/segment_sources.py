@@ -1037,7 +1037,18 @@ class TabRelaySource(SegmentSource):
             "ffmpeg", "-y", "-loglevel", "error",
             "-fflags", "+genpts",
             "-f", "webm", "-i", "pipe:0",
+            # No -crf/-b:v previously -> x264's bare default (CRF 23) at
+            # -preset ultrafast, which needs a much higher bitrate than a
+            # slower preset to hit the same visual quality -- a real,
+            # visible quality loss on top of MediaRecorder's own capture
+            # (see relay_capture.py's videoBitsPerSecond fix, same
+            # investigation). CRF 20 + a maxrate/bufsize cap (constrained-
+            # CRF) targets noticeably better quality while still bounding
+            # worst-case segment bitrate for smooth delivery -- CPU cost is
+            # unchanged, preset (encode speed) is the same, only the
+            # quality/bitrate target moves.
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-crf", "20", "-maxrate", "4M", "-bufsize", "8M",
             "-bf", "0", "-x264-params", "threads=2", "-pix_fmt", "yuv420p",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-c:a", "aac", "-ar", "48000", "-ac", "2",

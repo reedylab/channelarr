@@ -99,7 +99,17 @@ _RELAY_START_JS = r"""
     if (!mimeType) { window.__relay.state.error = 'no supported webm mimeType'; return false; }
     var recorder;
     try {
-      recorder = new MediaRecorder(stream, {mimeType: mimeType});
+      // Explicit bitrate -- MediaRecorder's browser-chosen default (no
+      // videoBitsPerSecond given) targets a modest, resolution-derived
+      // bitrate nowhere near what a real live sports feed needs, which is
+      // why the relayed stream looked visibly softer than the source even
+      // though nothing downstream was re-encoding it away (encoder_mode=
+      // copy). Originally tried 8 Mbps (paired with a 1920x1080 window) --
+      // confirmed live that combination destabilized the capture itself
+      // ("lost recording context" mid-stream, visible corruption) under
+      // real CPU pressure. 3.5 Mbps at the now-720p window is a real
+      // improvement over unset without repeating that.
+      recorder = new MediaRecorder(stream, {mimeType: mimeType, videoBitsPerSecond: 3500000});
     } catch (e) {
       window.__relay.state.error = 'MediaRecorder() threw: ' + e;
       return false;
@@ -510,6 +520,13 @@ async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: 
         cross-origin frame reachable solely via an isolated world -- the
         outer click_iframe_center/iframe_dom_click steps only ever
         reached the popunder-bait layer, never this control.
+      {"action": "evaluate_any_context", "js": "..."}
+        -- same per-context search as click_selector_any_context, but for
+        arbitrary JS (e.g. forcing a player library's own quality selector
+        to its highest level via its global API) instead of a selector
+        click. The expression must return non-null/non-undefined in
+        whichever context actually has what it's looking for; null/
+        undefined is treated as "not this context, try the next one."
     Returns a per-step log -- this is expected to need real tuning per
     site, and a silent failure here is the hardest thing to diagnose from
     outside (see /relay/{id}/debug-eval for interactive tuning)."""
@@ -572,6 +589,26 @@ async def run_click_sequence(tab, browser, keep_target_id: str, click_sequence: 
                         hit = i
                         break
                 log.append({"step": step, "ok": hit is not None, "context_index": hit})
+            elif action == "evaluate_any_context":
+                # Same context-search pattern as click_selector_any_context,
+                # for arbitrary JS instead of a selector click -- e.g. a
+                # player library's global API (jwplayer(), hls.js instance,
+                # etc.) that lives in whichever context actually holds the
+                # <video>, not necessarily the top-level tab. Expression
+                # must return a JSON-serializable value (or null/undefined,
+                # treated as "this context doesn't have it, try the next
+                # one") -- same convention _eval_json already expects.
+                js = step["js"]
+                hit, hit_result = None, None
+                for i, ctx in enumerate(contexts or []):
+                    try:
+                        result = await _eval_json(ctx, js)
+                    except Exception:
+                        continue
+                    if result is not None:
+                        hit, hit_result = i, result
+                        break
+                log.append({"step": step, "ok": hit is not None, "context_index": hit, "result": hit_result})
             else:
                 log.append({"step": step, "ok": False, "error": f"unknown action {action!r}"})
         except Exception as e:
@@ -650,6 +687,18 @@ async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_se
                                           else DEFAULT_CLICK_SEQUENCE,
                                           contexts=contexts)
 
+    any_ok, last_error = await _inject_recording_js(contexts)
+
+    if not any_ok:
+        return {"ok": False, "error": last_error, "click_log": click_log, "contexts": []}
+    return {"ok": True, "error": None, "click_log": click_log, "contexts": contexts}
+
+
+async def _inject_recording_js(contexts: list) -> tuple:
+    """Injects _RELAY_START_JS into every given context, returning
+    (any_ok, last_error) -- factored out of start_relay so
+    rebuild_recording_contexts (below) can reuse the exact same logic
+    against a freshly-rebuilt context list, rather than duplicating it."""
     any_ok = False
     last_error = "no context accepted the capture JS"
     for ctx in contexts:
@@ -662,10 +711,36 @@ async def start_relay(tab, browser, keep_target_id: str, page_url: str, click_se
             any_ok = True
         elif result:
             last_error = result.get("error", "unknown")
+    return any_ok, last_error
 
+
+async def rebuild_recording_contexts(tab, browser) -> list:
+    """Re-enumerates every plausible execution context for the page RIGHT
+    NOW (see _build_contexts) and re-injects the capture JS into each,
+    returning only the ones that accepted it.
+
+    Real, confirmed-live motivation: start_relay's own context list is a
+    one-time snapshot, handed to the caller and polled unchanged for the
+    whole session (see poll_relay's docstring on why that's normally
+    fine). It stops being fine if the frame that actually held playback
+    reloads/re-navigates internally (common for ad-supported embeds) --
+    Chrome invalidates that frame's old JS execution context entirely,
+    and every future poll against it fails with a CDP-level "context not
+    found" error. The context is gone for good; nothing about the
+    ORIGINAL contexts list can recover it. But a fresh enumeration right
+    now can very plausibly find a live equivalent (same site, same
+    player, just re-initialized) -- this is the general recovery for
+    that whole class of failure, not a fix keyed to any one site's
+    specific frame layout or the exact error text observed the first
+    time it was seen."""
+    contexts, attached_count, isolated_count = await _build_contexts(tab, browser)
+    logger.info("[RELAY] rebuild: %d candidate context(s) (%d attached + %d isolated)",
+                len(contexts), attached_count, isolated_count)
+    any_ok, last_error = await _inject_recording_js(contexts)
     if not any_ok:
-        return {"ok": False, "error": last_error, "click_log": click_log, "contexts": []}
-    return {"ok": True, "error": None, "click_log": click_log, "contexts": contexts}
+        logger.warning("[RELAY] rebuild: no context accepted the capture JS (%s)", last_error)
+        return []
+    return contexts
 
 
 _POLL_PER_CONTEXT_TIMEOUT_SECONDS = 5.0
@@ -713,6 +788,23 @@ async def poll_relay(contexts: list) -> dict:
     all_ended = True
     last_error = None
     any_ok = False
+    # Contexts whose OWN call raised something other than our per-context
+    # timeout -- i.e. a real, permanent-looking failure (Chrome itself
+    # reporting the execution context no longer exists, most commonly
+    # because the frame that held it reloaded/re-navigated) rather than
+    # "just slow to respond right now". Deliberately NOT keyed to any
+    # specific error string/site -- a plain TimeoutError is excluded
+    # because that's the transient, expected-under-load case the per-
+    # context timeout above already exists to tolerate (see this
+    # function's own docstring); anything else raised by _eval_json
+    # itself is treated as "this context is gone for good", generically,
+    # regardless of the exact wording Chrome used to say so. The caller
+    # uses this to decide whether a context rebuild (see
+    # rebuild_recording_contexts) is worth attempting.
+    dead_context_indices = [
+        i for i, r in enumerate(raw_results)
+        if isinstance(r, Exception) and not isinstance(r, asyncio.TimeoutError)
+    ]
     for result in raw_results:
         if isinstance(result, Exception):
             # Context unreachable/unresponsive (target closed, or wedged
@@ -732,8 +824,9 @@ async def poll_relay(contexts: list) -> dict:
         if result.get("error"):
             last_error = result["error"]
     if not any_ok:
-        return {"ok": False, "chunks": [], "ended": True, "error": last_error or "no context reachable"}
-    return {"ok": True, "chunks": chunks, "ended": all_ended,
+        return {"ok": False, "chunks": [], "ended": True, "error": last_error or "no context reachable",
+                "dead_context_indices": dead_context_indices}
+    return {"ok": True, "chunks": chunks, "ended": all_ended, "dead_context_indices": dead_context_indices,
             "error": last_error, "recording": any_recording}
 
 
