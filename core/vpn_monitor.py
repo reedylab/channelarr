@@ -26,6 +26,27 @@ _samples = deque(maxlen=1440)
 _lock = threading.Lock()
 _last_rotate_at = None
 
+# Escalating backoff state for block-triggered rotations specifically --
+# see maybe_auto_rotate's docstring. Real, confirmed-live problem this
+# fixes: a genuinely PERSISTENT block (the same 1-2 domains blocked for
+# our whole exit-IP range, not a transient one-off) kept re-arming the
+# flat 10-min debounce every cycle, producing a rotation roughly every
+# 10-15 minutes for hours -- each one burning another exit IP for zero
+# benefit (a new IP in the same blocked range fails identically), and each
+# one immediately re-hammering the same known-bad domains on the fresh IP
+# in a pattern that itself looks automated enough to help EXPLAIN why so
+# many exit IPs end up individually flagged over time. Tracks whether the
+# domain set that triggered rotation N+1 is substantially the SAME as the
+# one that triggered rotation N -- if so, that rotation demonstrably
+# didn't help, so double the wait before trying again (capped). A
+# genuinely NEW/different domain set (an unrelated, possibly transient
+# block) resets the backoff -- it deserves its own fresh attempt at the
+# normal interval, not inherited punishment from an unrelated domain's
+# already-proven-persistent block.
+_block_rotation_backoff_multiplier = 1
+_last_block_rotation_domains: frozenset = frozenset()
+_BLOCK_BACKOFF_CAP_MULTIPLIER = 32  # e.g. 10min base -> capped at ~5h20m
+
 
 def _get_auth_and_url():
     """Resolve gluetun control config from env vars via core.config."""
@@ -351,8 +372,11 @@ def maybe_auto_rotate():
       a strong signal it's our own exit IP getting blocked, not a
       one-off site outage (see core/block_detector.py's docstring).
       Gated by vpn_auto_rotate_on_block (default on) and its own,
-      separate debounce (vpn_block_rotate_min_interval_minutes) so a
-      persistent block doesn't re-trigger a rotation every tick.
+      separate debounce (vpn_block_rotate_min_interval_minutes) --
+      ESCALATING, not flat, when the same domain(s) keep re-triggering it
+      (see _block_rotation_backoff_multiplier's docstring above) -- so a
+      genuinely persistent, whole-exit-range block doesn't re-trigger a
+      rotation every 10-15 minutes for hours on end.
 
     Both triggers share the same _last_rotate_at debounce timestamp so
     a scheduled and a block-triggered rotation can't stack back-to-back
@@ -361,7 +385,7 @@ def maybe_auto_rotate():
     regardless of which trigger fired it.
     """
     from core.config import get_setting
-    global _last_rotate_at
+    global _last_rotate_at, _block_rotation_backoff_multiplier, _last_block_rotation_domains
     now = datetime.now(timezone.utc)
 
     try:
@@ -376,16 +400,42 @@ def maybe_auto_rotate():
     on_block = str(get_setting("vpn_auto_rotate_on_block", "true")).strip().lower() not in ("0", "false", "no")
     if not on_block:
         return
+
+    from core.block_detector import looks_like_ip_block, distinct_recent_blocked_domains
+    if not looks_like_ip_block():
+        # No active block signal right now -- let the backoff self-heal so
+        # a FUTURE, unrelated block gets a fair attempt at the base
+        # interval rather than inheriting stale escalation from whatever
+        # domain caused it last time.
+        _block_rotation_backoff_multiplier = 1
+        return
+
     try:
         block_minutes = int(get_setting("vpn_block_rotate_min_interval_minutes", "10") or "10")
     except (ValueError, TypeError):
         block_minutes = 10
-    if _last_rotate_at and (now - _last_rotate_at).total_seconds() < block_minutes * 60:
+    effective_minutes = min(block_minutes * _block_rotation_backoff_multiplier,
+                            block_minutes * _BLOCK_BACKOFF_CAP_MULTIPLIER)
+    if _last_rotate_at and (now - _last_rotate_at).total_seconds() < effective_minutes * 60:
         return
 
-    from core.block_detector import looks_like_ip_block, distinct_recent_blocked_domains
-    if looks_like_ip_block():
-        domains = distinct_recent_blocked_domains()
-        logger.warning("[VPN] auto-rotating -- possible IP block detected across "
-                       "%d independent domains: %s", len(domains), domains)
-        rotate_vpn(reason="block_detected")
+    domains = frozenset(distinct_recent_blocked_domains())
+    # Same domain(s) as last time this trigger fired -- that prior
+    # rotation demonstrably didn't fix it, so double the wait before
+    # trying again instead of repeating the same ineffective cycle.
+    # A genuinely different domain set gets a fresh attempt at the
+    # base interval -- an unrelated block deserves its own chance,
+    # not inherited backoff from a different domain's known-persistent one.
+    if domains & _last_block_rotation_domains:
+        _block_rotation_backoff_multiplier = min(_block_rotation_backoff_multiplier * 2,
+                                                  _BLOCK_BACKOFF_CAP_MULTIPLIER)
+    else:
+        _block_rotation_backoff_multiplier = 1
+    _last_block_rotation_domains = domains
+    logger.warning("[VPN] auto-rotating -- possible IP block detected across "
+                   "%d independent domains: %s (next block-triggered rotation "
+                   "won't fire for at least %d min if this doesn't help)",
+                   len(domains), sorted(domains),
+                   min(block_minutes * _block_rotation_backoff_multiplier,
+                       block_minutes * _BLOCK_BACKOFF_CAP_MULTIPLIER))
+    rotate_vpn(reason="block_detected")
