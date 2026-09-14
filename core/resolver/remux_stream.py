@@ -20,6 +20,7 @@ Output at ``/live/{id}/`` (same dir the other modes use). Same lifecycle
 surface: start/stop/touch/last_access/status.
 """
 
+import json
 import logging
 import os
 import re
@@ -28,12 +29,55 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import urljoin
 
 import requests as _requests
 
 from core.diagnostics import record_sample, record_event, incr_counter
+# Reused as-is from proxy_stream's catch-up threading (see its own
+# constants for the full rationale): only escalate to concurrent fetching
+# when a cycle finds a genuine backlog, and only when the deployment has
+# opted into "multi" concurrency mode. Same safety scope here as there —
+# steady-state (0-1 new segment per rendition per cycle, the normal case)
+# is completely unaffected, still one fetch at a time, same pacing as
+# today. Worth being extra careful here specifically: _headers()'s own
+# comment says this source's CDN detects bursty fetches and serves
+# scrambled bytes in retaliation, not just slower/failing ones — so this
+# stays gated behind the exact same narrow catch-up-only trigger proxy
+# mode uses, never a blanket "always concurrent" change.
+from core.resolver.proxy_stream import (
+    CATCHUP_THREAD_THRESHOLD,
+    CATCHUP_MAX_WORKERS,
+    _resolver_concurrency_mode,
+)
+
+
+def _fetch_one(dl_fn, seq, url):
+    try:
+        return (seq, dl_fn(url), None)
+    except Exception as e:
+        return (seq, None, e)
+
+
+def _fetch_batch(dl_fn, items: list, channel_id: str = "?") -> list:
+    """Fetch every (seq, url) in items via dl_fn (RemuxStream._dl, bound to
+    one rendition's session/headers), sequential by default, escalating to
+    a small bounded pool only for a genuine catch-up burst under "multi"
+    mode — see this module's own import comment for the full rationale.
+    Returns (seq, data, error) tuples in the SAME order as items regardless
+    of which path ran or completion order, so the caller's vbuf/abuf/dur
+    assignment stays single-threaded either way (dict writes keyed by
+    sequence number, so unlike proxy mode's ordered playlist there's not
+    even an ordering concern here — this still runs them in the calling
+    thread purely for consistency with proxy_stream's pattern)."""
+    if len(items) < CATCHUP_THREAD_THRESHOLD or _resolver_concurrency_mode() != "multi":
+        return [_fetch_one(dl_fn, seq, url) for seq, url in items]
+    logging.info("[REMUX] %s catch-up: fetching %d new segments with up to %d workers",
+                 channel_id, len(items), CATCHUP_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=CATCHUP_MAX_WORKERS) as pool:
+        return list(pool.map(lambda item: _fetch_one(dl_fn, item[0], item[1]), items))
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -73,6 +117,12 @@ class RemuxStream:
         self.session = _requests.Session()
         self.source_domain = ""
         self.page_url = ""
+        # Set by _resolve_inputs when the master fetch turns out to be a
+        # JSON manifest-envelope rather than HLS directly (observed on one
+        # source family: a relay pointing at genuinely CENC-encrypted
+        # content) -- see that method and _mux_pair for the full story.
+        # None for every other source; purely additive.
+        self._decryption_key_hex: Optional[str] = None
         self._load_context()
         # Some CDNs only serve clean (unscrambled) segment bytes to a session
         # that first hit the stream's *entry* URL (the short redirector the
@@ -196,10 +246,45 @@ class RemuxStream:
                     pass
         shutil.rmtree(self.src_dir, ignore_errors=True)
 
+    @staticmethod
+    def _try_parse_manifest_envelope(body: str):
+        """Some sources don't return HLS at the master URL at all — they
+        return a small JSON envelope pointing at the REAL master one hop
+        further (observed on one source family: a relay whose entry URL
+        returns {"manifest": "<real master url>", "key": "<keyid>:<content
+        key hex>"}, with the real master turning out to be genuinely CENC-
+        encrypted, #EXT-X-KEY METHOD=SAMPLE-AES-CTR — the "key" field is
+        the raw content key, sparing a real DRM license exchange). Detected
+        generically by JSON shape, never by hostname, so this covers any
+        source using the same envelope pattern. Returns (manifest_url,
+        key_hex_or_None), or None if body isn't this kind of envelope at
+        all (the overwhelmingly common case — every other source's master
+        fetch is unaffected by this check)."""
+        stripped = body.strip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            data = json.loads(stripped)
+        except (ValueError, TypeError):
+            return None
+        manifest_url = data.get("manifest")
+        if not manifest_url or not isinstance(manifest_url, str):
+            return None
+        key_hex = None
+        key_field = data.get("key")
+        if isinstance(key_field, str) and ":" in key_field:
+            key_hex = key_field.rsplit(":", 1)[1].strip() or None
+        return manifest_url, key_hex
+
     def _resolve_inputs(self):
         """(video_playlist_url, audio_playlist_url_or_None). Fetches through the
         entry URL when known (which blesses the session AND 302-redirects to a
-        fresh master), else the stored master directly."""
+        fresh master), else the stored master directly.
+
+        See _try_parse_manifest_envelope for the one-hop JSON-envelope case
+        this also handles — purely additive; a source that returns a normal
+        HLS master or media playlist directly takes the exact same path as
+        before this existed."""
         url = self.entry_url or self.manifest_url
         try:
             r = self.session.get(url, headers=self._headers(), timeout=12, allow_redirects=True)
@@ -207,8 +292,25 @@ class RemuxStream:
         except Exception as e:
             logging.warning("[REMUX] %s master fetch failed: %s", self.channel_id, e)
             return self.manifest_url, None
+
         if "#EXT-X-STREAM-INF" not in body:
-            return base, None
+            envelope = self._try_parse_manifest_envelope(body)
+            if envelope:
+                manifest_url, key_hex = envelope
+                self._decryption_key_hex = key_hex
+                logging.info("[REMUX] %s following manifest envelope to %s%s",
+                            self.channel_id, manifest_url[:120],
+                            " (encrypted, content key received)" if key_hex else "")
+                try:
+                    r = self.session.get(manifest_url, headers=self._headers(),
+                                         timeout=12, allow_redirects=True)
+                    body, base = r.text, r.url
+                except Exception as e:
+                    logging.warning("[REMUX] %s envelope manifest fetch failed: %s",
+                                    self.channel_id, e)
+                    return self.manifest_url, None
+            if "#EXT-X-STREAM-INF" not in body:
+                return base, None
         lines = body.splitlines()
         best_uri, best_bw = None, -1
         for i, l in enumerate(lines):
@@ -311,7 +413,37 @@ class RemuxStream:
 
     def _mux_pair(self, v_init, v_data, a_init, a_data, out_path) -> bool:
         """Mux one aligned (video, audio) fMP4 pair to one MPEG-TS output
-        segment with -c copy (the proven-clean finite operation)."""
+        segment with -c copy (the proven-clean finite operation).
+
+        self._decryption_key_hex, when set (see _resolve_inputs' manifest-
+        envelope handling), is a real content key for genuinely CENC-
+        encrypted source content (#EXT-X-KEY METHOD=SAMPLE-AES-CTR) — handed
+        to ffmpeg's own native -decryption_key option rather than hand-
+        rolling MP4 moof/senc-box parsing plus AES-CTR ourselves, which
+        would carry real risk of subtly-wrong decryption (garbled video)
+        for a scheme this fiddly to get exactly right. ffmpeg's mov/mp4
+        demuxer already implements this correctly — confirmed against real
+        segments from the source that needs it before wiring this in.
+        Applied to both inputs when set — video and audio renditions of the
+        same asset were confirmed to share one content key. None for every
+        other source, so this changes nothing there.
+
+        Known, accepted, NOT-yet-fixed issue: a fraction of fragments on
+        this same source carry a leading DASH 'emsg' box before their moof,
+        which correlates 1:1 with garbled AAC audio after decryption (real,
+        confirmed via direct box-level forensics) — video is unaffected.
+        Two mitigation attempts (dropping that fragment's audio track
+        entirely, then synthesizing silence in its place) each introduced
+        their own regression (a frame-ordering/stutter issue, then a PTS-
+        misalignment issue that broke much worse on Jellyfin's own stricter
+        remux pipeline than on a browser's tolerant hls.js) — reverted both
+        rather than stack a third guess under time pressure. Pass-through
+        as-is for now: occasional garbled audio on this source family,
+        self-contained to the affected fragment, no structural side
+        effects. Revisit with a real fix (properly aligning synthesized
+        audio's PTS to the source's own continuous timeline, or root-
+        causing why ffmpeg's CENC decrypt mishandles a leading emsg at
+        all) when there's room to do it without live-fire pressure."""
         vp = os.path.join(self.src_dir, "v.mp4")
         with open(vp, "wb") as f:
             f.write((v_init or b"") + v_data)
@@ -323,11 +455,15 @@ class RemuxStream:
             # auto-probe latches onto the decoy and the copy-mux emits no
             # real video/audio track.
             cmd += ["-f", "mpegts"]
+        if self._decryption_key_hex:
+            cmd += ["-decryption_key", self._decryption_key_hex]
         cmd += ["-i", vp]
         if a_init is not None and a_data is not None:
             ap = os.path.join(self.src_dir, "a.mp4")
             with open(ap, "wb") as f:
                 f.write((a_init or b"") + a_data)
+            if self._decryption_key_hex:
+                cmd += ["-decryption_key", self._decryption_key_hex]
             cmd += ["-i", ap, "-map", "0:v:0", "-map", "1:a:0"]
         else:
             cmd += ["-map", "0"]
@@ -337,7 +473,16 @@ class RemuxStream:
                 "-f", "mpegts", out_path]
         try:
             r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
-            return r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+            ok = r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+            if not ok:
+                # A non-zero ffmpeg exit on otherwise-successfully-fetched
+                # input is exactly what malformed/corrupted source bytes
+                # would look like -- this used to return False silently,
+                # which would have hidden that failure mode completely.
+                logging.warning("[REMUX] %s mux exited %d: %s",
+                                self.channel_id, r.returncode,
+                                r.stderr.decode(errors="replace")[:300] if r.stderr else "")
+            return ok
         except Exception as e:
             logging.warning("[REMUX] %s mux failed: %s", self.channel_id, e)
             return False
@@ -408,18 +553,23 @@ class RemuxStream:
                     a_init = self._dl(init_u)
                 except Exception:
                     pass
+            new_items = []
+            new_durs = {}
             for i, (seg_url, dur) in enumerate(segs):
                 seq = msq + i
                 if emit is not None and seq < emit:
                     continue
                 if seq in buf:
                     continue
-                try:
-                    buf[seq] = self._dl(seg_url)          # fetch every new one, like a player
-                    if dur_map is not None:
-                        dur_map[seq] = dur
-                except Exception as e:
-                    logging.warning("[REMUX] %s seg dl failed: %s", self.channel_id, e)
+                new_items.append((seq, seg_url))
+                new_durs[seq] = dur
+            for seq, data, err in _fetch_batch(self._dl, new_items, self.channel_id):
+                if err is not None:
+                    logging.warning("[REMUX] %s seg dl failed: %s", self.channel_id, err)
+                    continue
+                buf[seq] = data
+                if dur_map is not None:
+                    dur_map[seq] = new_durs[seq]
             return 200
 
         last_bless = time.time()
@@ -517,15 +667,20 @@ class RemuxStream:
                     v_init = self._dl(vinit_u)
                 except Exception:
                     pass
+            new_video = []
+            new_video_durs = {}
             for i, (seg_url, dur) in enumerate(vsegs):
                 seq = vmsq + i
                 if seq < emit or seq in vbuf:
                     continue
-                try:
-                    vbuf[seq] = self._dl(seg_url)
-                    adur[seq] = dur
-                except Exception as e:
-                    logging.warning("[REMUX] %s video dl failed: %s", self.channel_id, e)
+                new_video.append((seq, seg_url))
+                new_video_durs[seq] = dur
+            for seq, data, err in _fetch_batch(self._dl, new_video, self.channel_id):
+                if err is not None:
+                    logging.warning("[REMUX] %s video dl failed: %s", self.channel_id, err)
+                    continue
+                vbuf[seq] = data
+                adur[seq] = new_video_durs[seq]
             if aurl:
                 sta = _download_new(aurl, abuf, None, is_video=False)
                 if sta in (403, 404, 410):
