@@ -86,17 +86,19 @@ def _native_resolver():
     return _load()
 
 
-def _live_multiplayer_channels() -> list:
-    """[{channel_id, page_url, primary_manifest_id}] for every currently-
-    running channel the native resolver's discover-all hook applies to."""
+def _live_channels() -> list:
+    """[{channel_id, page_url, primary_manifest_id, fallback_sources}] for
+    every currently-running resolved channel — the shared enumeration both
+    the warming rotation and switch watchdog build their work-lists from.
+    Deliberately not filtered to "primary is multi-player-capable" here:
+    a channel can have foreign fallbacks (a different site/plugin entirely,
+    manually added or independently discovered) worth tracking even when
+    its own primary has no internal picker at all — see
+    _foreign_fallback_targets."""
     from web import shared_state
     from core.diagnostics import get_live_snapshot
     from core.database import get_session
     from core.models import Capture, Manifest
-
-    native = _native_resolver()
-    if native is None or not hasattr(native, "discover_all_players"):
-        return []
 
     try:
         statuses = shared_state.streamer_mgr.get_all_status()
@@ -117,16 +119,30 @@ def _live_multiplayer_channels() -> list:
                 .filter(Manifest.id == ch["manifest_id"])
                 .first()
             )
-        page_url = row[0] if row else None
-        if not page_url:
+        out.append({"channel_id": channel_id, "page_url": row[0] if row else None,
+                    "primary_manifest_id": ch["manifest_id"],
+                    "fallback_sources": ch.get("fallback_sources") or []})
+    return out
+
+
+def _foreign_fallback_targets(ch: dict) -> list:
+    """This channel's configured fallback manifests that are NOT sub-paths
+    of the primary's own multi-player picker — i.e. a genuinely separate
+    source, whatever plugin or manual addition it came from. See
+    player_health._reorder_fallbacks_by_score for the same "(player: X)"
+    vs. manifest_id-keyed distinction this mirrors. Label comes from
+    source_domain (generic, already-stored data — never a hardcoded site
+    name) or the manifest's own title as a last resort."""
+    out = []
+    for fb in ch.get("fallback_sources") or []:
+        title = fb.get("title") or ""
+        if "(player: " in title:
             continue
-        try:
-            if not native.handles(page_url):
-                continue
-        except Exception:
+        mid = fb.get("manifest_id")
+        if not mid:
             continue
-        out.append({"channel_id": channel_id, "page_url": page_url,
-                    "primary_manifest_id": ch["manifest_id"]})
+        out.append({"manifest_id": mid,
+                    "label": fb.get("source_domain") or title or mid})
     return out
 
 
@@ -149,45 +165,115 @@ def _evaluate_one(channel_id: str, page_url: str, path: str) -> None:
         return
     if not result.get("ok") or not result.get("capture"):
         record_probe(channel_id, path, False, latency_ms=result.get("latency_ms"),
-                     error=result.get("error"))
+                     error=result.get("error"), label=result.get("label"))
         return
     try:
         sample = sample_manifest(result["capture"], duration_seconds=_SAMPLE_SECONDS)
     except Exception as e:
         logger.warning("[PLAYER-EVAL] %s/%s sample failed: %s", channel_id, path, e)
-        record_probe(channel_id, path, False, latency_ms=result.get("latency_ms"), error=str(e))
+        record_probe(channel_id, path, False, latency_ms=result.get("latency_ms"),
+                     error=str(e), label=result.get("label"))
         return
     record_probe(channel_id, path, sample["ok"], latency_ms=result.get("latency_ms"),
-                 error=None if sample["ok"] else f"stall_gap={sample['max_stall_gap']}s")
+                 error=None if sample["ok"] else f"stall_gap={sample['max_stall_gap']}s",
+                 label=result.get("label"))
     logger.info("[PLAYER-EVAL] %s/%s sampled: ok=%s segments_ok=%d segments_failed=%d max_stall_gap=%.1fs",
                 channel_id, path, sample["ok"], sample["segments_ok"],
                 sample["segments_failed"], sample["max_stall_gap"])
 
 
+def _evaluate_foreign_fallback(channel_id: str, manifest_id: str, label: str) -> None:
+    """One warming-rotation item for a fallback that's a genuinely separate
+    source (not a sub-path of the primary's own picker) — already a
+    resolved manifest sitting in the DB, so this skips discovery entirely
+    and goes straight to the same 30s real sample any other candidate
+    gets. Tracked under manifest_id as its player_path key (see
+    _foreign_fallback_targets) since it has no "path" concept of its own."""
+    from core.database import get_session
+    from core.models import Manifest
+
+    with get_session() as session:
+        m = session.query(Manifest).filter_by(id=manifest_id).first()
+        if m is None:
+            return
+        capture = {
+            "manifest_url": m.url,
+            "body": m.body,
+            "referer": f"https://{m.source_domain}/" if m.source_domain else None,
+        }
+    try:
+        sample = sample_manifest(capture, duration_seconds=_SAMPLE_SECONDS)
+    except Exception as e:
+        logger.warning("[PLAYER-EVAL] fallback %s/%s sample failed: %s", channel_id, manifest_id, e)
+        record_probe(channel_id, manifest_id, False, error=str(e), label=label)
+        return
+    record_probe(channel_id, manifest_id, sample["ok"],
+                 error=None if sample["ok"] else f"stall_gap={sample['max_stall_gap']}s",
+                 label=label)
+    logger.info("[PLAYER-EVAL] fallback %s/%s (%s) sampled: ok=%s segments_ok=%d segments_failed=%d max_stall_gap=%.1fs",
+                channel_id, manifest_id, label, sample["ok"], sample["segments_ok"],
+                sample["segments_failed"], sample["max_stall_gap"])
+
+
 def _build_warming_queue() -> list:
-    """One item per non-primary tracked path of every currently-live
-    multi-player channel, oldest-probed (or never-probed) first. Seeds a
-    channel's candidate pool with a one-time discover_and_record the first
-    time this rotation sees it live and it has no tracked paths yet."""
+    """One item per non-primary tracked candidate of every currently-live
+    channel, oldest-probed (or never-probed) first — both flavors folded
+    into the same queue/priority order: "kind": "player_path" (a sub-path
+    of the primary's own multi-player picker, needs the plugin to
+    resolve it) and "kind": "foreign_fallback" (an already-resolved
+    manifest from a separate source entirely, sampled directly). Seeds a
+    multi-player channel's candidate pool with a one-time discover_and_
+    record the first time this rotation sees it live with no tracked
+    paths yet."""
+    native = _native_resolver()
+    supports_discovery = native is not None and hasattr(native, "discover_all_players")
+
     items = []
-    for ch in _live_multiplayer_channels():
+    for ch in _live_channels():
         channel_id = ch["channel_id"]
-        scores = get_scores(channel_id)
-        if not scores:
+
+        is_multiplayer = False
+        if supports_discovery and ch["page_url"]:
             try:
-                discover_and_record(channel_id, ch["primary_manifest_id"], timeout=_PROBE_TIMEOUT)
-                scores = get_scores(channel_id)
-            except Exception as e:
-                logger.warning("[PLAYER-EVAL] seed discovery failed for %s: %s", channel_id, e)
-                continue
-        primary_path = get_primary_player_path(ch["primary_manifest_id"])
-        for path, row in scores.items():
-            if path == primary_path:
-                continue
-            items.append({"channel_id": channel_id, "page_url": ch["page_url"],
-                          "path": path, "last_probed_at": row.last_probed_at})
+                is_multiplayer = native.handles(ch["page_url"])
+            except Exception:
+                is_multiplayer = False
+
+        if is_multiplayer:
+            scores = get_scores(channel_id)
+            if not scores:
+                try:
+                    discover_and_record(channel_id, ch["primary_manifest_id"], timeout=_PROBE_TIMEOUT)
+                    scores = get_scores(channel_id)
+                except Exception as e:
+                    logger.warning("[PLAYER-EVAL] seed discovery failed for %s: %s", channel_id, e)
+                    scores = {}
+            primary_path = get_primary_player_path(ch["primary_manifest_id"])
+            for path, row in scores.items():
+                if path == primary_path:
+                    continue
+                items.append({"kind": "player_path", "channel_id": channel_id,
+                              "page_url": ch["page_url"], "path": path,
+                              "last_probed_at": row.last_probed_at})
+
+        foreign = _foreign_fallback_targets(ch)
+        if foreign:
+            scores = get_scores(channel_id)
+            for fb in foreign:
+                row = scores.get(fb["manifest_id"])
+                items.append({"kind": "foreign_fallback", "channel_id": channel_id,
+                              "manifest_id": fb["manifest_id"], "label": fb["label"],
+                              "last_probed_at": row.last_probed_at if row else None})
+
     items.sort(key=lambda it: it["last_probed_at"] or datetime.min.replace(tzinfo=timezone.utc))
     return items
+
+
+def _dispatch_warming_item(item: dict) -> None:
+    if item["kind"] == "foreign_fallback":
+        _evaluate_foreign_fallback(item["channel_id"], item["manifest_id"], item["label"])
+    else:
+        _evaluate_one(item["channel_id"], item["page_url"], item["path"])
 
 
 def _warming_loop() -> None:
@@ -203,8 +289,7 @@ def _warming_loop() -> None:
                     continue
                 batch = queue[:_MAX_WORKERS]
                 batch_start = time.monotonic()
-                futures = [pool.submit(_evaluate_one, it["channel_id"], it["page_url"], it["path"])
-                          for it in batch]
+                futures = [pool.submit(_dispatch_warming_item, it) for it in batch]
                 for f in futures:
                     f.result()
                 elapsed = time.monotonic() - batch_start
@@ -229,7 +314,7 @@ def _watchdog_loop() -> None:
     time.sleep(_STARTUP_DELAY_SECONDS)
     while True:
         try:
-            for ch in _live_multiplayer_channels():
+            for ch in _live_channels():
                 channel_id = ch["channel_id"]
                 if not _channel_is_struggling(channel_id):
                     continue
