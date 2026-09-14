@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -99,6 +100,35 @@ PRODUCTION_WINDOW_SECONDS = 3.0
 # diagnostic counter read clean (2026-09-12).
 SOURCE_STALL_SECONDS = 15.0
 
+# Segment fetches are deliberately sequential in steady state (see the
+# poller loop below) — going through a defensive source's anti-bot
+# checks one request at a time is what keeps this deployment welcome
+# there at all. But that same seriality costs real time during a
+# catch-up burst (cold start, or recovering from a stall), when several
+# already-published segments need fetching before the local playlist can
+# move again. Selective threading: only escalate to a small bounded pool
+# when a single poll finds more than CATCHUP_THREAD_THRESHOLD new
+# segments at once, AND the deployment has opted into "multi" concurrency
+# mode (RESOLVER_CONCURRENCY_MODE — see manifest_resolver._concurrency_
+# mode). Reusing that same flag means one setting controls the whole
+# deployment's overall concurrency posture instead of two independent
+# toggles to keep in sync — flip it once when pointed at a sidecar/
+# source mix that can tolerate it. In the ordinary case (0-1 new segment
+# per poll, or "single" mode) this changes nothing: same request count,
+# same pacing, same steady-state traffic pattern as before.
+CATCHUP_THREAD_THRESHOLD = 2
+CATCHUP_MAX_WORKERS = 3
+
+
+def _resolver_concurrency_mode() -> str:
+    """Local import to avoid a module-load-order cycle between the
+    resolver and streaming layers — see CATCHUP_THREAD_THRESHOLD."""
+    try:
+        from core.resolver.manifest_resolver import _concurrency_mode
+        return _concurrency_mode()
+    except Exception:
+        return "single"
+
 
 # Some CDNs prepend a fake image header (observed: a 36-byte RIFF/WebP
 # header) before the real MPEG-TS sync bytes on an otherwise-plain segment —
@@ -146,9 +176,10 @@ def _strip_ts_decoy_prefix(channel_id: str, data: bytes) -> bytes:
 
 
 class _DecryptError(Exception):
-    """Raised by _download_segment when AES decryption fails (wrong key /
-    stale session). Distinguished from generic download errors so the
-    poller loop can react with a manifest refresh instead of just retrying."""
+    """Raised by ProxyStream._fetch_one_segment when AES decryption fails
+    (wrong key / stale session). Distinguished from generic download errors
+    so the poller loop can react with a manifest refresh instead of just
+    retrying."""
 
 
 def _pick_best_variant(text: str, base_url: str) -> str:
@@ -180,7 +211,7 @@ def _pick_best_variant(text: str, base_url: str) -> str:
 def _fetch_segment_bytes(session, seg: dict, headers: dict, get_key_fn, label: str) -> bytes:
     """Fetch (and, if AES-128 encrypted, decrypt) one segment's raw bytes,
     with the decoy-header strip already applied — everything
-    ProxyStream._download_segment needs before it writes to disk, factored
+    ProxyStream._fetch_one_segment needs before writing to disk, factored
     out as a module-level function so core/resolver/segment_sampler.py can
     run the exact same fetch/decrypt/decoy-strip logic without a live
     ProxyStream instance (it just measures whether this succeeds and
@@ -295,6 +326,10 @@ class ProxyStream:
         # MEDIA-SEQUENCE advances; old keys are evicted when no segment
         # in the current playlist still references them.
         self._key_cache: dict[str, bytes] = {}
+        # Guards _key_cache only — concurrent catch-up segment fetches
+        # (see CATCHUP_THREAD_THRESHOLD) commonly share the same
+        # still-current key and would otherwise race on the dict.
+        self._key_cache_lock = threading.Lock()
 
         # Single Session so cookies persist across manifest poll, segment,
         # and key fetches. Sources whose stream auth lives on a different
@@ -334,9 +369,14 @@ class ProxyStream:
         return h
 
     def _get_key(self, key_url: str) -> Optional[bytes]:
-        """Fetch + cache the AES-128 key bytes for a given URL."""
-        if key_url in self._key_cache:
-            return self._key_cache[key_url]
+        """Fetch + cache the AES-128 key bytes for a given URL. Locked
+        around the cache dict only — see _key_cache_lock — the network
+        fetch itself runs unlocked, so a rare simultaneous miss on the
+        same key from two catch-up workers just costs one redundant
+        fetch, never a corrupted cache."""
+        with self._key_cache_lock:
+            if key_url in self._key_cache:
+                return self._key_cache[key_url]
         try:
             resp = self.session.get(key_url, headers=self._upstream_headers(), timeout=10)
         except Exception as e:
@@ -348,7 +388,8 @@ class ProxyStream:
                             self.channel_id, key_url[:80],
                             resp.status_code, len(resp.content))
             return None
-        self._key_cache[key_url] = resp.content
+        with self._key_cache_lock:
+            self._key_cache[key_url] = resp.content
         return resp.content
 
     # ── Public lifecycle ────────────────────────────────────────────────────
@@ -578,44 +619,54 @@ class ProxyStream:
                 logging.info("[PROXY] %s seeded past %d backlog segments; will grab the last %d",
                              self.channel_id, cutoff, COLD_START_SEED_SEGMENTS)
 
-            # Download new segments
-            new_count = 0
+            # Download new segments — fetch first (sequential by default,
+            # selectively threaded for a catch-up burst; see
+            # CATCHUP_THREAD_THRESHOLD), then apply all the counter/
+            # escalation/playlist bookkeeping below single-threaded and in
+            # original segment order, exactly as before this existed.
+            new_segs = []
             for seg in segments:
-                uri = seg["uri"]
-                if uri in seen_uris:
+                if seg["uri"] in seen_uris:
                     continue
-                seen_uris.add(uri)
+                seen_uris.add(seg["uri"])
+                new_segs.append(seg)
 
-                try:
-                    local_filename = f"seg_{local_seq:05d}.ts"
-                    local_path = os.path.join(self.hls_dir, local_filename)
-                    _fetch_start = time.time()
-                    self._download_segment(seg, local_path)
-                    record_sample(self.channel_id, "fetch_latency_ms",
-                                 (time.time() - _fetch_start) * 1000)
-                    segment_files.append((local_seq, local_filename, seg["duration"], seg.get("discontinuity", False)))
-                    local_seq += 1
-                    new_count += 1
-                    prod_window_dur += seg["duration"]
-                    self._consecutive_decrypt_failures = 0
-                    self._consecutive_segment_errors = 0
-                except _DecryptError as e:
-                    self._consecutive_decrypt_failures += 1
-                    incr_counter(self.channel_id, "decrypt_failures")
-                    logging.warning("[PROXY] %s decrypt failed for %s: %s (#%d consecutive)",
-                                    self.channel_id, uri[:80], e,
-                                    self._consecutive_decrypt_failures)
-                except Exception as e:
-                    self._consecutive_segment_errors += 1
-                    logging.warning("[PROXY] %s download failed for %s: %s (#%d consecutive)",
-                                    self.channel_id, uri[:80], e,
-                                    self._consecutive_segment_errors)
-                    if isinstance(e, http_requests.exceptions.ConnectionError):
-                        try:
-                            from core.block_detector import record_possible_block
-                            record_possible_block(urlparse(uri).netloc)
-                        except Exception:
-                            pass
+            new_count = 0
+            for seg, data, err in self._fetch_new_segments(new_segs):
+                uri = seg["uri"]
+                if err is None:
+                    try:
+                        local_filename = f"seg_{local_seq:05d}.ts"
+                        local_path = os.path.join(self.hls_dir, local_filename)
+                        with open(local_path, "wb") as f:
+                            f.write(data)
+                        segment_files.append((local_seq, local_filename, seg["duration"], seg.get("discontinuity", False)))
+                        local_seq += 1
+                        new_count += 1
+                        prod_window_dur += seg["duration"]
+                        self._consecutive_decrypt_failures = 0
+                        self._consecutive_segment_errors = 0
+                    except Exception as e:
+                        err = e  # local disk write failed — fall through to the same error handling below
+
+                if err is not None:
+                    if isinstance(err, _DecryptError):
+                        self._consecutive_decrypt_failures += 1
+                        incr_counter(self.channel_id, "decrypt_failures")
+                        logging.warning("[PROXY] %s decrypt failed for %s: %s (#%d consecutive)",
+                                        self.channel_id, uri[:80], err,
+                                        self._consecutive_decrypt_failures)
+                    else:
+                        self._consecutive_segment_errors += 1
+                        logging.warning("[PROXY] %s download failed for %s: %s (#%d consecutive)",
+                                        self.channel_id, uri[:80], err,
+                                        self._consecutive_segment_errors)
+                        if isinstance(err, http_requests.exceptions.ConnectionError):
+                            try:
+                                from core.block_detector import record_possible_block
+                                record_possible_block(urlparse(uri).netloc)
+                            except Exception:
+                                pass
 
             # If decrypt has been failing for several segments in a row, the
             # upstream session is stale — kick the resolver to re-establish
@@ -727,15 +778,42 @@ class ProxyStream:
 
             self._stop_event.wait(POLL_INTERVAL)
 
-    def _download_segment(self, seg: dict, local_path: str):
-        """Download a single segment to local disk — see
-        _fetch_segment_bytes (module-level) for the fetch/decrypt/decoy-
-        strip logic, factored out so core/resolver/segment_sampler.py can
-        reuse it verbatim without writing anything to disk."""
-        data = _fetch_segment_bytes(self.session, seg, self._upstream_headers(),
-                                    self._get_key, self.channel_id)
-        with open(local_path, "wb") as f:
-            f.write(data)
+    def _fetch_one_segment(self, seg: dict) -> tuple:
+        """Fetch (and decrypt/decoy-strip) one segment's bytes — see
+        _fetch_segment_bytes (module-level) for the actual logic, shared
+        with core/resolver/segment_sampler.py. Deliberately pure: no disk
+        write, no counter/state mutation, so it's safe to call from
+        multiple threads at once during a catch-up burst (see
+        _fetch_new_segments). Records its own fetch latency here (rather
+        than in the caller) so the metric reflects this segment's real
+        duration even when several run concurrently. Returns
+        (seg, data, error) — never raises."""
+        _fetch_start = time.time()
+        try:
+            data = _fetch_segment_bytes(self.session, seg, self._upstream_headers(),
+                                        self._get_key, self.channel_id)
+        except Exception as e:
+            return (seg, None, e)
+        record_sample(self.channel_id, "fetch_latency_ms",
+                     (time.time() - _fetch_start) * 1000)
+        return (seg, data, None)
+
+    def _fetch_new_segments(self, new_segs: list) -> list:
+        """Fetch every segment in new_segs and return (seg, data, error)
+        tuples in the SAME order as new_segs, regardless of which path
+        ran — the caller's counter/escalation/playlist bookkeeping stays
+        single-threaded either way. Sequential by default (see
+        CATCHUP_THREAD_THRESHOLD); escalates to a small bounded pool only
+        for a genuine catch-up burst under "multi" concurrency mode."""
+        if len(new_segs) < CATCHUP_THREAD_THRESHOLD or _resolver_concurrency_mode() != "multi":
+            return [self._fetch_one_segment(seg) for seg in new_segs]
+
+        logging.info("[PROXY] %s catch-up: fetching %d new segments with up to %d workers",
+                     self.channel_id, len(new_segs), CATCHUP_MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=CATCHUP_MAX_WORKERS) as pool:
+            # map() preserves input order in its results regardless of
+            # completion order — no manual reordering needed.
+            return list(pool.map(self._fetch_one_segment, new_segs))
 
     def _write_playlist(self, segment_files: list[tuple[int, str, float, bool]]):
         """Write a local HLS playlist from the current segment list.
