@@ -36,9 +36,23 @@ _batch = {"running": False, "total": 0, "completed": 0, "current_url": None, "re
 # is still useful: it coalesces duplicate refresh triggers from the
 # 403 safety net and the scheduled refresh worker colliding on the same
 # URL. Without it they'd each kick off independent sidecar captures.
-_inflight: dict[str, threading.Event] = {}  # page_url -> Event (set when done)
+_inflight: dict[str, tuple] = {}  # page_url -> (Event, started_at_monotonic)
 _inflight_results: dict[str, dict] = {}     # page_url -> result dict
 _inflight_lock = threading.Lock()
+
+# A per-URL in-flight entry held far longer than any legitimate resolve
+# could take means the thread that created it is genuinely stuck (hung
+# inside _call_sidecar with no client-side timeout ever firing -- confirmed
+# live, 2026-09-13: one entry sat in-flight for over an hour, permanently
+# pinning one of only RESOLVER_HIGH_SLOTS+RESOLVER_LOW_SLOTS pool permits,
+# since pool.release() only runs after _call_sidecar returns, which it
+# never did). Recurring under heavier load the next night: several entries
+# stuck for minutes at once degraded pool capacity enough that fresh
+# on-demand channel starts began failing outright. Generous multiple of
+# the normal ~90-105s resolve/wait budget -- long enough that no
+# legitimate resolve should ever hit it, short enough to actually reclaim
+# a stuck slot instead of leaving it stuck forever.
+_INFLIGHT_STALE_SECONDS = 180.0
 
 # ── Pipeline lock ──────────────────────────────────────────────────────
 # Acquired non-blocking by scheduled ticks (manifest_refresh, event_resolver)
@@ -569,13 +583,29 @@ class ManifestResolverService:
         see _call_sidecar. Everything else should leave this at the default.
         """
         # In-flight dedup — if another thread is already resolving this URL, wait for it
+        # (unless that entry is stale enough to be genuinely stuck — see
+        # _INFLIGHT_STALE_SECONDS). my_event tracks whether THIS call owns
+        # the slot, so its own finally block below only ever clears/signals
+        # the entry it actually created — never a newer one that force-
+        # cleared it out from under it.
+        event = None
+        my_event = None
         with _inflight_lock:
-            if url in _inflight:
-                event = _inflight[url]
-                logger.info("[RESOLVER] Waiting on in-flight resolve for %s", url)
+            existing = _inflight.get(url)
+            if existing:
+                existing_event, started_at = existing
+                age = time.monotonic() - started_at
+                if age < _INFLIGHT_STALE_SECONDS:
+                    event = existing_event
+                    logger.info("[RESOLVER] Waiting on in-flight resolve for %s", url)
+                else:
+                    logger.warning("[RESOLVER] In-flight resolve for %s has been stuck for "
+                                   "%.0fs — force-clearing and starting fresh", url, age)
+                    my_event = threading.Event()
+                    _inflight[url] = (my_event, time.monotonic())
             else:
-                event = None
-                _inflight[url] = threading.Event()
+                my_event = threading.Event()
+                _inflight[url] = (my_event, time.monotonic())
 
         if event:
             event.wait(timeout=timeout + 45)
@@ -671,11 +701,17 @@ class ManifestResolverService:
             expires_at = parse_body_expiry(body_text, manifest_url) or (now_utc + timedelta(minutes=30))
             logger.info("[RESOLVER] Manifest resolved and stored: %s -> %s (expires %s)",
                         url, manifest_id, expires_at.isoformat())
-            try:
-                from web import shared_state
-                shared_state.regenerate_m3u()
-            except Exception as e:
-                logger.debug("[RESOLVER] regenerate_m3u after resolve failed: %s", e)
+            # No regenerate_m3u() here — every channel publishes one stable
+            # /live/{channel_id}/... URL regardless of which manifest is
+            # currently behind it, so an ordinary refresh (the overwhelming
+            # majority of calls here: background ticks, player-health
+            # probes, light/heavy refreshes) never actually changes the
+            # M3U's content. The one case that DOES need it — a brand new
+            # channel just got created — is handled below, scoped to the
+            # auto_create branch. Regenerating unconditionally on every
+            # refresh was pure waste and widened the exposure window for
+            # the torn-read hazard regenerate_m3u() itself used to have
+            # (see its own docstring) for zero benefit.
             result = {
                 "ok": True,
                 "manifest_id": manifest_id,
@@ -765,13 +801,20 @@ class ManifestResolverService:
 
         finally:
             _status["running"] = False
-            # Signal in-flight waiters
+            # Signal in-flight waiters — only clear/signal the entry if it's
+            # still OURS (identity check on the Event). A later caller may
+            # have already force-cleared us as stale (see
+            # _INFLIGHT_STALE_SECONDS) and started its own attempt; an
+            # unconditional pop here would wipe out THAT newer attempt's
+            # own in-flight entry instead of our long-dead one.
             with _inflight_lock:
-                evt = _inflight.pop(url, None)
-            if evt:
+                current = _inflight.get(url)
+                if current is not None and current[0] is my_event:
+                    _inflight.pop(url, None)
+            if my_event:
                 if result:
                     _inflight_results[url] = result
-                evt.set()
+                my_event.set()
 
     @staticmethod
     def light_refresh_manifest(manifest_id: str) -> dict:
