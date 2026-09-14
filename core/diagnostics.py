@@ -187,16 +187,35 @@ def score_quality(*, encode_speed_ratio=None, reconnect_gap_ms_max=None,
                    fallback_active=False) -> str:
     """Returns "excellent" | "good" | "bad" | "unknown". A metric that's None
     (doesn't apply to this stream's mode, e.g. encode_speed_ratio for a pure
-    copy/remux/proxy stream) is skipped rather than penalized. Running on a
-    fallback source at all is an automatic "bad" — the primary is broken."""
+    copy/remux/proxy stream) is skipped rather than penalized. encode_speed_
+    ratio and fetch_latency_ms_avg are mutually exclusive signals, not
+    additive — see the inline comment below for why. Running on a fallback
+    source at all is an automatic "bad" — the primary is broken."""
     if fallback_active:
         return "bad"
 
     scores = []
+    # fetch_latency_ms_avg is a PROXY for "is content landing fast enough
+    # to sustain playback" -- encode_speed_ratio (which the call site also
+    # uses to carry production_speed_ratio for modes that never re-encode,
+    # see _snapshot_channel's speed_ratio_for_scoring) measures that
+    # directly: content-seconds produced per wall-clock second. When the
+    # direct measurement is available, trust it instead of ALSO gating on
+    # the proxy metric -- a stream can have high per-segment fetch latency
+    # and still sustain real-time delivery (see proxy_stream.py's
+    # catch-up threading, which exists specifically to make that true),
+    # and scoring both was flagging those streams "bad" from the same
+    # underlying cause counted twice, even while they play cleanly.
+    # Latency only falls back to being the signal when there's no direct
+    # measurement for this stream's mode at all.
     if encode_speed_ratio is not None:
         scores.append(
             "excellent" if encode_speed_ratio >= SPEED_RATIO_EXCELLENT else
             "good" if encode_speed_ratio >= SPEED_RATIO_GOOD else "bad")
+    elif fetch_latency_ms_avg is not None:
+        scores.append(
+            "excellent" if fetch_latency_ms_avg <= FETCH_LATENCY_EXCELLENT_MS else
+            "good" if fetch_latency_ms_avg <= FETCH_LATENCY_GOOD_MS else "bad")
     if reconnect_gap_ms_max is not None:
         scores.append(
             "excellent" if reconnect_gap_ms_max <= RECONNECT_GAP_EXCELLENT_MS else
@@ -205,10 +224,6 @@ def score_quality(*, encode_speed_ratio=None, reconnect_gap_ms_max=None,
         scores.append(
             "excellent" if error_count_5m <= ERROR_RATE_EXCELLENT_PER_5MIN else
             "good" if error_count_5m <= ERROR_RATE_GOOD_PER_5MIN else "bad")
-    if fetch_latency_ms_avg is not None:
-        scores.append(
-            "excellent" if fetch_latency_ms_avg <= FETCH_LATENCY_EXCELLENT_MS else
-            "good" if fetch_latency_ms_avg <= FETCH_LATENCY_GOOD_MS else "bad")
 
     if not scores:
         return "unknown"
@@ -297,6 +312,32 @@ def get_summary(channel_id: str) -> dict:
 
     fallback_active = bool(meta.get("fallback_active", False))
 
+    # How long since this channel last recorded ANY real production
+    # activity (a segment fetch or a speed-ratio sample) — the direct
+    # complement to `quality` above, which can only ever describe samples
+    # that exist. A channel stuck in a fail/refresh loop stops producing
+    # samples entirely rather than producing bad ones, so the rolling
+    # window just keeps averaging whatever it had from before things broke
+    # — quality can read "good" for minutes after a channel has gone
+    # completely silent. Falls back to time-since-start when there's no
+    # sample at all yet, so a channel that's been broken since the very
+    # first second isn't invisible to this just because it never got any
+    # data in (as opposed to going quiet after a while) — a channel still
+    # within its own cold-start grace naturally reads a small number here
+    # either way, so this doesn't false-positive on a fresh start.
+    last_activity_ts = None
+    for metric in ("fetch_latency_ms", "production_speed_ratio", "encode_speed_ratio"):
+        entries = samples.get(metric)
+        if entries and (last_activity_ts is None or entries[-1]["ts"] > last_activity_ts):
+            last_activity_ts = entries[-1]["ts"]
+    started_at = meta.get("started_at")
+    if last_activity_ts is not None:
+        seconds_since_last_activity = time.time() - last_activity_ts
+    elif started_at:
+        seconds_since_last_activity = time.time() - started_at
+    else:
+        seconds_since_last_activity = None
+
     quality = score_quality(
         encode_speed_ratio=speed_ratio_for_scoring,
         reconnect_gap_ms_max=reconnect_gap_max,
@@ -323,6 +364,8 @@ def get_summary(channel_id: str) -> dict:
         "playlist_wait_ms_max": round(playlist_wait_max, 1) if playlist_wait_max is not None else None,
         "reconnects_last_5m": reconnects_5m,
         "errors_last_5m": error_events_5m,
+        "seconds_since_last_activity": (round(seconds_since_last_activity, 1)
+                                        if seconds_since_last_activity is not None else None),
         "fallback_active": fallback_active,
         # Which candidate is actually serving right now -- "primary",
         # "fallback (stored)", or "fallback (player: X)" for a discovered
