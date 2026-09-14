@@ -126,6 +126,17 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN epg_pw_id VARCHAR"))
                     conn.commit()
                 logging.info("[DB] Added column channels.epg_pw_id")
+        # Player-path/source labels for the multi-player ranking view (see
+        # core.resolver.player_health) -- opaque display text sourced from
+        # whichever plugin/manifest discovered the candidate, never a
+        # site name hardcoded here.
+        if "player_health_scores" in tables:
+            phs_cols = [c["name"] for c in insp.get_columns("player_health_scores")]
+            if "label" not in phs_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE player_health_scores ADD COLUMN label VARCHAR"))
+                    conn.commit()
+                logging.info("[DB] Added column player_health_scores.label")
         Base.metadata.create_all(engine)
         logging.info("[DB] Resolver tables ready")
         # B5 finalization: migrate legacy ch-{8} IDs to UUIDs, retire the

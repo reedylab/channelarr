@@ -249,11 +249,22 @@ def regenerate_m3u():
 
     os.makedirs(m3u_path, exist_ok=True)
     out = os.path.join(m3u_path, "channelarr.m3u")
+    tmp = out + ".tmp"
 
     scheduled = [ch for ch in channels if ch.get("type") != "resolved"]
     resolved = [ch for ch in channels if ch.get("type") == "resolved"]
 
-    with open(out, "w") as f:
+    # Atomic write — open(out, "w") used to truncate the LIVE file in place
+    # and write it line by line, a classic torn-read hazard: any reader
+    # (Jellyfin re-fetching its tuner's M3U) landing between the truncation
+    # and the final write sees a partial/empty file, which reads as
+    # "malformed M3U" and can reject every channel in it, not just one.
+    # Negligible risk while this ran rarely, but the new continuous score-
+    # driven reordering/promotion work calls this far more often than
+    # before, turning a once-negligible window into a real, recurring one.
+    # write-tmp-then-os.replace matches the same pattern already used for
+    # live HLS playlists (proxy_stream/remux_stream's _write_output_playlist).
+    with open(tmp, "w") as f:
         f.write("#EXTM3U\n")
         chno = 1
         for ch in scheduled:
@@ -297,6 +308,7 @@ def regenerate_m3u():
                 f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")
             chno += 1
 
+    os.replace(tmp, out)
     logging.info("[M3U] Regenerated %s with %d channels (%d scheduled, %d resolved)",
                  out, len(channels), len(scheduled), len(resolved))
 
