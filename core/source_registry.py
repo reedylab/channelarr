@@ -351,6 +351,75 @@ def promote_source_to_primary(source_id: str) -> dict:
     return {"promoted": promoted, "already_primary": already_primary, "no_match": no_match}
 
 
+def _channels_primaried_on_source(session, domains: list[str]):
+    """Every resolved Channel row whose CURRENT PRIMARY's front-door
+    page_url matches one of `domains` -- the shared "which channels does
+    this bulk action affect" lookup used by promote_source_to_primary,
+    set_sequential_fetch_for_source, and set_encoder_mode_for_source."""
+    from urllib.parse import urlparse
+    from core.models.channel import Channel
+    from core.models.manifest import Manifest, Capture
+
+    manifest_domains = dict(
+        session.query(Manifest.id, Capture.page_url)
+        .join(Capture, Manifest.capture_id == Capture.id)
+        .all()
+    )
+    out = []
+    for row in session.query(Channel).filter(Channel.type == "resolved").all():
+        page_url = manifest_domains.get(row.manifest_id)
+        if not page_url:
+            continue
+        domain = urlparse(page_url).netloc
+        if any(_domain_matches(domain, d) for d in domains):
+            out.append(row)
+    return out
+
+
+def set_encoder_mode_for_source(source_id: str, mode: str) -> dict:
+    """Bulk-set encoder_mode to an EXACT value for every channel whose
+    CURRENT PRIMARY belongs to this declared source -- unlike
+    set_sequential_fetch_for_source (which preserves whichever base mode a
+    channel already had and only toggles the _sequential suffix), this
+    forces every matching channel to the SAME literal mode, e.g. switching
+    a source that's a mix of proxy/remux channels to all-remux_sequential
+    at once. Valid modes: proxy, proxy_sequential, remux, remux_sequential
+    (see core/channels.py's base_encoder_mode/is_sequential_encoder_mode --
+    single/multi/copy/tab_proxy don't have a sequential variant and aren't
+    valid here).
+
+    Returns {"updated": [{"channel_id", "name"}], "no_match": int}."""
+    from core.channels import base_encoder_mode
+    if base_encoder_mode(mode) not in ("proxy", "remux"):
+        return {"updated": [], "no_match": 0, "error": f"invalid mode: {mode!r}"}
+    sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
+    if not sources:
+        return {"updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
+    domains = sources[0]["domains"]
+
+    from core.database import get_session
+
+    updated = []
+    with get_session() as session:
+        for row in _channels_primaried_on_source(session, domains):
+            if row.encoder_mode != mode:
+                row.encoder_mode = mode
+                updated.append({"channel_id": row.id, "name": row.name})
+
+    if updated:
+        from web import shared_state
+        for u in updated:
+            try:
+                shared_state.streamer_mgr.stop_channel(u["channel_id"])
+            except Exception as e:
+                logger.warning("[SOURCES] Failed to stop channel %s after encoder_mode change: %s",
+                               u["channel_id"], e)
+
+    logger.info("[SOURCES] Set encoder_mode=%s for %d channel(s) on source %s",
+                mode, len(updated), source_id)
+    return {"updated": updated, "no_match": 0}
+
+
 def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
     """Bulk-toggle the "_sequential" encoder_mode variant for every channel
     whose CURRENT PRIMARY belongs to this declared source -- real
@@ -379,26 +448,11 @@ def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
     domains = sources[0]["domains"]
 
     from core.database import get_session
-    from core.models.channel import Channel
-    from core.models.manifest import Manifest, Capture
     from core.channels import sequential_variant
 
     updated = []
     with get_session() as session:
-        manifest_domains = dict(
-            session.query(Manifest.id, Capture.page_url)
-            .join(Capture, Manifest.capture_id == Capture.id)
-            .all()
-        )
-        rows = session.query(Channel).filter(Channel.type == "resolved").all()
-        for row in rows:
-            page_url = manifest_domains.get(row.manifest_id)
-            if not page_url:
-                continue
-            from urllib.parse import urlparse
-            domain = urlparse(page_url).netloc
-            if not any(_domain_matches(domain, d) for d in domains):
-                continue
+        for row in _channels_primaried_on_source(session, domains):
             new_mode = sequential_variant(row.encoder_mode, enabled)
             if new_mode != row.encoder_mode:
                 row.encoder_mode = new_mode

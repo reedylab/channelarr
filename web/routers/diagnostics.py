@@ -111,8 +111,9 @@ def diagnostics_promote_source(source_id: str):
 
 @router.post("/diagnostics/sources/{source_id}/sequential-fetch")
 def diagnostics_set_sequential_fetch(source_id: str, body: dict):
-    """Bulk per-channel Channel.sequential_fetch_only override for every
-    channel currently primaried on this source (core/source_registry.py::
+    """Bulk-toggle the "_sequential" encoder_mode suffix for every channel
+    currently primaried on this source, PRESERVING each channel's own
+    current base mode (core/source_registry.py::
     set_sequential_fetch_for_source). Body: {"enabled": bool}. Some
     sources' CDNs detect bursty/concurrent segment fetching and serve back
     corrupted content -- this forces plain sequential fetching for those
@@ -122,6 +123,24 @@ def diagnostics_set_sequential_fetch(source_id: str, body: dict):
     from core.source_registry import set_sequential_fetch_for_source
     enabled = bool(body.get("enabled", True))
     result = set_sequential_fetch_for_source(source_id, enabled)
+    return {"ok": "error" not in result, **result}
+
+
+@router.post("/diagnostics/sources/{source_id}/set-mode")
+def diagnostics_set_encoder_mode(source_id: str, body: dict):
+    """Bulk-set encoder_mode to an EXACT value for every channel currently
+    primaried on this source (core/source_registry.py::
+    set_encoder_mode_for_source) -- unlike the sequential-fetch toggle
+    above, this forces every matching channel to the SAME literal mode
+    regardless of what base mode each one currently has. Body:
+    {"mode": "proxy"|"proxy_sequential"|"remux"|"remux_sequential"}.
+    Stops each affected channel's current stream so the next playlist
+    request reboots it with the new mode."""
+    from core.source_registry import set_encoder_mode_for_source
+    mode = body.get("mode")
+    if not mode:
+        return {"ok": False, "error": "mode required"}
+    result = set_encoder_mode_for_source(source_id, mode)
     return {"ok": "error" not in result, **result}
 
 
