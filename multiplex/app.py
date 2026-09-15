@@ -246,7 +246,26 @@ _CHANNELARR_BASE_URL = os.getenv("CHANNELARR_BASE_URL", "http://localhost:5045")
 # req.timeout+45 and req.timeout defaults to 60 (callers can set it higher,
 # but this is generous headroom over any realistic capture, matching
 # "definitely stale" rather than "might still be working").
-_TAB_STALE_SECONDS = int(os.getenv("SIDECAR_TAB_STALE_SECONDS", "300"))
+#
+# Lowered from 300s on 2026-09-15: PrioritySemaphore's own docstring already
+# says its slot count "has no relationship to how many real Chrome renderer
+# processes are actually still alive" -- this threshold is what actually
+# bounds that gap. Under NORMAL conditions (most tabs close cleanly) that
+# gap barely matters. But under SUSTAINED heavy failure against one or more
+# sources -- confirmed real this session, driven by a large pool of stored
+# fallback candidates all sharing a synchronized expiry window and
+# re-entering the refresh cycle's "due" pool together -- most captures end
+# mid-network-activity, exactly _close_tab_safely's own documented trigger
+# for a tab failing to close cleanly. At a high failure rate, "occasional
+# straggler cleaned up eventually" stops being true; stuck tabs can
+# accumulate faster than one sweep pass (_TAB_SWEEP_INTERVAL) clears them,
+# each still burning real CPU/memory, degrading the shared browser enough
+# that even unrelated, healthy captures start failing too -- a real,
+# reproduced-twice-in-one-session failure spiral, only resolved by a full
+# container restart. Longest legitimate capture observed is a multi-player
+# sweep at ~150s deadline; 180s keeps real margin above that while roughly
+# halving the worst-case pile-up window from 300s.
+_TAB_STALE_SECONDS = int(os.getenv("SIDECAR_TAB_STALE_SECONDS", "180"))
 _TAB_SWEEP_INTERVAL = int(os.getenv("SIDECAR_TAB_SWEEP_INTERVAL", "60"))
 # Cap how many past debug=True captures' screenshot dirs stick around --
 # oldest-evicted. Small, real hardening detail: debug traffic could

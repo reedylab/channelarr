@@ -377,6 +377,48 @@ def refresh_due_manifests():
             deduped.sort(key=lambda row: (row[1] is not None, row[1]))
             ids = [mid for mid, _ in deduped]
 
+            # Skip candidates whose underlying source is currently disabled
+            # (manual toggle or auto-held on sustained failures — see
+            # core/source_registry.py) BEFORE spending any refresh effort on
+            # them, not just relying on _call_sidecar's own downstream gate.
+            # Real motivation, confirmed 2026-09-14: a large pool of stored
+            # multi-player-family fallback manifests all share the same
+            # ~30min TTL (all discovered together by the same fallback-race
+            # event),
+            # so they naturally re-expire in synchronized clusters and kept
+            # re-entering this tick's "due" pool every cycle regardless of
+            # how consistently they'd already failed — burning heavy-refresh
+            # budget slots on known-doomed candidates every single tick and
+            # crowding out genuinely-recoverable ones, on top of the raw
+            # hammering itself. is_domain_enabled()'s own probe-cooldown
+            # still lets exactly one candidate per held domain through per
+            # window (whichever is checked first in this loop) — this isn't
+            # a permanent exclusion, just stops re-trying the same known-bad
+            # pool on every tick regardless of track record.
+            if ids:
+                from urllib.parse import urlparse
+                from core.source_registry import is_domain_enabled
+                page_urls = dict(
+                    session.query(Manifest.id, Capture.page_url)
+                    .join(Capture, Manifest.capture_id == Capture.id)
+                    .filter(Manifest.id.in_(ids))
+                    .all()
+                )
+                filtered_ids = []
+                skipped_disabled = 0
+                for mid in ids:
+                    page_url = page_urls.get(mid)
+                    domain = urlparse(page_url).netloc if page_url else None
+                    enabled, reason = is_domain_enabled(domain) if domain else (True, None)
+                    if enabled:
+                        filtered_ids.append(mid)
+                    else:
+                        skipped_disabled += 1
+                if skipped_disabled:
+                    logger.info("[RESOLVER] Refresh tick: skipping %d due candidate(s) — source disabled",
+                                skipped_disabled)
+                ids = filtered_ids
+
             # Tag each manifest with the priority it should carry into a heavy
             # sidecar refresh — fallback-warming-only manifests are pure
             # background work and get "low" (defers on the sidecar's single

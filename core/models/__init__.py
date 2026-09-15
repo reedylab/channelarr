@@ -15,7 +15,8 @@ from core.models.vpn_server import VpnServer
 from core.models.diagnostics import StreamDiagnosticSnapshot
 from core.models.player_health import PlayerHealthScore
 from core.models.source_toggle import SourceToggle
+from core.models.domain_failure import DomainFailure
 
 __all__ = ["Base", "Channel", "EpgPwCache", "Capture", "Manifest", "Variant",
            "HeaderProfile", "ScrapedEvent", "VpnServer", "StreamDiagnosticSnapshot",
-           "PlayerHealthScore", "SourceToggle"]
+           "PlayerHealthScore", "SourceToggle", "DomainFailure"]
