@@ -351,11 +351,20 @@ def promote_source_to_primary(source_id: str) -> dict:
     return {"promoted": promoted, "already_primary": already_primary, "no_match": no_match}
 
 
-def _channels_primaried_on_source(session, domains: list[str]):
-    """Every resolved Channel row whose CURRENT PRIMARY's front-door
-    page_url matches one of `domains` -- the shared "which channels does
-    this bulk action affect" lookup used by promote_source_to_primary,
-    set_sequential_fetch_for_source, and set_encoder_mode_for_source."""
+def _channel_source_matches(session, domains: list[str]):
+    """For every resolved Channel row, which of its candidates (primary
+    and/or fallbacks) belong to a source declaring `domains` -- the shared
+    "which channels/candidates does this bulk action affect" lookup used
+    by promote_source_to_primary, set_sequential_fetch_for_source, and
+    set_encoder_mode_for_source. A source's manifests don't only ever sit
+    as primary -- the SAME source can be a dormant fallback on a channel
+    currently primaried elsewhere (found real 2026-09-15: dozens of
+    channels had a stale plain-mode override sitting on an unrelated
+    source's own fallback candidate from that source, never touched by an
+    earlier primary-only version of this bulk logic).
+
+    Yields (row, primary_matches: bool, fallback_ids_matching: list[str])
+    for every channel where at least one of those is true."""
     from urllib.parse import urlparse
     from core.models.channel import Channel
     from core.models.manifest import Manifest, Capture
@@ -365,46 +374,73 @@ def _channels_primaried_on_source(session, domains: list[str]):
         .join(Capture, Manifest.capture_id == Capture.id)
         .all()
     )
-    out = []
-    for row in session.query(Channel).filter(Channel.type == "resolved").all():
-        page_url = manifest_domains.get(row.manifest_id)
+
+    def _matches(manifest_id):
+        page_url = manifest_domains.get(manifest_id)
         if not page_url:
-            continue
+            return False
         domain = urlparse(page_url).netloc
-        if any(_domain_matches(domain, d) for d in domains):
-            out.append(row)
-    return out
+        return any(_domain_matches(domain, d) for d in domains)
+
+    for row in session.query(Channel).filter(Channel.type == "resolved").all():
+        primary_matches = bool(row.manifest_id) and _matches(row.manifest_id)
+        fb_matches = [fid for fid in (row.fallback_manifest_ids or []) if _matches(fid)]
+        if primary_matches or fb_matches:
+            yield row, primary_matches, fb_matches
 
 
 def set_encoder_mode_for_source(source_id: str, mode: str) -> dict:
-    """Bulk-set encoder_mode to an EXACT value for every channel whose
-    CURRENT PRIMARY belongs to this declared source -- unlike
-    set_sequential_fetch_for_source (which preserves whichever base mode a
-    channel already had and only toggles the _sequential suffix), this
-    forces every matching channel to the SAME literal mode, e.g. switching
-    a source that's a mix of proxy/remux channels to all-remux_sequential
-    at once. Valid modes: proxy, proxy_sequential, remux, remux_sequential
-    (see core/channels.py's base_encoder_mode/is_sequential_encoder_mode --
-    single/multi/copy/tab_proxy don't have a sequential variant and aren't
-    valid here).
+    """Bulk-set encoder_mode to an EXACT value for every candidate (primary
+    OR fallback) belonging to this declared source, across every channel --
+    unlike set_sequential_fetch_for_source (which preserves whichever base
+    mode a channel already had and only toggles the _sequential suffix),
+    this forces every matching candidate to the SAME literal mode, e.g.
+    switching a source that's a mix of proxy/remux channels to all-
+    remux_sequential at once. Valid modes: proxy, proxy_sequential, remux,
+    remux_sequential (see core/channels.py's base_encoder_mode/
+    is_sequential_encoder_mode -- single/multi/copy/tab_proxy don't have a
+    sequential variant and aren't valid here).
 
-    Returns {"updated": [{"channel_id", "name"}], "no_match": int}."""
+    Only channels whose PRIMARY changed get their current stream stopped
+    (so the next request reboots it with the new mode) -- a dormant
+    fallback candidate's stored override changing doesn't affect anything
+    currently playing, no reason to interrupt it.
+
+    Returns {"updated": [...] (primary changed, stream restarted),
+    "fallback_only_updated": [...] (a fallback's stored override changed,
+    nothing currently playing affected), "no_match": int}."""
     from core.channels import base_encoder_mode
     if base_encoder_mode(mode) not in ("proxy", "remux"):
-        return {"updated": [], "no_match": 0, "error": f"invalid mode: {mode!r}"}
+        return {"updated": [], "fallback_only_updated": [], "no_match": 0, "error": f"invalid mode: {mode!r}"}
     sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
     if not sources:
-        return {"updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
+        return {"updated": [], "fallback_only_updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
     domains = sources[0]["domains"]
 
     from core.database import get_session
 
     updated = []
+    fallback_only_updated = []
     with get_session() as session:
-        for row in _channels_primaried_on_source(session, domains):
-            if row.encoder_mode != mode:
+        for row, primary_matches, fb_matches in _channel_source_matches(session, domains):
+            primary_changed = False
+            if primary_matches and row.encoder_mode != mode:
                 row.encoder_mode = mode
+                primary_changed = True
+
+            fb_modes = dict(row.fallback_encoder_modes or {})
+            fb_changed = False
+            for fid in fb_matches:
+                if fb_modes.get(fid) != mode:
+                    fb_modes[fid] = mode
+                    fb_changed = True
+            if fb_changed:
+                row.fallback_encoder_modes = fb_modes
+
+            if primary_changed:
                 updated.append({"channel_id": row.id, "name": row.name})
+            elif fb_changed:
+                fallback_only_updated.append({"channel_id": row.id, "name": row.name})
 
     if updated:
         from web import shared_state
@@ -415,14 +451,17 @@ def set_encoder_mode_for_source(source_id: str, mode: str) -> dict:
                 logger.warning("[SOURCES] Failed to stop channel %s after encoder_mode change: %s",
                                u["channel_id"], e)
 
-    logger.info("[SOURCES] Set encoder_mode=%s for %d channel(s) on source %s",
-                mode, len(updated), source_id)
-    return {"updated": updated, "no_match": 0}
+    logger.info("[SOURCES] Set encoder_mode=%s for source %s: %d primary (restarted), %d fallback-only",
+                mode, source_id, len(updated), len(fallback_only_updated))
+    return {"updated": updated, "fallback_only_updated": fallback_only_updated, "no_match": 0}
 
 
 def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
-    """Bulk-toggle the "_sequential" encoder_mode variant for every channel
-    whose CURRENT PRIMARY belongs to this declared source -- real
+    """Bulk-toggle the "_sequential" encoder_mode variant for every
+    candidate (primary OR fallback) belonging to this declared source,
+    across every channel -- PRESERVING each candidate's own current base
+    mode (a fallback's own fallback_encoder_modes override if it has one,
+    else whatever the channel's own default happens to be). Real
     motivation: some sources' CDNs detect bursty/concurrent segment
     fetching and respond with corrupted content, so the catch-up threading
     that's fine for most sources (see proxy_stream.py's
@@ -435,28 +474,45 @@ def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
     exact per-channel override mechanism encoder_mode/fallback_encoder_modes
     already provide instead of a second, parallel dimension.
 
-    Matches primary only, same as promote_source_to_primary -- a channel
-    currently using this source as a dormant fallback isn't actively
-    fetching from it, so there's nothing to protect yet; if it's later
-    promoted, re-run this action (or set the fallback's own
-    fallback_encoder_modes entry to the _sequential variant directly).
+    Only channels whose PRIMARY changed get their current stream stopped --
+    see set_encoder_mode_for_source's own docstring for why.
 
-    Returns {"updated": [{"channel_id", "name"}], "no_match": int}."""
+    Returns {"updated": [...] (primary changed, stream restarted),
+    "fallback_only_updated": [...], "no_match": int}."""
     sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
     if not sources:
-        return {"updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
+        return {"updated": [], "fallback_only_updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
     domains = sources[0]["domains"]
 
     from core.database import get_session
     from core.channels import sequential_variant
 
     updated = []
+    fallback_only_updated = []
     with get_session() as session:
-        for row in _channels_primaried_on_source(session, domains):
-            new_mode = sequential_variant(row.encoder_mode, enabled)
-            if new_mode != row.encoder_mode:
-                row.encoder_mode = new_mode
+        for row, primary_matches, fb_matches in _channel_source_matches(session, domains):
+            primary_changed = False
+            if primary_matches:
+                new_mode = sequential_variant(row.encoder_mode, enabled)
+                if new_mode != row.encoder_mode:
+                    row.encoder_mode = new_mode
+                    primary_changed = True
+
+            fb_modes = dict(row.fallback_encoder_modes or {})
+            fb_changed = False
+            for fid in fb_matches:
+                current = fb_modes.get(fid) or row.encoder_mode
+                new_mode = sequential_variant(current, enabled)
+                if fb_modes.get(fid) != new_mode:
+                    fb_modes[fid] = new_mode
+                    fb_changed = True
+            if fb_changed:
+                row.fallback_encoder_modes = fb_modes
+
+            if primary_changed:
                 updated.append({"channel_id": row.id, "name": row.name})
+            elif fb_changed:
+                fallback_only_updated.append({"channel_id": row.id, "name": row.name})
 
     if updated:
         # encoder_mode is read once at ProxyStream/RemuxStream construction
@@ -472,9 +528,9 @@ def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
                 logger.warning("[SOURCES] Failed to stop channel %s after encoder_mode change: %s",
                                u["channel_id"], e)
 
-    logger.info("[SOURCES] Set sequential-fetch=%s for %d channel(s) on source %s",
-                enabled, len(updated), source_id)
-    return {"updated": updated, "no_match": 0}
+    logger.info("[SOURCES] Set sequential-fetch=%s for source %s: %d primary (restarted), %d fallback-only",
+                enabled, source_id, len(updated), len(fallback_only_updated))
+    return {"updated": updated, "fallback_only_updated": fallback_only_updated, "no_match": 0}
 
 
 def list_source_status() -> list[dict]:

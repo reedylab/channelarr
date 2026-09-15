@@ -4195,7 +4195,7 @@ function promoteSource(sourceId, displayName) {
 
 function setSequentialFetch(sourceId, displayName, enabled) {
   const verb = enabled ? "Force sequential (never threaded)" : "Allow threaded catch-up";
-  if (!confirm(`${verb} segment fetching for every channel currently primaried on ${displayName}? Affected channels currently running will be stopped and re-started with the new setting on next request.`)) {
+  if (!confirm(`${verb} segment fetching for every candidate (primary or fallback) belonging to ${displayName}, across every channel? Channels whose PRIMARY changed will be stopped and re-started with the new setting on next request; a dormant fallback's stored setting updates without interrupting anything currently playing.`)) {
     return;
   }
   fetch(`${API}/diagnostics/sources/${encodeURIComponent(sourceId)}/sequential-fetch`, {
@@ -4204,7 +4204,7 @@ function setSequentialFetch(sourceId, displayName, enabled) {
     body: JSON.stringify({ enabled }),
   }).then(r => r.json()).then(data => {
     if (data.error) { alert(`Failed: ${data.error}`); return; }
-    alert(`Updated ${data.updated.length} channel(s).`);
+    alert(`${data.updated.length} channel(s) restarted with the new primary setting; ${data.fallback_only_updated.length} dormant fallback(s) updated.`);
   }).catch(() => alert("Request failed -- check the server logs."));
 }
 
