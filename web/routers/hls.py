@@ -77,9 +77,21 @@ def _pick_working_manifest(ch):
     outright, without even a light-refresh attempt, exactly like every
     other exhausted candidate. This is the "a domain that's down doesn't
     need to be tried on every channel that lists it as primary" enforcement
-    point from the Sources panel design -- see [[project_source_health_panel]].
+    point from the Sources panel design.
+
+    The enable check is against each candidate's own front-door page_url
+    domain, NOT its resolved manifest_url (CDN) domain -- real bug found
+    2026-09-15: several unrelated declared sources land on the SAME shared
+    CDN family for their actual video delivery, so checking the CDN domain
+    meant a source's manual toggle could never match its own stored
+    candidates at all -- disabling a source had zero effect on fallback
+    selection, only on brand-new resolves. The declared source domains
+    describe the front door a plugin actually resolves through, which is
+    exactly what Capture.page_url is.
     """
     from urllib.parse import urlparse
+    from core.database import get_session
+    from core.models.manifest import Manifest, Capture
     from core.resolver.manifest_resolver import ManifestResolverService
     from core.source_registry import is_domain_enabled
 
@@ -94,12 +106,22 @@ def _pick_working_manifest(ch):
                             "expires_at": ch.get("expires_at")})
     candidates.extend(ch.get("fallback_sources") or [])
 
+    candidate_ids = [c.get("manifest_id") for c in candidates if c.get("manifest_id")]
+    with get_session() as session:
+        page_urls = dict(
+            session.query(Manifest.id, Capture.page_url)
+            .join(Capture, Manifest.capture_id == Capture.id)
+            .filter(Manifest.id.in_(candidate_ids))
+            .all()
+        ) if candidate_ids else {}
+
     for i, cand in enumerate(candidates):
         mid, murl = cand.get("manifest_id"), cand.get("manifest_url")
         if not mid or not murl:
             continue
-        cand_domain = urlparse(murl).netloc
-        cand_enabled, cand_reason = is_domain_enabled(cand_domain)
+        cand_page_url = page_urls.get(mid)
+        cand_domain = urlparse(cand_page_url).netloc if cand_page_url else None
+        cand_enabled, cand_reason = is_domain_enabled(cand_domain) if cand_domain else (True, None)
         if not cand_enabled:
             logging.info("[HLS] %s: skipping candidate #%d (%s) — %s",
                          ch.get("id"), i, mid, cand_reason)
