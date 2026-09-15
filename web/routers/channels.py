@@ -263,7 +263,7 @@ async def api_set_primary_manifest(channel_id: str, request: Request):
     guard = _require_resolved(channel_id)
     if isinstance(guard, JSONResponse):
         return guard
-    ch = shared_state.channel_mgr.set_primary_manifest(channel_id, manifest_id)
+    ch = shared_state.channel_mgr.set_primary_manifest(channel_id, manifest_id, manual=True)
     if not ch:
         return JSONResponse({"error": "Manifest not found"}, status_code=404)
     shared_state.streamer_mgr.stop_channel(channel_id)

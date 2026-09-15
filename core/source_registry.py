@@ -312,6 +312,7 @@ def promote_source_to_primary(source_id: str) -> dict:
         domain = urlparse(page_url).netloc
         return any(_domain_matches(domain, d) for d in domains)
 
+    to_refresh = []
     for channel_id, name, primary_id, fb_ids in rows:
         if primary_id and _matches_source(primary_id):
             already_primary += 1
@@ -319,8 +320,31 @@ def promote_source_to_primary(source_id: str) -> dict:
         match = next((mid for mid in (fb_ids or []) if _matches_source(mid)), None)
         if not match:
             continue
-        channel_mgr.set_primary_manifest(channel_id, match)
+        channel_mgr.set_primary_manifest(channel_id, match, manual=True)
         promoted.append({"channel_id": channel_id, "name": name})
+        to_refresh.append(match)
+
+    if to_refresh:
+        # Real bug found 2026-09-15: promoting a fallback captured hours
+        # earlier (e.g. right after a bulk enrichment pass) makes it
+        # primary in the DB immediately, but its stored manifest can
+        # already be token-expired by then -- _pick_working_manifest's own
+        # expiry check silently skips an expired primary and falls through
+        # to whatever's next in the chain, with no visible error. From the
+        # human's side that looks exactly like "the button didn't work,"
+        # even though the promotion itself was correct. Force a real heavy
+        # refresh of everything just promoted, in the background so the
+        # endpoint itself returns quickly even for a large source -- this
+        # is what actually makes "promote all" visibly take effect instead
+        # of silently deferring to the next throttled refresh-tick pass.
+        def _refresh_all():
+            from core.resolver.manifest_resolver import ManifestResolverService
+            for mid in to_refresh:
+                try:
+                    ManifestResolverService.refresh_manifest(mid, priority="high")
+                except Exception as e:
+                    logger.warning("[SOURCES] post-promote refresh failed for %s: %s", mid, e)
+        threading.Thread(target=_refresh_all, daemon=True).start()
 
     logger.info("[SOURCES] Promoted %d channel(s) to primary for source %s (already_primary=%d)",
                 len(promoted), source_id, already_primary)

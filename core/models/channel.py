@@ -98,6 +98,19 @@ class Channel(Base):
     # no HLS playlist upstream at all (see core/resolver/segment_sources.py).
     source_kind = Column(String, nullable=False, default="hls")
 
+    # Set whenever a human explicitly chooses the primary (per-channel Make
+    # Primary button, or the bulk per-source Promote All action) -- NOT set
+    # by any automated path (player_health.maybe_promote_best_player,
+    # discovery/fallback-race logic). Real bug found 2026-09-15: with no
+    # such marker, an automated health-score promotion could silently
+    # override a human's explicit choice minutes later with zero visibility
+    # -- especially likely right after a manual promotion, since a freshly
+    # promoted candidate starts with no player_health track record of its
+    # own. maybe_promote_best_player checks this and skips entirely while
+    # recent, mirroring the same "manual always wins over automated" split
+    # already used for source-level enable/disable (core/source_registry.py).
+    manual_primary_pinned_at = Column(DateTime(timezone=True), nullable=True)
+
     branding_logo = Column(String, nullable=True)
 
     # Channel tags for grouping and auto-cleanup behavior

@@ -59,6 +59,8 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
         "event_start": row.event_start.isoformat() if getattr(row, "event_start", None) else None,
         "event_end": row.event_end.isoformat() if getattr(row, "event_end", None) else None,
         "epg_pw_id": getattr(row, "epg_pw_id", None),
+        "manual_primary_pinned_at": row.manual_primary_pinned_at.isoformat()
+            if getattr(row, "manual_primary_pinned_at", None) else None,
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.
@@ -571,15 +573,25 @@ class ChannelManager:
         logging.info("[CHANNELS] Removed fallback source %s from channel %s", manifest_id, channel_id)
         return self.get_channel(channel_id)
 
-    def set_primary_manifest(self, channel_id: str, manifest_id: str) -> dict | None:
+    def set_primary_manifest(self, channel_id: str, manifest_id: str, manual: bool = False) -> dict | None:
         """Swap which manifest is primary for a resolved channel. The OLD
         primary is automatically pushed onto the FRONT of the fallback
         chain (so it's tried first if the new primary fails), and carries
         the channel's current encoder_mode/source_kind as ITS fallback
         override — this makes trying an alternate source as primary a
         cheap, reversible experiment (call again with the old manifest_id
-        to revert) rather than a one-way door. No-op if already primary.
+        to revert) rather than a one-way door. No-op (beyond the manual
+        pin, see below) if already primary.
+
+        manual=True marks manual_primary_pinned_at (now) -- pass this from
+        every human-initiated call site (the per-channel Make Primary
+        button, the bulk per-source Promote All action) so
+        player_health.maybe_promote_best_player knows to leave this
+        channel's primary alone for a while. Internal/automated callers
+        (that function itself, fallback-race/discovery logic) must NOT
+        pass manual=True -- doing so would defeat the whole protection.
         """
+        from datetime import datetime
         from core.database import get_session
         from core.models import Channel as ChannelRow
         from core.models.manifest import Manifest
@@ -591,6 +603,8 @@ class ChannelManager:
             if session.query(Manifest.id).filter_by(id=manifest_id).first() is None:
                 return None
             if manifest_id == row.manifest_id:
+                if manual:
+                    row.manual_primary_pinned_at = datetime.utcnow()
                 return self.get_channel(channel_id)
 
             old_primary = row.manifest_id
@@ -615,8 +629,10 @@ class ChannelManager:
                 row.source_kind = new_kind_override
             row.fallback_encoder_modes = modes
             row.fallback_source_kinds = kinds
-        logging.info("[CHANNELS] Swapped primary manifest for channel %s: %s -> %s (old primary now first fallback)",
-                     channel_id, old_primary, manifest_id)
+            if manual:
+                row.manual_primary_pinned_at = datetime.utcnow()
+        logging.info("[CHANNELS] Swapped primary manifest for channel %s: %s -> %s (old primary now first fallback)%s",
+                     channel_id, old_primary, manifest_id, " [manual pin]" if manual else "")
         return self.get_channel(channel_id)
 
     def set_fallback_sources(self, channel_id: str, manifest_ids: list) -> dict | None:

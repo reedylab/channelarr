@@ -59,6 +59,16 @@ PROMOTE_MIN_SAMPLES = 2      # challenger needs at least this many probes
 PROMOTE_MIN_MARGIN = 0.25    # ...and must beat the current primary's score
                              # by at least this much to be worth switching for
 
+# Real bug found 2026-09-15: a human manually promoting a primary (per-
+# channel Make Primary, or the bulk per-source Promote All) got silently
+# overridden minutes later by this exact function -- a freshly promoted
+# candidate starts with zero player_health track record of its own, so it
+# looked like an easy "improvement" to auto-swap away from. Bounded grace
+# window, not permanent -- long enough for a human's explicit choice to be
+# respected and to actually accumulate its own track record, short enough
+# that a genuinely bad manual choice doesn't stay auto-protected forever.
+MANUAL_PIN_GRACE_HOURS = 6
+
 
 def _native_resolver():
     from core.resolver.manifest_resolver import _native_resolver as _load
@@ -302,6 +312,19 @@ def maybe_promote_best_player(channel_id: str) -> bool:
     ch = shared_state.channel_mgr.get_channel(channel_id)
     if not ch or ch.get("type") != "resolved":
         return False
+
+    pinned_at = ch.get("manual_primary_pinned_at")
+    if pinned_at:
+        from datetime import datetime, timezone
+        pinned_dt = datetime.fromisoformat(pinned_at)
+        if pinned_dt.tzinfo is None:
+            pinned_dt = pinned_dt.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - pinned_dt).total_seconds() / 3600
+        if age_hours < MANUAL_PIN_GRACE_HOURS:
+            logger.info("[PLAYER-HEALTH] channel %s: skipping auto-promotion -- primary was "
+                        "manually pinned %.1fh ago (grace window %dh)",
+                        channel_id, age_hours, MANUAL_PIN_GRACE_HOURS)
+            return False
 
     primary_manifest_id = ch.get("manifest_id")
     primary_path = get_primary_player_path(primary_manifest_id)

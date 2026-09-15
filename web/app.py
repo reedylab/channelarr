@@ -126,6 +126,11 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN epg_pw_id VARCHAR"))
                     conn.commit()
                 logging.info("[DB] Added column channels.epg_pw_id")
+            if "manual_primary_pinned_at" not in channel_cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE channels ADD COLUMN manual_primary_pinned_at TIMESTAMPTZ"))
+                    conn.commit()
+                logging.info("[DB] Added column channels.manual_primary_pinned_at")
         # Player-path/source labels for the multi-player ranking view (see
         # core.resolver.player_health) -- opaque display text sourced from
         # whichever plugin/manifest discovered the candidate, never a
