@@ -16,6 +16,41 @@ from core.nfo import read_nfo_title, read_nfo_plot
 # constant is kept so the backup helper can find the original location.
 CHANNELS_FILE = os.getenv("CHANNELS_FILE", "/app/data/channels.json")
 
+# encoder_mode "_sequential" suffix: same base streaming approach (proxy/
+# remux), but forces ProxyStream/RemuxStream's catch-up burst fetching
+# (see proxy_stream.py's CATCHUP_THREAD_THRESHOLD) to plain sequential
+# regardless of the deployment's overall RESOLVER_CONCURRENCY_MODE. Folded
+# into the mode string itself rather than a separate column/flag —
+# real design call 2026-09-15: a source is essentially always tied to one
+# base mode already, and this reuses the exact same per-channel/per-
+# fallback override mechanism (encoder_mode, fallback_encoder_modes)
+# every other mode choice already goes through, instead of a second,
+# parallel dimension. Only proxy/remux have a sequential variant --
+# single/multi/copy/tab_proxy don't go through this catch-up mechanism at
+# all, so a suffix on them would be meaningless.
+_SEQUENTIAL_SUFFIX = "_sequential"
+
+
+def base_encoder_mode(encoder_mode: str | None) -> str:
+    """Strip a _sequential suffix, if present, to get the underlying
+    dispatchable mode (what every existing `encoder_mode == "proxy"`-style
+    check should now compare against)."""
+    if encoder_mode and encoder_mode.endswith(_SEQUENTIAL_SUFFIX):
+        return encoder_mode[: -len(_SEQUENTIAL_SUFFIX)]
+    return encoder_mode or "proxy"
+
+
+def is_sequential_encoder_mode(encoder_mode: str | None) -> bool:
+    return bool(encoder_mode) and encoder_mode.endswith(_SEQUENTIAL_SUFFIX)
+
+
+def sequential_variant(encoder_mode: str | None, sequential: bool) -> str:
+    """Given any current mode string, return the equivalent mode with
+    sequential-fetch forced on or off, preserving whichever base mode
+    (proxy/remux) it already had."""
+    base = base_encoder_mode(encoder_mode)
+    return f"{base}{_SEQUENTIAL_SUFFIX}" if sequential else base
+
 
 # ── Postgres-backed channel store (Phase B2) ────────────────────────────────
 # In B2 the channels table becomes the source of truth. JSON is still written
@@ -61,7 +96,6 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
         "epg_pw_id": getattr(row, "epg_pw_id", None),
         "manual_primary_pinned_at": row.manual_primary_pinned_at.isoformat()
             if getattr(row, "manual_primary_pinned_at", None) else None,
-        "sequential_fetch_only": bool(getattr(row, "sequential_fetch_only", False)),
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.

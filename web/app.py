@@ -131,11 +131,16 @@ async def lifespan(app: FastAPI):
                     conn.execute(text("ALTER TABLE channels ADD COLUMN manual_primary_pinned_at TIMESTAMPTZ"))
                     conn.commit()
                 logging.info("[DB] Added column channels.manual_primary_pinned_at")
-            if "sequential_fetch_only" not in channel_cols:
+            if "sequential_fetch_only" in channel_cols:
+                # Superseded same-session by folding sequential-fetch into
+                # encoder_mode itself ("proxy_sequential"/"remux_sequential")
+                # instead of a parallel column -- see core/channels.py's
+                # base_encoder_mode/sequential_variant. Cleanup migration for
+                # the brief window this column was live.
                 with engine.connect() as conn:
-                    conn.execute(text("ALTER TABLE channels ADD COLUMN sequential_fetch_only BOOLEAN NOT NULL DEFAULT false"))
+                    conn.execute(text("ALTER TABLE channels DROP COLUMN sequential_fetch_only"))
                     conn.commit()
-                logging.info("[DB] Added column channels.sequential_fetch_only")
+                logging.info("[DB] Dropped superseded column channels.sequential_fetch_only")
         # Player-path/source labels for the multi-player ranking view (see
         # core.resolver.player_health) -- opaque display text sourced from
         # whichever plugin/manifest discovered the candidate, never a

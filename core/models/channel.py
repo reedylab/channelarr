@@ -89,6 +89,13 @@ class Channel(Base):
     # Encoder pipeline mode for transcode-mediated resolved channels.
     # "single" = one long-running encoder (seamless, best for short segments)
     # "multi" = per-item encoder + HLS segmenter (robust, best for Adult Swim)
+    # "proxy"/"remux" each also have a "_sequential" variant (e.g.
+    # "proxy_sequential") that forces ProxyStream/RemuxStream's catch-up
+    # burst fetching to plain sequential regardless of
+    # RESOLVER_CONCURRENCY_MODE -- see core/channels.py's base_encoder_mode/
+    # is_sequential_encoder_mode/sequential_variant helpers, which every
+    # dispatch site reading this column goes through rather than comparing
+    # the raw string directly.
     encoder_mode = Column(String, nullable=False, default="proxy")
 
     # How content is discovered/pulled for this channel — orthogonal to
@@ -110,21 +117,6 @@ class Channel(Base):
     # recent, mirroring the same "manual always wins over automated" split
     # already used for source-level enable/disable (core/source_registry.py).
     manual_primary_pinned_at = Column(DateTime(timezone=True), nullable=True)
-
-    # Per-channel override: force sequential (never threaded) segment
-    # fetching in ProxyStream/RemuxStream's catch-up burst path, regardless
-    # of RESOLVER_CONCURRENCY_MODE. Real motivation, found 2026-09-15:
-    # catch-up threading was deliberately gated behind the SAME global
-    # "multi" flag as browser-dispatch concurrency (one setting for the
-    # whole deployment's posture, see proxy_stream.py's own
-    # CATCHUP_THREAD_THRESHOLD comment) -- but a source can be fine with
-    # concurrent browser captures while genuinely NOT tolerating concurrent
-    # segment fetches (observed: real stream corruption on one specific
-    # source under threaded catch-up). This is the per-channel escape
-    # hatch, same override idiom as fallback_encoder_modes/
-    # fallback_source_kinds -- a channel not touching this column behaves
-    # exactly as before.
-    sequential_fetch_only = Column(Boolean, nullable=False, default=False)
 
     branding_logo = Column(String, nullable=True)
 

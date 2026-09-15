@@ -352,17 +352,25 @@ def promote_source_to_primary(source_id: str) -> dict:
 
 
 def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
-    """Bulk-set Channel.sequential_fetch_only for every channel whose
-    CURRENT PRIMARY belongs to this declared source -- real motivation:
-    some sources' CDNs detect bursty/concurrent segment fetching and
-    respond with corrupted content, so the catch-up threading that's fine
-    for most sources (see proxy_stream.py's CATCHUP_THREAD_THRESHOLD) needs
-    to stay off for these regardless of the deployment's overall
-    RESOLVER_CONCURRENCY_MODE. Matches primary only, same as
-    promote_source_to_primary -- a channel currently using this source as
-    a dormant fallback isn't actively fetching from it, so there's nothing
-    to protect yet; if it's later promoted, promote_source_to_primary's own
-    caller should set this too (or re-run this action).
+    """Bulk-toggle the "_sequential" encoder_mode variant for every channel
+    whose CURRENT PRIMARY belongs to this declared source -- real
+    motivation: some sources' CDNs detect bursty/concurrent segment
+    fetching and respond with corrupted content, so the catch-up threading
+    that's fine for most sources (see proxy_stream.py's
+    CATCHUP_THREAD_THRESHOLD) needs to stay off for these regardless of the
+    deployment's overall RESOLVER_CONCURRENCY_MODE.
+
+    Folded into encoder_mode itself (core/channels.py's sequential_variant)
+    rather than a separate column -- design call 2026-09-15: a source is
+    essentially always tied to one base mode already, so this reuses the
+    exact per-channel override mechanism encoder_mode/fallback_encoder_modes
+    already provide instead of a second, parallel dimension.
+
+    Matches primary only, same as promote_source_to_primary -- a channel
+    currently using this source as a dormant fallback isn't actively
+    fetching from it, so there's nothing to protect yet; if it's later
+    promoted, re-run this action (or set the fallback's own
+    fallback_encoder_modes entry to the _sequential variant directly).
 
     Returns {"updated": [{"channel_id", "name"}], "no_match": int}."""
     sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
@@ -373,6 +381,7 @@ def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
     from core.database import get_session
     from core.models.channel import Channel
     from core.models.manifest import Manifest, Capture
+    from core.channels import sequential_variant
 
     updated = []
     with get_session() as session:
@@ -390,26 +399,26 @@ def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
             domain = urlparse(page_url).netloc
             if not any(_domain_matches(domain, d) for d in domains):
                 continue
-            if bool(row.sequential_fetch_only) != enabled:
-                row.sequential_fetch_only = enabled
+            new_mode = sequential_variant(row.encoder_mode, enabled)
+            if new_mode != row.encoder_mode:
+                row.encoder_mode = new_mode
                 updated.append({"channel_id": row.id, "name": row.name})
 
     if updated:
-        # ProxyStream/RemuxStream read sequential_fetch_only once at
-        # construction -- an already-running encoder won't pick up this
-        # change on its own. Stop each updated channel's current stream (if
-        # any) so the next playlist request reboots it with the new
-        # setting applied, same pattern set_primary_manifest's own caller
-        # already uses.
+        # encoder_mode is read once at ProxyStream/RemuxStream construction
+        # -- an already-running encoder won't pick up this change on its
+        # own. Stop each updated channel's current stream (if any) so the
+        # next playlist request reboots it with the new mode applied, same
+        # pattern set_primary_manifest's own caller already uses.
         from web import shared_state
         for u in updated:
             try:
                 shared_state.streamer_mgr.stop_channel(u["channel_id"])
             except Exception as e:
-                logger.warning("[SOURCES] Failed to stop channel %s after sequential_fetch_only change: %s",
+                logger.warning("[SOURCES] Failed to stop channel %s after encoder_mode change: %s",
                                u["channel_id"], e)
 
-    logger.info("[SOURCES] Set sequential_fetch_only=%s for %d channel(s) on source %s",
+    logger.info("[SOURCES] Set sequential-fetch=%s for %d channel(s) on source %s",
                 enabled, len(updated), source_id)
     return {"updated": updated, "no_match": 0}
 

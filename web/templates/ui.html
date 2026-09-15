@@ -650,7 +650,9 @@
                 <select id="ch-fallback-add-mode" title="Stream mode for this fallback (leave as-is to match the primary's mode above)">
                   <option value="">Mode: same as primary</option>
                   <option value="proxy">Mode: Proxy</option>
+                  <option value="proxy_sequential">Mode: Proxy (sequential fetch only)</option>
                   <option value="remux">Mode: Remux</option>
+                  <option value="remux_sequential">Mode: Remux (sequential fetch only)</option>
                   <option value="single">Mode: Transcode (single)</option>
                   <option value="multi">Mode: Transcode (multi)</option>
                 </select>
@@ -681,12 +683,14 @@
               <label>Stream Mode</label>
               <select id="ch-resolved-encoder-mode">
                 <option value="proxy">Proxy (no re-encode, lossless)</option>
+                <option value="proxy_sequential">Proxy — sequential fetch only (no catch-up threading)</option>
                 <option value="remux">Remux (no re-encode — for fMP4/CMAF + demuxed audio)</option>
+                <option value="remux_sequential">Remux — sequential fetch only (no catch-up threading)</option>
                 <option value="single">Transcode — Single encoder (seamless)</option>
                 <option value="multi">Transcode — Multi encoder (robust)</option>
                 <option value="tab_proxy">Tab Proxy (persistent browser tab — for session-locked CDNs)</option>
               </select>
-              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Remux is also lossless but repackages fMP4/CMAF and demuxed-audio streams (which Proxy can't carry) to MPEG-TS via FFmpeg <code>-c copy</code>. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks. Tab Proxy keeps a browser tab open to play streams whose CDN tokens can't be replayed outside the original session.</div>
+              <div class="muted" style="margin-top:4px;font-size:11px">Proxy downloads segments with auth headers and serves locally — zero quality loss, minimal CPU. Remux is also lossless but repackages fMP4/CMAF and demuxed-audio streams (which Proxy can't carry) to MPEG-TS via FFmpeg <code>-c copy</code>. Single/Multi re-encode through FFmpeg for bump insertion during ad breaks. Tab Proxy keeps a browser tab open to play streams whose CDN tokens can't be replayed outside the original session. The "sequential fetch only" variants force segment fetching one at a time even during a catch-up burst — use if a source's CDN corrupts content under concurrent fetching.</div>
             </div>
 
             <div class="setting-field" id="ch-resolved-source-kind-wrap" style="margin-top:10px;display:none">

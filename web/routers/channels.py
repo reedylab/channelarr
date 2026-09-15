@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from web import shared_state
-from core.channels import materialize_schedule, get_now_playing, current_placeholder_block
+from core.channels import materialize_schedule, get_now_playing, current_placeholder_block, base_encoder_mode
 
 router = APIRouter()
 
@@ -27,7 +27,7 @@ def _enrich(ch: dict) -> dict:
         # unified /live/{id}/ dir; only true passthrough serves the raw manifest
         # via /live-resolved/. Keep this in lockstep with regenerate_m3u().
         if (ch.get("transcode_mediated")
-                or ch.get("encoder_mode") in ("proxy", "remux")):
+                or base_encoder_mode(ch.get("encoder_mode")) in ("proxy", "remux")):
             ch["stream_url"] = f"/live/{cid}/stream.m3u8"
             ch["stream_status"] = shared_state.streamer_mgr.get_status(cid)
         else:

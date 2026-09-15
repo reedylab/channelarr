@@ -286,6 +286,7 @@ def regenerate_m3u():
         # Transcode-mediated channels publish the unified /live/{id}/ URL
         # because that's where the FFmpeg pipeline writes its output. Pure
         # passthrough channels publish the /live-resolved/{manifest_id}/ URL.
+        from core.channels import base_encoder_mode
         for ch in resolved:
             cid = ch["id"]
             mid = ch.get("manifest_id")
@@ -302,7 +303,7 @@ def regenerate_m3u():
                 f'group-title="{group}",{name}\n'
             )
             if (ch.get("transcode_mediated")
-                    or ch.get("encoder_mode") in ("proxy", "remux")):
+                    or base_encoder_mode(ch.get("encoder_mode")) in ("proxy", "remux")):
                 f.write(f"{base_url}/live/{cid}/stream.m3u8\n")
             else:
                 f.write(f"{base_url}/live-resolved/{mid}.m3u8\n")

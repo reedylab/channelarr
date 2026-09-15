@@ -224,28 +224,32 @@ def _start_from_schedule(channel_id):
         return False, "Channel not found"
 
     if ch.get("type") == "resolved":
+        from core.channels import base_encoder_mode, is_sequential_encoder_mode
         manifest_id, manifest_url, encoder_mode, source_kind = _pick_working_manifest(ch)
         if not manifest_id or not manifest_url:
             return False, "Resolved channel missing manifest"
 
+        sequential_fetch_only = is_sequential_encoder_mode(encoder_mode)
+        dispatch_mode = base_encoder_mode(encoder_mode)
+
         # Proxy mode — download segments with auth, serve locally. No encode.
-        if encoder_mode == "proxy":
+        if dispatch_mode == "proxy":
             ok = shared_state.streamer_mgr.start_proxy_channel(
                 channel_id,
                 manifest_id=manifest_id,
                 manifest_url=manifest_url,
-                sequential_fetch_only=ch.get("sequential_fetch_only", False),
+                sequential_fetch_only=sequential_fetch_only,
             )
             return ok, "Started" if ok else "Already running"
 
         # Remux mode — ffmpeg -c copy from the master URL. Handles fMP4/CMAF +
         # demuxed audio the proxy can't carry. No re-encode.
-        if encoder_mode == "remux":
+        if dispatch_mode == "remux":
             ok = shared_state.streamer_mgr.start_remux_channel(
                 channel_id,
                 manifest_id=manifest_id,
                 manifest_url=manifest_url,
-                sequential_fetch_only=ch.get("sequential_fetch_only", False),
+                sequential_fetch_only=sequential_fetch_only,
             )
             return ok, "Started" if ok else "Already running"
 
