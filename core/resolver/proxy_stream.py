@@ -298,6 +298,7 @@ class ProxyStream:
         *,
         hls_time: int = 6,
         hls_list_size: int = 10,
+        sequential_fetch_only: bool = False,
     ):
         self.channel_id = channel_id
         self.manifest_id = manifest_id
@@ -305,6 +306,10 @@ class ProxyStream:
         self.hls_dir = hls_dir
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
+        # Per-channel override -- see Channel.sequential_fetch_only's own
+        # docstring. Checked in _fetch_new_segments, ahead of the global
+        # RESOLVER_CONCURRENCY_MODE check.
+        self.sequential_fetch_only = sequential_fetch_only
 
         self._poller_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -805,7 +810,8 @@ class ProxyStream:
         single-threaded either way. Sequential by default (see
         CATCHUP_THREAD_THRESHOLD); escalates to a small bounded pool only
         for a genuine catch-up burst under "multi" concurrency mode."""
-        if len(new_segs) < CATCHUP_THREAD_THRESHOLD or _resolver_concurrency_mode() != "multi":
+        if (self.sequential_fetch_only or len(new_segs) < CATCHUP_THREAD_THRESHOLD
+                or _resolver_concurrency_mode() != "multi"):
             return [self._fetch_one_segment(seg) for seg in new_segs]
 
         logging.info("[PROXY] %s catch-up: fetching %d new segments with up to %d workers",

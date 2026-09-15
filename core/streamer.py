@@ -688,7 +688,7 @@ class StreamerManager:
         return True
 
     def start_proxy_channel(self, channel_id: str, manifest_id: str,
-                            manifest_url: str) -> bool:
+                            manifest_url: str, sequential_fetch_only: bool = False) -> bool:
         """Start a proxy-mode resolved channel. Downloads segments with
         proper auth headers and serves them locally. No re-encode."""
         from core.resolver.proxy_stream import ProxyStream
@@ -720,13 +720,14 @@ class StreamerManager:
             hls_dir=hls_dir,
             hls_time=int(self._get("HLS_TIME", "6")),
             hls_list_size=int(self._get("HLS_LIST_SIZE", "10")),
+            sequential_fetch_only=sequential_fetch_only,
         )
         stream.start()
         self._streams[channel_id] = stream
         return True
 
     def start_remux_channel(self, channel_id: str, manifest_id: str,
-                            manifest_url: str) -> bool:
+                            manifest_url: str, sequential_fetch_only: bool = False) -> bool:
         """Start a remux-mode resolved channel. Feeds the master URL to ffmpeg
         -c copy so fMP4/CMAF + demuxed-audio streams (which the proxy can't
         carry) are muxed to MPEG-TS HLS. No re-encode. Output goes to the same
@@ -769,6 +770,7 @@ class StreamerManager:
             # stall resistance, see project memory for the tradeoff.
             hls_list_size=int(self._get("HLS_LIST_SIZE_REMUX", "20")),
             loglevel=self._get("FFMPEG_LOGLEVEL", "warning"),
+            sequential_fetch_only=sequential_fetch_only,
         )
         stream.start()
         self._streams[channel_id] = stream

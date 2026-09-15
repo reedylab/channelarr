@@ -61,6 +61,7 @@ def _row_to_dict(row, manifest=None, fallback_manifests: dict | None = None) -> 
         "epg_pw_id": getattr(row, "epg_pw_id", None),
         "manual_primary_pinned_at": row.manual_primary_pinned_at.isoformat()
             if getattr(row, "manual_primary_pinned_at", None) else None,
+        "sequential_fetch_only": bool(getattr(row, "sequential_fetch_only", False)),
     }
     # Legacy boolean shuffle field for backward-compat with code that hasn't
     # been updated to read shuffle_config.

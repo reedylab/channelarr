@@ -351,6 +351,69 @@ def promote_source_to_primary(source_id: str) -> dict:
     return {"promoted": promoted, "already_primary": already_primary, "no_match": no_match}
 
 
+def set_sequential_fetch_for_source(source_id: str, enabled: bool) -> dict:
+    """Bulk-set Channel.sequential_fetch_only for every channel whose
+    CURRENT PRIMARY belongs to this declared source -- real motivation:
+    some sources' CDNs detect bursty/concurrent segment fetching and
+    respond with corrupted content, so the catch-up threading that's fine
+    for most sources (see proxy_stream.py's CATCHUP_THREAD_THRESHOLD) needs
+    to stay off for these regardless of the deployment's overall
+    RESOLVER_CONCURRENCY_MODE. Matches primary only, same as
+    promote_source_to_primary -- a channel currently using this source as
+    a dormant fallback isn't actively fetching from it, so there's nothing
+    to protect yet; if it's later promoted, promote_source_to_primary's own
+    caller should set this too (or re-run this action).
+
+    Returns {"updated": [{"channel_id", "name"}], "no_match": int}."""
+    sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
+    if not sources:
+        return {"updated": [], "no_match": 0, "error": f"unknown source_id: {source_id}"}
+    domains = sources[0]["domains"]
+
+    from core.database import get_session
+    from core.models.channel import Channel
+    from core.models.manifest import Manifest, Capture
+
+    updated = []
+    with get_session() as session:
+        manifest_domains = dict(
+            session.query(Manifest.id, Capture.page_url)
+            .join(Capture, Manifest.capture_id == Capture.id)
+            .all()
+        )
+        rows = session.query(Channel).filter(Channel.type == "resolved").all()
+        for row in rows:
+            page_url = manifest_domains.get(row.manifest_id)
+            if not page_url:
+                continue
+            from urllib.parse import urlparse
+            domain = urlparse(page_url).netloc
+            if not any(_domain_matches(domain, d) for d in domains):
+                continue
+            if bool(row.sequential_fetch_only) != enabled:
+                row.sequential_fetch_only = enabled
+                updated.append({"channel_id": row.id, "name": row.name})
+
+    if updated:
+        # ProxyStream/RemuxStream read sequential_fetch_only once at
+        # construction -- an already-running encoder won't pick up this
+        # change on its own. Stop each updated channel's current stream (if
+        # any) so the next playlist request reboots it with the new
+        # setting applied, same pattern set_primary_manifest's own caller
+        # already uses.
+        from web import shared_state
+        for u in updated:
+            try:
+                shared_state.streamer_mgr.stop_channel(u["channel_id"])
+            except Exception as e:
+                logger.warning("[SOURCES] Failed to stop channel %s after sequential_fetch_only change: %s",
+                               u["channel_id"], e)
+
+    logger.info("[SOURCES] Set sequential_fetch_only=%s for %d channel(s) on source %s",
+                enabled, len(updated), source_id)
+    return {"updated": updated, "no_match": 0}
+
+
 def list_source_status() -> list[dict]:
     """Full Sources panel view: every declared source, its manual + live
     auto-held state, and the effective (ANDed) result -- for the Diagnostics

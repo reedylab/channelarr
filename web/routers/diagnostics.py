@@ -109,6 +109,22 @@ def diagnostics_promote_source(source_id: str):
     return {"ok": "error" not in result, **result}
 
 
+@router.post("/diagnostics/sources/{source_id}/sequential-fetch")
+def diagnostics_set_sequential_fetch(source_id: str, body: dict):
+    """Bulk per-channel Channel.sequential_fetch_only override for every
+    channel currently primaried on this source (core/source_registry.py::
+    set_sequential_fetch_for_source). Body: {"enabled": bool}. Some
+    sources' CDNs detect bursty/concurrent segment fetching and serve back
+    corrupted content -- this forces plain sequential fetching for those
+    channels regardless of the deployment's overall
+    RESOLVER_CONCURRENCY_MODE. Stops each affected channel's current
+    stream so the next playlist request reboots it with the new setting."""
+    from core.source_registry import set_sequential_fetch_for_source
+    enabled = bool(body.get("enabled", True))
+    result = set_sequential_fetch_for_source(source_id, enabled)
+    return {"ok": "error" not in result, **result}
+
+
 @router.get("/diagnostics/{channel_id}/stream")
 async def diagnostics_channel_stream(channel_id: str, request: Request):
     from core.diagnostics import get_summary, subscribe, unsubscribe

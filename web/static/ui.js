@@ -4163,6 +4163,8 @@ function renderSourceTogglesPanel(sources) {
       <td>
         <button class="btn btn-ghost btn-sm-header" title="Promote every channel currently using this source as a fallback to make it their primary"
                 onclick="channelarr.promoteSource('${esc(s.source_id)}', '${esc(s.display_name)}')">Promote All to Primary</button>
+        <button class="btn btn-ghost btn-sm-header" title="Force sequential (never threaded) segment fetching for every channel currently primaried on this source -- use if a source's CDN corrupts content under concurrent fetching"
+                onclick="channelarr.setSequentialFetch('${esc(s.source_id)}', '${esc(s.display_name)}', true)">Force Sequential Fetch</button>
       </td>
     </tr>`;
   }).join("");
@@ -4191,8 +4193,24 @@ function promoteSource(sourceId, displayName) {
     .catch(() => alert("Request failed -- check the server logs."));
 }
 
+function setSequentialFetch(sourceId, displayName, enabled) {
+  const verb = enabled ? "Force sequential (never threaded)" : "Allow threaded catch-up";
+  if (!confirm(`${verb} segment fetching for every channel currently primaried on ${displayName}? Affected channels currently running will be stopped and re-started with the new setting on next request.`)) {
+    return;
+  }
+  fetch(`${API}/diagnostics/sources/${encodeURIComponent(sourceId)}/sequential-fetch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { alert(`Failed: ${data.error}`); return; }
+    alert(`Updated ${data.updated.length} channel(s).`);
+  }).catch(() => alert("Request failed -- check the server logs."));
+}
+
 channelarr.toggleSource = toggleSource;
 channelarr.promoteSource = promoteSource;
+channelarr.setSequentialFetch = setSequentialFetch;
 
 function renderSourcesPanel(data) {
   renderSourceTogglesPanel(data.sources);

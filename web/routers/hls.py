@@ -234,6 +234,7 @@ def _start_from_schedule(channel_id):
                 channel_id,
                 manifest_id=manifest_id,
                 manifest_url=manifest_url,
+                sequential_fetch_only=ch.get("sequential_fetch_only", False),
             )
             return ok, "Started" if ok else "Already running"
 
@@ -244,6 +245,7 @@ def _start_from_schedule(channel_id):
                 channel_id,
                 manifest_id=manifest_id,
                 manifest_url=manifest_url,
+                sequential_fetch_only=ch.get("sequential_fetch_only", False),
             )
             return ok, "Started" if ok else "Already running"
 

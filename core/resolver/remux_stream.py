@@ -61,7 +61,7 @@ def _fetch_one(dl_fn, seq, url):
         return (seq, None, e)
 
 
-def _fetch_batch(dl_fn, items: list, channel_id: str = "?") -> list:
+def _fetch_batch(dl_fn, items: list, channel_id: str = "?", sequential_fetch_only: bool = False) -> list:
     """Fetch every (seq, url) in items via dl_fn (RemuxStream._dl, bound to
     one rendition's session/headers), sequential by default, escalating to
     a small bounded pool only for a genuine catch-up burst under "multi"
@@ -71,8 +71,12 @@ def _fetch_batch(dl_fn, items: list, channel_id: str = "?") -> list:
     assignment stays single-threaded either way (dict writes keyed by
     sequence number, so unlike proxy mode's ordered playlist there's not
     even an ordering concern here — this still runs them in the calling
-    thread purely for consistency with proxy_stream's pattern)."""
-    if len(items) < CATCHUP_THREAD_THRESHOLD or _resolver_concurrency_mode() != "multi":
+    thread purely for consistency with proxy_stream's pattern).
+
+    sequential_fetch_only forces the plain sequential path regardless of
+    concurrency mode -- see Channel.sequential_fetch_only's own docstring."""
+    if (sequential_fetch_only or len(items) < CATCHUP_THREAD_THRESHOLD
+            or _resolver_concurrency_mode() != "multi"):
         return [_fetch_one(dl_fn, seq, url) for seq, url in items]
     logging.info("[REMUX] %s catch-up: fetching %d new segments with up to %d workers",
                  channel_id, len(items), CATCHUP_MAX_WORKERS)
@@ -98,10 +102,12 @@ class RemuxStream:
     MAX_CONSECUTIVE_FAILURES = 5
 
     def __init__(self, channel_id, manifest_id, manifest_url, hls_dir, *,
-                 hls_time=6, hls_list_size=10, loglevel="warning"):
+                 hls_time=6, hls_list_size=10, loglevel="warning",
+                 sequential_fetch_only=False):
         self.channel_id = channel_id
         self.manifest_id = manifest_id
         self.manifest_url = manifest_url
+        self.sequential_fetch_only = sequential_fetch_only
         self.hls_dir = hls_dir
         self.src_dir = os.path.join(hls_dir, "src")
         self.hls_list_size = hls_list_size
@@ -563,7 +569,7 @@ class RemuxStream:
                     continue
                 new_items.append((seq, seg_url))
                 new_durs[seq] = dur
-            for seq, data, err in _fetch_batch(self._dl, new_items, self.channel_id):
+            for seq, data, err in _fetch_batch(self._dl, new_items, self.channel_id, self.sequential_fetch_only):
                 if err is not None:
                     logging.warning("[REMUX] %s seg dl failed: %s", self.channel_id, err)
                     continue
@@ -675,7 +681,7 @@ class RemuxStream:
                     continue
                 new_video.append((seq, seg_url))
                 new_video_durs[seq] = dur
-            for seq, data, err in _fetch_batch(self._dl, new_video, self.channel_id):
+            for seq, data, err in _fetch_batch(self._dl, new_video, self.channel_id, self.sequential_fetch_only):
                 if err is not None:
                     logging.warning("[REMUX] %s video dl failed: %s", self.channel_id, err)
                     continue

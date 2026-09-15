@@ -111,6 +111,21 @@ class Channel(Base):
     # already used for source-level enable/disable (core/source_registry.py).
     manual_primary_pinned_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Per-channel override: force sequential (never threaded) segment
+    # fetching in ProxyStream/RemuxStream's catch-up burst path, regardless
+    # of RESOLVER_CONCURRENCY_MODE. Real motivation, found 2026-09-15:
+    # catch-up threading was deliberately gated behind the SAME global
+    # "multi" flag as browser-dispatch concurrency (one setting for the
+    # whole deployment's posture, see proxy_stream.py's own
+    # CATCHUP_THREAD_THRESHOLD comment) -- but a source can be fine with
+    # concurrent browser captures while genuinely NOT tolerating concurrent
+    # segment fetches (observed: real stream corruption on one specific
+    # source under threaded catch-up). This is the per-channel escape
+    # hatch, same override idiom as fallback_encoder_modes/
+    # fallback_source_kinds -- a channel not touching this column behaves
+    # exactly as before.
+    sequential_fetch_only = Column(Boolean, nullable=False, default=False)
+
     branding_logo = Column(String, nullable=True)
 
     # Channel tags for grouping and auto-cleanup behavior
