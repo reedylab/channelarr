@@ -729,6 +729,25 @@ class ManifestResolverService:
                 if key_match:
                     context["drm_key_url"] = key_match.group(1)
 
+            # Confirmed live 2026-09-15: block_detector.record_success()
+            # existed but had no caller anywhere in the codebase, despite
+            # source_registry.py's own docstring describing auto_held
+            # clearing "the moment record_success() fires" -- a domain
+            # that ever tripped auto_held (e.g. a resolve-burst that's
+            # since been fixed) had no path back to healthy except the
+            # one-probe-per-cooldown trickle in _probe_allowed, forever.
+            # This is the one place that sees every successful resolve
+            # regardless of whether it came from a native resolver or the
+            # sidecar -- confirmed live that the sidecar fallback path is
+            # what actually recovers in practice even when native
+            # discovery is struggling, so gating this on native-only
+            # would have missed the real recovery signal entirely.
+            try:
+                from core.block_detector import record_success
+                record_success(urlparse(url).netloc)
+            except Exception:
+                pass
+
             manifest_url = capture["manifest_url"]
             manifest_id = _store_manifest(
                 page_url=url,
