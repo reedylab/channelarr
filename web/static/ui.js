@@ -4136,7 +4136,7 @@ function renderSourceTogglesPanel(sources) {
   const tbody = $("#source-toggles-tbody");
   if (!tbody) return;
   if (!sources || !sources.length) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No plugin sources declared.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No plugin sources declared.</td></tr>';
     return;
   }
   tbody.innerHTML = sources.map(s => {
@@ -4160,6 +4160,10 @@ function renderSourceTogglesPanel(sources) {
           <span class="switch-slider"></span>
         </label>
       </td>
+      <td>
+        <button class="btn btn-ghost btn-sm-header" title="Promote every channel currently using this source as a fallback to make it their primary"
+                onclick="channelarr.promoteSource('${esc(s.source_id)}', '${esc(s.display_name)}')">Promote All to Primary</button>
+      </td>
     </tr>`;
   }).join("");
 }
@@ -4174,7 +4178,21 @@ function toggleSource(sourceId, enabled) {
   }).catch(() => { loadSourcesPanel(); });
 }
 
+function promoteSource(sourceId, displayName) {
+  if (!confirm(`Promote every channel currently using ${displayName} as a fallback to make it their primary? The old primary is kept as each channel's own new front-of-chain fallback (not dropped) -- reversible per-channel via that channel's own Make Primary action.`)) {
+    return;
+  }
+  fetch(`${API}/diagnostics/sources/${encodeURIComponent(sourceId)}/promote-all`, { method: "POST" })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { alert(`Failed: ${data.error}`); return; }
+      alert(`Promoted ${data.promoted.length} channel(s) to primary (${data.already_primary} were already primary).`);
+    })
+    .catch(() => alert("Request failed -- check the server logs."));
+}
+
 channelarr.toggleSource = toggleSource;
+channelarr.promoteSource = promoteSource;
 
 function renderSourcesPanel(data) {
   renderSourceTogglesPanel(data.sources);

@@ -1,7 +1,7 @@
 """Plugin-declared Source registry + manual/automated enable state.
 
-Pass 2 of the Diagnostics "Sources" panel (see [[project_source_health_panel]]
-in memory, and Pass 1's core/block_detector.py). Plugins in scrapers/
+Pass 2 of the Diagnostics "Sources" panel (see Pass 1's
+core/block_detector.py). Plugins in scrapers/
 (gitignored, site-specific -- see CLAUDE.md's public-repo-hygiene rule) may
 declare a module-level SOURCE_INFO advertising what they resolve:
 
@@ -256,6 +256,75 @@ def is_domain_enabled(domain: str) -> tuple:
                 return True, None
             return False, f"auto-held: sustained failures on {held_domain}"
     return True, None
+
+
+def promote_source_to_primary(source_id: str) -> dict:
+    """Bulk version of the existing per-channel "Make Primary" action: for
+    every channel that currently carries a fallback manifest from this
+    declared source, promote that fallback to primary. A human's explicit
+    "I know this source is good" call, not something automation decides --
+    e.g. after a fresh, verified enrichment pass adds a new independent
+    path to a bunch of channels and the human wants to lead with it
+    everywhere at once instead of clicking "Make Primary" one channel at
+    a time.
+
+    Reuses ChannelManager.set_primary_manifest() as-is -- same safety
+    property applies here: the old primary isn't dropped, it gets pushed to
+    the front of the fallback chain, so this is a cheap, reversible bulk
+    experiment (call promote on whatever source WAS primary to revert any
+    one channel), not a one-way door.
+
+    Returns {"promoted": [{"channel_id", "name"}], "already_primary": int,
+    "no_match": int} -- no_match counts declared-source channels where
+    resolution found no matching fallback at all (shouldn't normally
+    happen if list_source_status() shows channels using this source, but
+    tracked rather than silently skipped)."""
+    sources = [s for s in _load_declared_sources() if s["source_id"] == source_id]
+    if not sources:
+        return {"promoted": [], "already_primary": 0, "no_match": 0, "error": f"unknown source_id: {source_id}"}
+    domains = sources[0]["domains"]
+
+    from core.database import get_session
+    from core.models.channel import Channel
+    from core.models.manifest import Manifest, Capture
+    from core.channels import ChannelManager
+
+    channel_mgr = ChannelManager()
+    promoted = []
+    already_primary = 0
+    no_match = 0
+
+    with get_session() as session:
+        manifest_domains = dict(
+            session.query(Manifest.id, Capture.page_url)
+            .join(Capture, Manifest.capture_id == Capture.id)
+            .all()
+        )
+        rows = session.query(Channel.id, Channel.name, Channel.manifest_id,
+                             Channel.fallback_manifest_ids).filter(
+            Channel.type == "resolved").all()
+
+    def _matches_source(manifest_id):
+        page_url = manifest_domains.get(manifest_id)
+        if not page_url:
+            return False
+        from urllib.parse import urlparse
+        domain = urlparse(page_url).netloc
+        return any(_domain_matches(domain, d) for d in domains)
+
+    for channel_id, name, primary_id, fb_ids in rows:
+        if primary_id and _matches_source(primary_id):
+            already_primary += 1
+            continue
+        match = next((mid for mid in (fb_ids or []) if _matches_source(mid)), None)
+        if not match:
+            continue
+        channel_mgr.set_primary_manifest(channel_id, match)
+        promoted.append({"channel_id": channel_id, "name": name})
+
+    logger.info("[SOURCES] Promoted %d channel(s) to primary for source %s (already_primary=%d)",
+                len(promoted), source_id, already_primary)
+    return {"promoted": promoted, "already_primary": already_primary, "no_match": no_match}
 
 
 def list_source_status() -> list[dict]:

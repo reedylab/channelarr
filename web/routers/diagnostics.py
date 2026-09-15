@@ -96,6 +96,19 @@ def diagnostics_toggle_source(source_id: str, body: dict):
     return {"ok": True, "sources": list_source_status()}
 
 
+@router.post("/diagnostics/sources/{source_id}/promote-all")
+def diagnostics_promote_source(source_id: str):
+    """Bulk "Make Primary" -- for every channel currently carrying a
+    fallback manifest from this source, promote it to primary. A human's
+    explicit "I know this source is good" call (core/source_registry.py::
+    promote_source_to_primary). Reversible per-channel via the existing
+    per-channel Make Primary action (the demoted old primary just becomes
+    that channel's own new front-of-chain fallback, never dropped)."""
+    from core.source_registry import promote_source_to_primary
+    result = promote_source_to_primary(source_id)
+    return {"ok": "error" not in result, **result}
+
+
 @router.get("/diagnostics/{channel_id}/stream")
 async def diagnostics_channel_stream(channel_id: str, request: Request):
     from core.diagnostics import get_summary, subscribe, unsubscribe
