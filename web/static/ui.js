@@ -87,11 +87,11 @@ function switchView(view) {
   if (view === "media") loadMediaView();
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
-  if (view === "resolver") loadResolver();
-  if (view === "diagnostics") {
-    loadDiagnostics(); loadSourcesPanel(); loadSidecarQueues();
+  if (view === "resolver") {
+    loadResolver(); loadSidecarQueues();
     if (!sidecarQueueTimer) sidecarQueueTimer = setInterval(loadSidecarQueues, 3000);
   }
+  if (view === "diagnostics") { loadDiagnostics(); loadSourcesPanel(); }
   if (view === "settings") {
     // Auto-expand subnav and load active sub-tab
     const parentBtn = document.querySelector('[data-view="settings"]');
@@ -106,6 +106,8 @@ function switchView(view) {
   if (view !== "resolver") {
     clearInterval(resolverTimer);
     resolverTimer = null;
+    clearInterval(sidecarQueueTimer);
+    sidecarQueueTimer = null;
   }
   if (view === "scrapers") { loadScrapers(); loadEventQueue(); }
   if (view !== "scrapers") {
@@ -117,10 +119,6 @@ function switchView(view) {
   if (view !== "diagnostics" && diagEventSource) {
     diagEventSource.close();
     diagEventSource = null;
-  }
-  if (view !== "diagnostics") {
-    clearInterval(sidecarQueueTimer);
-    sidecarQueueTimer = null;
   }
 }
 
