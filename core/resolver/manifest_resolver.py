@@ -836,6 +836,16 @@ class ManifestResolverService:
                             event_start=event_start,
                             event_end=event_end,
                         )
+                        if not ch:
+                            # Same "auto_create's success criterion is
+                            # getting a channel" reasoning as the except
+                            # block below -- create_resolved_channel returning
+                            # falsy (no exception) is this same failure mode
+                            # via a different path, must not be silently
+                            # treated as ok=True either.
+                            logger.warning("[RESOLVER] Auto-create channel returned nothing for %s", manifest_id)
+                            result["ok"] = False
+                            result["error"] = "manifest resolved but create_resolved_channel returned nothing"
                         if ch:
                             result["channel_id"] = ch["id"]
                             result["channel_name"] = ch["name"]
@@ -875,6 +885,20 @@ class ManifestResolverService:
                             shared_state.regenerate_m3u()
                 except Exception as e:
                     logger.warning("[RESOLVER] Auto-create channel failed for %s: %s", manifest_id, e)
+                    # Real bug found 2026-09-16: this except previously only
+                    # logged -- result["ok"] stayed True from the manifest
+                    # capture succeeding above, so a caller that asked for
+                    # auto_create specifically (the whole point of the call)
+                    # saw a plain success with channel_id=None and had no way
+                    # to tell "fully succeeded" apart from "got a manifest but
+                    # never got the channel it actually wanted." event_
+                    # resolver.py's reconcile step took that at face value and
+                    # marked the event permanently "resolved" -- a status that
+                    # never gets retried -- even though nothing was actually
+                    # watchable. If auto_create was requested, getting a
+                    # channel out of it IS the success criterion.
+                    result["ok"] = False
+                    result["error"] = f"manifest resolved but channel creation failed: {e}"
 
             return result
 
