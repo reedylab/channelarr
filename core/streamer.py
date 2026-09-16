@@ -561,6 +561,24 @@ class StreamerManager:
         path = os.path.join(base, "branding", branding_logo)
         return path if os.path.isfile(path) else ""
 
+    def _kick_off_player_evaluation(self, channel_id: str, manifest_id: str):
+        """Fire-and-forget: probe this channel's known player paths in the
+        background when a viewer actually starts watching. Replaces the old
+        periodic due-channels sweep -- for fixed-structure multi-player
+        sources (a known, unchanging set of player paths) there's nothing to
+        gain from probing on a timer regardless of viewership; evaluating
+        once per real watch session is enough to keep the fallback chain
+        ranked. discover_and_record no-ops on its own for anything that
+        isn't a multi-player native-resolver source, so this is safe to call
+        unconditionally."""
+        def _run():
+            try:
+                from core.resolver.player_health import discover_and_record
+                discover_and_record(channel_id, manifest_id)
+            except Exception as e:
+                logging.warning("[STREAM] player evaluation failed for %s: %s", channel_id, e)
+        threading.Thread(target=_run, daemon=True).start()
+
     def start_channel(self, channel_id: str, schedule: list,
                       start_index: int = 0, start_seek: float = 0.0,
                       loop: bool = True, show_next: bool = False,
@@ -685,6 +703,7 @@ class StreamerManager:
         )
         stream.start()
         self._streams[channel_id] = stream
+        self._kick_off_player_evaluation(channel_id, manifest_id)
         return True
 
     def start_proxy_channel(self, channel_id: str, manifest_id: str,
@@ -724,6 +743,7 @@ class StreamerManager:
         )
         stream.start()
         self._streams[channel_id] = stream
+        self._kick_off_player_evaluation(channel_id, manifest_id)
         return True
 
     def start_remux_channel(self, channel_id: str, manifest_id: str,
@@ -774,6 +794,7 @@ class StreamerManager:
         )
         stream.start()
         self._streams[channel_id] = stream
+        self._kick_off_player_evaluation(channel_id, manifest_id)
         return True
 
     def stop_channel(self, channel_id: str) -> bool:

@@ -276,32 +276,41 @@ async def lifespan(app: FastAPI):
     add_job("manifest_refresh", refresh_due_manifests, seconds=60, max_instances=1)
     logging.info("[RESOLVER] Scheduled manifest refresh tick (60s interval)")
 
-    # Player-health probe tick — the safety net for TRACKED-but-not-
-    # currently-live channels (watched recently, scores going stale, but
-    # nobody's watching this second). Pure HTTP (no selenium/browser cost),
-    # deliberately independent of pipeline_lock/manifest_refresh's single-
-    # worker sidecar coordination.
-    from core.resolver.player_health import probe_due_channels
-    add_job("player_health_probe", probe_due_channels, seconds=120, max_instances=1)
-    logging.info("[PLAYER-HEALTH] Scheduled player health probe tick (120s interval)")
+    # Player-health probe tick -- DISABLED 2026-09-16. This was a periodic
+    # (120s) full re-discovery sweep across every TRACKED-but-not-live
+    # channel that was "due", regardless of whether anyone was watching.
+    # For fixed-structure multi-player sources the set of player paths is
+    # known and unchanging -- there's nothing to gain from probing it on a
+    # timer independent of viewership, and several of those paths route
+    # through third-party subdomains that go fully dead (DNS failure /
+    # connection refused) for stretches -- every sweep still burned its full
+    # budget hitting them, and two dead subdomains showing up together was
+    # exactly what tripped the block-detector's distinct-domain threshold
+    # and fired false-positive VPN auto-rotations roughly every 20 minutes.
+    # Replaced with an on-demand trigger: core/streamer.py's
+    # StreamerManager._kick_off_player_evaluation fires the same underlying
+    # probe (player_health.discover_and_record) once, in the background,
+    # whenever a resolved channel actually starts streaming -- evaluating
+    # the fallback chain per real watch session instead of on a global
+    # timer. Token freshness is unaffected -- that's manifest_resolver.py's
+    # refresh_due_manifests (separate 60s tick), which never touched these
+    # dead subdomains and stays exactly as-is.
+    #
+    # from core.resolver.player_health import probe_due_channels
+    # add_job("player_health_probe", probe_due_channels, seconds=120, max_instances=1)
 
-    # Continuous player evaluator -- DISABLED 2026-09-16. Real, confirmed-
-    # live cost outweighed the benefit: a 2-at-a-time background rotation
-    # that never rested between batches (more live channels = more sustained
+    # Continuous player evaluator -- DISABLED 2026-09-16, same night, for a
+    # related but distinct reason: a 2-at-a-time background rotation that
+    # never rested between batches (more live channels = more sustained
     # parallel probing, not a slower pace) was the root cause of a whole
     # night's worth of "hammering" complaints against the fleet's best
     # source, several rounds of pacing/backoff fixes, and disruptive VPN
     # auto-rotations tearing down currently-healthy streams as collateral.
-    # Even after fixing the pacing, the underlying idea -- continuously
-    # pre-warming every live channel's alternates so a switch never has to
-    # wait on a probe -- wasn't worth its ongoing operational risk. The
-    # fleet still has a real, much gentler safety net without this:
-    # core/resolver/player_health.py's probe_due_channels, a bounded 120s
-    # APScheduler tick (max_instances=1) that predates this evaluator
-    # entirely and needs no changes to keep working. A channel that stalls
-    # now discovers a fallback reactively (a few seconds slower) instead of
-    # switching to something continuously pre-vetted -- a real, deliberate
-    # trade for a much smaller footprint. See core/resolver/player_evaluator.py
+    # Even after fixing the pacing, continuously pre-warming every live
+    # channel's alternates so a switch never has to wait on a probe wasn't
+    # worth its ongoing operational risk -- the on-demand, once-per-stream-
+    # start evaluation above covers the same fallback-chain-freshness need
+    # with a much smaller footprint. See core/resolver/player_evaluator.py
     # for the (still intact, just unstarted) implementation if this ever
     # gets revisited with a fundamentally lighter design.
     #
