@@ -285,15 +285,28 @@ async def lifespan(app: FastAPI):
     add_job("player_health_probe", probe_due_channels, seconds=120, max_instances=1)
     logging.info("[PLAYER-HEALTH] Scheduled player health probe tick (120s interval)")
 
-    # Continuous player evaluator — the deeper, faster-reacting counterpart
-    # scoped to CURRENTLY-LIVE channels only (stays as thread, not a tick,
-    # same reasoning as the YouTube cache worker below): a 2-at-a-time
-    # background rotation keeps live channels' alternate sources warm with
-    # real 30s samples, and a ~10s watchdog acts on that data instantly the
-    # moment the diagnostics dashboard flags trouble — the switch itself
-    # never waits on a probe. See core/resolver/player_evaluator.py.
-    from core.resolver.player_evaluator import start_player_evaluator
-    start_player_evaluator()
+    # Continuous player evaluator -- DISABLED 2026-09-16. Real, confirmed-
+    # live cost outweighed the benefit: a 2-at-a-time background rotation
+    # that never rested between batches (more live channels = more sustained
+    # parallel probing, not a slower pace) was the root cause of a whole
+    # night's worth of "hammering" complaints against the fleet's best
+    # source, several rounds of pacing/backoff fixes, and disruptive VPN
+    # auto-rotations tearing down currently-healthy streams as collateral.
+    # Even after fixing the pacing, the underlying idea -- continuously
+    # pre-warming every live channel's alternates so a switch never has to
+    # wait on a probe -- wasn't worth its ongoing operational risk. The
+    # fleet still has a real, much gentler safety net without this:
+    # core/resolver/player_health.py's probe_due_channels, a bounded 120s
+    # APScheduler tick (max_instances=1) that predates this evaluator
+    # entirely and needs no changes to keep working. A channel that stalls
+    # now discovers a fallback reactively (a few seconds slower) instead of
+    # switching to something continuously pre-vetted -- a real, deliberate
+    # trade for a much smaller footprint. See core/resolver/player_evaluator.py
+    # for the (still intact, just unstarted) implementation if this ever
+    # gets revisited with a fundamentally lighter design.
+    #
+    # from core.resolver.player_evaluator import start_player_evaluator
+    # start_player_evaluator()
 
     # YouTube pre-cache worker (stays as thread — cookie warmup + failure tracking)
     from core.youtube import start_yt_cache_worker
