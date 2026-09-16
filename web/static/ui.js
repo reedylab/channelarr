@@ -87,10 +87,7 @@ function switchView(view) {
   if (view === "media") loadMediaView();
   if (view === "bumps") loadBumps();
   if (view === "system") updateSystemStats();
-  if (view === "resolver") {
-    loadResolver(); loadSidecarQueues();
-    if (!sidecarQueueTimer) sidecarQueueTimer = setInterval(loadSidecarQueues, 3000);
-  }
+  if (view === "resolver") loadResolver();
   if (view === "diagnostics") { loadDiagnostics(); loadSourcesPanel(); }
   if (view === "settings") {
     // Auto-expand subnav and load active sub-tab
@@ -106,8 +103,6 @@ function switchView(view) {
   if (view !== "resolver") {
     clearInterval(resolverTimer);
     resolverTimer = null;
-    clearInterval(sidecarQueueTimer);
-    sidecarQueueTimer = null;
   }
   if (view === "scrapers") { loadScrapers(); loadEventQueue(); }
   if (view !== "scrapers") {
@@ -3976,57 +3971,6 @@ channelarr.scraperFilterQueue = function(name) {
   const panel = $("#event-queue-panel");
   if (panel) panel.scrollIntoView({behavior: "smooth", block: "start"});
 };
-
-// ─── Sidecar Capture Queues ───
-let sidecarQueueTimer = null;
-let sidecarQueueLane = "live_event_high";
-let sidecarQueueData = [];
-
-const SIDECAR_QUEUE_LABELS = {
-  live_event_high: "Live Events · High",
-  live_event_low: "Live Events · Low",
-  default_high: "Default · High",
-  default_low: "Default · Low",
-};
-
-$$(".media-tab-queue").forEach(btn => {
-  btn.addEventListener("click", () => {
-    sidecarQueueLane = btn.dataset.lane;
-    $$(".media-tab-queue").forEach(b => b.classList.toggle("active", b === btn));
-    renderSidecarQueueDetail();
-  });
-});
-
-function loadSidecarQueues() {
-  fetch(`${API}/diagnostics/sidecar-queues`).then(r => r.json()).then(data => {
-    const statusEl = $("#sidecar-queues-status");
-    if (!data.ok) {
-      statusEl.textContent = `Sidecar unreachable: ${data.error || "unknown error"}`;
-      sidecarQueueData = [];
-    } else {
-      statusEl.textContent = `browser ${data.browser_alive ? "alive" : "down"} · ${data.capture_count || 0} captures total`;
-      sidecarQueueData = data.lanes || [];
-    }
-    renderSidecarQueueDetail();
-  }).catch(() => {});
-}
-
-function renderSidecarQueueDetail() {
-  const el = $("#sidecar-queue-detail");
-  if (!el) return;
-  const lane = sidecarQueueData.find(l => l.key === sidecarQueueLane);
-  if (!lane) {
-    el.innerHTML = `<div class="empty-state">No data for ${esc(SIDECAR_QUEUE_LABELS[sidecarQueueLane] || sidecarQueueLane)} yet.</div>`;
-    return;
-  }
-  el.innerHTML = `
-    <div class="stat-row-grid" style="display:flex;gap:24px">
-      <div><div class="text-muted" style="font-size:11px">CAPACITY</div><div style="font-size:22px">${lane.cap}</div></div>
-      <div><div class="text-muted" style="font-size:11px">IN FLIGHT</div><div style="font-size:22px">${lane.in_flight}</div></div>
-      <div><div class="text-muted" style="font-size:11px">FREE</div><div style="font-size:22px">${lane.free}</div></div>
-      <div><div class="text-muted" style="font-size:11px${lane.queued ? ';color:var(--danger)' : ''}">QUEUED</div><div style="font-size:22px${lane.queued ? ';color:var(--danger)' : ''}">${lane.queued}</div></div>
-    </div>`;
-}
 
 // ─── Live Diagnostics ───
 let diagEventSource = null;

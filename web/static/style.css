@@ -610,7 +610,6 @@ button,input,select,textarea{font-family:inherit}
 /* Guide view — manifold-style grid */
 .guide-controls{display:flex;align-items:center;gap:10px}
 .guide-range.active{background:var(--accent);border-color:var(--accent);color:white}
-.media-tab-queue.active{background:var(--accent);border-color:var(--accent);color:white}
 .guide-container{overflow:hidden;position:relative}
 .guide-grid{display:grid;grid-template-columns:240px 1fr;min-height:300px}
 .guide-channels{display:flex;flex-direction:column;border-right:1px solid var(--border);position:sticky;left:0;z-index:2;background:var(--bg-card)}
