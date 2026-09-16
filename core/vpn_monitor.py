@@ -47,6 +47,36 @@ _block_rotation_backoff_multiplier = 1
 _last_block_rotation_domains: frozenset = frozenset()
 _BLOCK_BACKOFF_CAP_MULTIPLIER = 32  # e.g. 10min base -> capped at ~5h20m
 
+# Real, confirmed-live problem (2026-09-15): rotation is disruptive to
+# EVERY active connection regardless of which domain triggered it, since
+# it cycles the whole tunnel's exit IP -- a block-triggered rotation was
+# tearing down a currently-healthy, actively-watched stream to try to fix
+# a completely unrelated background probe's failure. This gives an
+# actively-healthy stream a grace window before the first rotation
+# attempt in a given block episode, without disabling self-healing
+# entirely -- if the block is still there after _MAX_VIEWER_DEFERS checks
+# (~5 min at the 60s poll interval this is called on), it rotates anyway
+# regardless of viewer state, since indefinitely deferring would mean a
+# real, persistent block never gets fixed as long as anything is playing.
+_viewer_defer_count = 0
+_MAX_VIEWER_DEFERS = 5
+
+
+def _has_healthy_active_stream() -> bool:
+    """True if any currently-running stream looks genuinely healthy right
+    now -- best-effort, never lets a diagnostics failure block a real
+    rotation (defaults to "no" on error, same posture as not knowing)."""
+    try:
+        from core.diagnostics import get_live_snapshot
+        from web import shared_state
+        statuses = shared_state.streamer_mgr.get_all_status()
+        for row in get_live_snapshot(statuses):
+            if row.get("quality") not in (None, "bad"):
+                return True
+        return False
+    except Exception:
+        return False
+
 
 def get_block_rotation_status() -> dict:
     """Read-only snapshot for the Diagnostics Sources panel: what domains
@@ -411,6 +441,7 @@ def maybe_auto_rotate():
     """
     from core.config import get_setting
     global _last_rotate_at, _block_rotation_backoff_multiplier, _last_block_rotation_domains
+    global _viewer_defer_count
     now = datetime.now(timezone.utc)
 
     try:
@@ -433,7 +464,18 @@ def maybe_auto_rotate():
         # interval rather than inheriting stale escalation from whatever
         # domain caused it last time.
         _block_rotation_backoff_multiplier = 1
+        _viewer_defer_count = 0
         return
+
+    if _viewer_defer_count < _MAX_VIEWER_DEFERS and _has_healthy_active_stream():
+        _viewer_defer_count += 1
+        logger.warning(
+            "[VPN] possible IP block detected but deferring rotation (%d/%d) -- "
+            "at least one stream is currently healthy and rotation would disrupt "
+            "it too; will re-check next cycle",
+            _viewer_defer_count, _MAX_VIEWER_DEFERS)
+        return
+    _viewer_defer_count = 0
 
     try:
         block_minutes = int(get_setting("vpn_block_rotate_min_interval_minutes", "10") or "10")

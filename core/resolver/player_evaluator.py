@@ -37,6 +37,7 @@ sleep, no stop path.
 """
 
 import logging
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -79,6 +80,24 @@ _EMPTY_QUEUE_BACKOFF_SECONDS = 15  # nothing live/multi-player right now
 # meaningfully longer than this.
 _FAST_BATCH_THRESHOLD_SECONDS = 5
 _FAST_BATCH_MAX_BACKOFF_SECONDS = 300
+
+# Confirmed live 2026-09-15: even with the fast-batch backoff above (which
+# only catches instant-failure batches), a batch of genuinely real ~30s
+# samples still gets immediately followed by the next batch with ZERO
+# rest in between -- as long as any multi-player channel is live, this
+# loop never actually idles. Worse, MORE concurrent live channels just
+# means a bigger queue, not a slower pace -- watching several streams at
+# once multiplies sustained background probe volume against whatever
+# domain(s) they share with no throttle at all. This forces a real gap
+# between the START of consecutive batches regardless of how fast the
+# batch's own work finished -- more queued work now means this loop
+# takes longer to cycle through everything (each individual channel's
+# alternates get re-checked less often when more channels are live),
+# which is the correct direction: it should get GENTLER under load, not
+# stay flat. Jittered for the same reason as _native_resolvers.py's own
+# per-request pacing -- a perfectly periodic cycle is its own signal.
+_MIN_BATCH_INTERVAL_SECONDS = 90
+_MIN_BATCH_INTERVAL_JITTER_SECONDS = 30
 
 
 def _native_resolver():
@@ -311,6 +330,16 @@ def _warming_loop() -> None:
                     time.sleep(backoff)
                 else:
                     consecutive_fast_batches = 0
+                    # Real, deliberate rest between batches -- see
+                    # _MIN_BATCH_INTERVAL_SECONDS's own comment. The batch's
+                    # own real-sample work already ate some of this window;
+                    # only sleep the remainder so a slow batch doesn't get
+                    # penalized twice.
+                    target = _MIN_BATCH_INTERVAL_SECONDS + random.uniform(
+                        0, _MIN_BATCH_INTERVAL_JITTER_SECONDS)
+                    remaining = target - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
             except Exception as e:
                 logger.error("[PLAYER-EVAL] warming loop error: %s", e)
                 time.sleep(_EMPTY_QUEUE_BACKOFF_SECONDS)
