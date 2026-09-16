@@ -51,6 +51,30 @@ def _get_settings() -> tuple[int, int, int]:
     return lead, backoff, max_attempts
 
 
+# Real bug found 2026-09-16: the flat backoff above meant a persistently-
+# failing event just re-entered the "due" pool every backoff_minutes
+# forever, up to max_attempts. Traced a real multiplex wedge to this
+# directly: several events (all from the same browser-dependent-only
+# source family) had failed 10-19 times each, all roughly synchronized
+# since they started failing around the same original tick -- meaning
+# multiple of them kept becoming due in the SAME tick repeatedly, and
+# resolve_batch fires everything due in one tick concurrently, so this
+# was a recurring burst of real browser captures every ~5 minutes, not a
+# one-off. Same escalating-backoff shape already proven for
+# vpn_monitor.py's rotation backoff and core/source_registry.py's
+# auto-hold -- a failing candidate should back off harder over time, not
+# hold a flat retry cadence forever. Capped well below max_attempts'
+# worth of wait time -- expire_stale_events() is the real safety net for
+# a truly dead event (once its own event_end passes it's swept regardless
+# of attempt_count), so this cap doesn't need to be conservative.
+_BACKOFF_ESCALATION_CAP = 8
+
+
+def _effective_backoff_minutes(attempt_count: int, base_minutes: int) -> float:
+    multiplier = min(2 ** max(0, (attempt_count or 0) - 1), _BACKOFF_ESCALATION_CAP)
+    return base_minutes * multiplier
+
+
 def _md5(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
@@ -222,7 +246,11 @@ def _resolve_due_events_inner():
                 ev.last_error = "Reconcile lost — JIT process killed mid-batch"
             logger.info("[QUEUE] Self-healed %d stuck 'resolving' rows back to pending", len(stale))
 
-        candidates = (
+        # SQL pre-filter uses the base (unescalated) backoff -- cheap, keeps
+        # the candidate set from scanning every pending row every tick. The
+        # real per-row escalating check happens in Python just below, since
+        # it depends on each row's own attempt_count.
+        raw_candidates = (
             session.query(ScrapedEvent)
             .filter(ScrapedEvent.status == "pending")
             .filter(ScrapedEvent.event_start < now + timedelta(minutes=lead_minutes))
@@ -235,6 +263,19 @@ def _resolve_due_events_inner():
             .order_by(ScrapedEvent.event_start.asc())
             .all()
         )
+        candidates = []
+        for ev in raw_candidates:
+            if ev.last_attempt_at is None:
+                candidates.append(ev)
+                continue
+            effective = _effective_backoff_minutes(ev.attempt_count, backoff_minutes)
+            if ev.last_attempt_at < now - timedelta(minutes=effective):
+                candidates.append(ev)
+
+        skipped_backoff = len(raw_candidates) - len(candidates)
+        if skipped_backoff:
+            logger.info("[QUEUE] JIT resolve: %d candidate(s) held back by escalating backoff "
+                        "(repeated failures)", skipped_backoff)
 
         if not candidates:
             return
