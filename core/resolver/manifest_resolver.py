@@ -8,6 +8,7 @@ in channelarr's resolver Postgres tables (parallel to existing JSON storage).
 import hashlib
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -23,6 +24,28 @@ from core.models.manifest import Capture, Manifest, Variant, HeaderProfile
 from core.resolver.expiry_parser import parse_expiry, parse_body_expiry
 
 logger = logging.getLogger(__name__)
+
+# Fallback expiry when a manifest's own body/URL carries no parseable expiry
+# (parse_body_expiry returns None) -- used to schedule this manifest's next
+# background refresh. Confirmed live 2026-09-15: real, direct "Connection
+# refused" against a native-resolver entry apex was still happening even after
+# fixing a per-request pacing/misattribution bug, with real fleet channels
+# (dozens on this one apex) all defaulting to the same flat 30min window --
+# meaning many channels' refreshes cluster into near-lockstep cycles
+# regardless of how well-paced any ONE resolve's own requests are. Two
+# independent levers: raised the base window (fewer refreshes overall,
+# directly cutting total request volume against the apex) and added
+# jitter (spreads WHEN different channels' windows land, so they don't
+# resync into periodic mini-bursts the way a shared flat interval would).
+_DEFAULT_EXPIRY_MINUTES = 60
+_DEFAULT_EXPIRY_JITTER_MINUTES = 15
+
+
+def _default_expiry(now: datetime) -> datetime:
+    minutes = _DEFAULT_EXPIRY_MINUTES + random.uniform(
+        -_DEFAULT_EXPIRY_JITTER_MINUTES, _DEFAULT_EXPIRY_JITTER_MINUTES)
+    return now + timedelta(minutes=minutes)
+
 
 # Status tracking for async resolve jobs
 _status = {"running": False, "last_url": None, "last_error": None, "last_manifest_id": None}
@@ -767,7 +790,7 @@ class ManifestResolverService:
 
             _status["last_manifest_id"] = manifest_id
             now_utc = datetime.now(timezone.utc)
-            expires_at = parse_body_expiry(body_text, manifest_url) or (now_utc + timedelta(minutes=30))
+            expires_at = parse_body_expiry(body_text, manifest_url) or _default_expiry(now_utc)
             logger.info("[RESOLVER] Manifest resolved and stored: %s -> %s (expires %s)",
                         url, manifest_id, expires_at.isoformat())
             # No regenerate_m3u() here — every channel publishes one stable
@@ -993,9 +1016,10 @@ class ManifestResolverService:
                             "error": "decrypt probe: TS sync byte missing (session likely stale)"}
 
         # Refresh is real. Update expiry from the new body if it carries one,
-        # otherwise just push the default-30min window forward.
+        # otherwise just push the jittered default window forward (see
+        # _default_expiry).
         now = datetime.now(timezone.utc)
-        new_expiry = parse_body_expiry(body, url) or (now + timedelta(minutes=30))
+        new_expiry = parse_body_expiry(body, url) or _default_expiry(now)
         with get_session() as session:
             m = session.query(Manifest).filter_by(id=manifest_id).first()
             if m:
@@ -1487,9 +1511,10 @@ def _store_manifest(
     url_hash = _md5(manifest_url)
     body_hash = _sha256(body_text)
     now = datetime.now(timezone.utc)
-    # Try to parse real expiry from URL/body; fall back to 30min default so the
-    # scheduler refreshes all resolved channels periodically regardless of token format.
-    expires_at = parse_body_expiry(body_text, manifest_url) or (now + timedelta(minutes=30))
+    # Try to parse real expiry from URL/body; fall back to the jittered
+    # default window (see _default_expiry) so the scheduler refreshes all
+    # resolved channels periodically regardless of token format.
+    expires_at = parse_body_expiry(body_text, manifest_url) or _default_expiry(now)
 
     # DRM detection
     drm_method = None
