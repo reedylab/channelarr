@@ -245,6 +245,24 @@
           </div>
         </div>
 
+        <div class="panel" id="sidecar-queues-panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h3>Sidecar Capture Queues</h3>
+            <div class="panel-actions">
+              <span class="text-muted" style="font-size:12px" id="sidecar-queues-status">--</span>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:16px">
+            <div class="media-tabs" style="margin-bottom:12px">
+              <button class="btn btn-ghost media-tab-queue active" data-lane="live_event_high">Live Events &middot; High</button>
+              <button class="btn btn-ghost media-tab-queue" data-lane="live_event_low">Live Events &middot; Low</button>
+              <button class="btn btn-ghost media-tab-queue" data-lane="default_high">Default &middot; High</button>
+              <button class="btn btn-ghost media-tab-queue" data-lane="default_low">Default &middot; Low</button>
+            </div>
+            <div id="sidecar-queue-detail" class="empty-state">Loading…</div>
+          </div>
+        </div>
+
         <div class="panel" id="source-toggles-panel" style="margin-top:16px">
           <div class="panel-head">
             <h3>Plugin Sources</h3>

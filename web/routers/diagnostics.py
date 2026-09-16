@@ -144,6 +144,38 @@ def diagnostics_set_encoder_mode(source_id: str, body: dict):
     return {"ok": "error" not in result, **result}
 
 
+@router.get("/diagnostics/sidecar-queues")
+def diagnostics_sidecar_queues():
+    """Live occupancy of the sidecar's four hard-partitioned capture lanes
+    (multiplex/app.py::LanedSlots -- (live_event|default) x (high|low)),
+    straight from its /health endpoint. Must be registered before
+    /diagnostics/{channel_id} (below) so "sidecar-queues" doesn't get
+    swallowed as a channel_id path param."""
+    import requests as http_requests
+    from core.config import get_setting
+    try:
+        r = http_requests.get(f"{get_setting('SELENIUM_URL', 'http://localhost:4445')}/health", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "lanes": []}
+    tabs = data.get("tabs") or {}
+    cap = tabs.get("cap", {})
+    free = tabs.get("free", {})
+    queued = tabs.get("queued", {})
+    lanes = [
+        {"key": key, "cap": c, "free": free.get(key, 0),
+         "in_flight": max(0, c - free.get(key, 0)), "queued": queued.get(key, 0)}
+        for key, c in cap.items()
+    ]
+    return {
+        "ok": True,
+        "browser_alive": data.get("browser_alive"),
+        "capture_count": data.get("capture_count"),
+        "lanes": lanes,
+    }
+
+
 @router.get("/diagnostics/{channel_id}/stream")
 async def diagnostics_channel_stream(channel_id: str, request: Request):
     from core.diagnostics import get_summary, subscribe, unsubscribe
