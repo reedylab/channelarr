@@ -275,6 +275,7 @@ def refresh_due_manifests():
         return
     needs_heavy: list[str] = []
     priority_by_id: dict[str, str] = {}
+    lane_by_id: dict[str, str] = {}
     try:
         from core.models.channel import Channel
         now = datetime.now(timezone.utc)
@@ -452,6 +453,23 @@ def refresh_due_manifests():
             for mid, _ in demand_rows + always_on_rows:
                 priority_by_id[mid] = "high"
 
+            # always_on_rows/always_on_fallback_rows are both queried off
+            # Channel.event_start/event_end IS NULL already -- default lane
+            # by construction. Only demand_rows (recently-ACCESSED, not
+            # filtered by event fields at all) can include a live-event
+            # channel's own primary manifest, so that's the only pool worth
+            # a lookup for.
+            if demand_rows:
+                demand_ids = [mid for mid, _ in demand_rows]
+                live_event_rows = (
+                    session.query(Channel.manifest_id)
+                    .filter(Channel.manifest_id.in_(demand_ids))
+                    .filter((Channel.event_start.isnot(None)) | (Channel.event_end.isnot(None)))
+                    .all()
+                )
+                for (mid,) in live_event_rows:
+                    lane_by_id[mid] = "live_event"
+
         if not ids:
             return
 
@@ -521,7 +539,8 @@ def refresh_due_manifests():
             futures = {}
             for mid in batch:
                 futures[ex.submit(ManifestResolverService.refresh_manifest, mid,
-                                   priority=priority_by_id.get(mid, "high"))] = mid
+                                   priority=priority_by_id.get(mid, "high"),
+                                   lane=lane_by_id.get(mid, "default"))] = mid
                 time.sleep(stagger)
             for fut in as_completed(futures):
                 mid = futures[fut]
@@ -539,7 +558,8 @@ def refresh_due_manifests():
                             len(batch) - i, len(batch))
                 break
             try:
-                ManifestResolverService.refresh_manifest(mid, priority=priority_by_id.get(mid, "high"))
+                ManifestResolverService.refresh_manifest(mid, priority=priority_by_id.get(mid, "high"),
+                                                          lane=lane_by_id.get(mid, "default"))
             except Exception as e:
                 logger.warning("[RESOLVER] heavy refresh %s failed: %s", mid, e)
             finally:
@@ -572,16 +592,18 @@ def _native_resolver():
     return _native_mod
 
 
-def _call_sidecar(url: str, timeout: int, priority: str = "high") -> dict:
+def _call_sidecar(url: str, timeout: int, priority: str = "high", lane: str = "default") -> dict:
     """Capture a manifest for a page URL. Some sources expose the HLS URL in
     plain HTML and can be resolved by a pure-HTTP native resolver (no browser);
-    everything else goes through the selenium-uc sidecar /capture endpoint.
+    everything else goes through the multiplex sidecar's /capture endpoint.
 
-    priority is forwarded to the sidecar's single-browser lock as-is — "low"
+    priority is forwarded to the sidecar's slot limiter as-is — "low"
     (background fallback-warming) defers there to any pending "high" (live/
-    on-demand) request. See selenium-uc/app.py's _PriorityLock. Anything but
-    an explicit "low" behaves like a plain mutex on the sidecar side, so the
-    default here preserves prior behavior for every existing caller."""
+    on-demand) request within the same lane. lane picks which independent
+    capacity pool the request draws from — "live_event" (channel has
+    event_start/event_end set) vs "default" (24/7 or anything else) — so a
+    pile-up in one can never starve the other. See multiplex/app.py's
+    LanedSlots."""
     from urllib.parse import urlparse
     from core.source_registry import is_domain_enabled
     domain = urlparse(url).netloc
@@ -605,10 +627,10 @@ def _call_sidecar(url: str, timeout: int, priority: str = "high") -> dict:
     sidecar_url = f"{get_setting('SELENIUM_URL', 'http://localhost:4445')}/capture"
     # HTTP timeout = browser timeout + 30s buffer for startup/teardown
     http_timeout = timeout + 30
-    logger.info("Calling sidecar %s for %s (priority=%s)", sidecar_url, url, priority)
+    logger.info("Calling sidecar %s for %s (priority=%s, lane=%s)", sidecar_url, url, priority, lane)
     resp = http_requests.post(
         sidecar_url,
-        json={"url": url, "timeout": timeout, "switch_iframe": True, "priority": priority},
+        json={"url": url, "timeout": timeout, "switch_iframe": True, "priority": priority, "lane": lane},
         timeout=http_timeout,
     )
     resp.raise_for_status()
@@ -643,7 +665,8 @@ class ManifestResolverService:
                 event_end: str | None = None,
                 auto_create: bool = False,
                 logo_urls: list | None = None,
-                priority: str = "high") -> dict:
+                priority: str = "high",
+                lane: str | None = None) -> dict:
         """Capture an m3u8 manifest via the sidecar and store it in DB.
 
         If existing_manifest_id is provided, the specified row is updated in place
@@ -652,8 +675,15 @@ class ManifestResolverService:
         created automatically with the given tags and event times.
 
         priority: "low" for background fallback-warming so it defers to any
-        live/on-demand request pending on the sidecar's single browser —
+        live/on-demand request pending in the same lane on the sidecar —
         see _call_sidecar. Everything else should leave this at the default.
+
+        lane: which sidecar capacity pool to draw from. Leave None (the
+        default) to derive it from event_start/event_end (live_event if
+        either is set, default otherwise) — pass explicitly only when the
+        caller already knows the channel's lane and event_start/event_end
+        aren't available here (e.g. refresh_manifest, refreshing an existing
+        row by manifest_id alone).
         """
         # In-flight dedup — if another thread is already resolving this URL, wait for it
         # (unless that entry is stale enough to be genuinely stuck — see
@@ -718,8 +748,10 @@ class ManifestResolverService:
         pool = _pool_for_priority(priority) if mode == "multi" else None
         if pool:
             pool.acquire()
+        resolved_lane = lane if lane is not None else (
+            "live_event" if (event_start or event_end) else "default")
         try:
-            capture = _call_sidecar(url, timeout, priority=priority)
+            capture = _call_sidecar(url, timeout, priority=priority, lane=resolved_lane)
         finally:
             if pool:
                 pool.release()
@@ -1054,7 +1086,8 @@ class ManifestResolverService:
                 "expires_at": new_expiry.isoformat(), "path": "light"}
 
     @staticmethod
-    def refresh_manifest(manifest_id: str, timeout: int = 60, priority: str = "high") -> dict:
+    def refresh_manifest(manifest_id: str, timeout: int = 60, priority: str = "high",
+                          lane: str | None = None) -> dict:
         """Re-resolve an existing manifest using its stored page_url.
 
         Updates the same row in place (preserves manifest_id) so active streams
@@ -1068,7 +1101,14 @@ class ManifestResolverService:
         caller — a live proxy/remux stream refreshing its own primary after a
         401/403, the JIT event resolver, a user-triggered resolve — leaves
         this at the default "high" so it doesn't queue behind background work
-        on the sidecar's single browser.
+        in the same lane on the sidecar.
+
+        lane: pass explicitly if the caller already knows the channel's lane
+        (e.g. refresh_due_manifests, which derives it from event_start/
+        event_end at tick time) — this function has no channel context of
+        its own, only a manifest_id, so it can't derive it. Leave None to
+        fall back to resolve()'s own default ("default" lane, since this
+        function's own signature has no event_start/event_end to check).
         """
         with get_session() as session:
             row = (
@@ -1083,11 +1123,11 @@ class ManifestResolverService:
         if not page_url:
             return {"ok": False, "manifest_id": manifest_id, "error": "no page_url for refresh"}
 
-        logger.info("Refreshing manifest %s from %s (full sidecar path, priority=%s)",
-                    manifest_id, page_url, priority)
+        logger.info("Refreshing manifest %s from %s (full sidecar path, priority=%s, lane=%s)",
+                    manifest_id, page_url, priority, lane or "default")
         result = ManifestResolverService.resolve(
             url=page_url, title=title, timeout=timeout,
-            existing_manifest_id=manifest_id, priority=priority,
+            existing_manifest_id=manifest_id, priority=priority, lane=lane,
         )
         if result.get("ok"):
             result["path"] = "full"
@@ -1194,6 +1234,7 @@ class ManifestResolverService:
         fb_kinds = ch.get("fallback_source_kinds") or {}
         ch_name = ch.get("name") or channel_id
         existing_titles = {fb.get("title") for fb in (ch.get("fallback_sources") or [])}
+        lane = "live_event" if (ch.get("event_start") or ch.get("event_end")) else "default"
 
         # Every already-known candidate -- race a REAL refresh for EACH one,
         # not just primary. Today's exhausted-chain path only ever retries
@@ -1244,7 +1285,8 @@ class ManifestResolverService:
             return None
 
         def _try_stored(mid, mode, kind):
-            result = ManifestResolverService.refresh_manifest(mid, timeout=timeout, priority="high")
+            result = ManifestResolverService.refresh_manifest(mid, timeout=timeout, priority="high",
+                                                                lane=lane)
             if result.get("ok"):
                 label = "primary" if mid == primary_id else "fallback (stored)"
                 return {"manifest_id": mid, "manifest_url": result.get("manifest_url"),

@@ -18,17 +18,21 @@ targets within one Chrome process (confirmed in Phase 0's crash-isolation
 test) — "open, capture, close" per request is the natural fit given that,
 not a compromise relative to a real tab pool.
 
-Concurrency comes from however many tabs are open at once (bounded by
-SIDECAR_MAX_TABS), not from a fixed set of pre-warmed tabs waiting to be
-assigned. Priority (high = live-viewer-driven, low = background fallback-
-warming) only matters once every slot is in use — see PrioritySemaphore.
+Concurrency comes from however many tabs are open at once, bounded by four
+independent, hard-partitioned capacity cells -- (lane, priority) -- not a
+single shared pool and not a fixed set of pre-warmed tabs waiting to be
+assigned. Lane (live_event = channel has event_start/event_end set, default
+= everything else) and priority (high = live-viewer-driven, low = background
+fallback-warming) together pick which cell a request draws from; a cell's
+capacity only matters once THAT cell's slot is in use -- see LanedSlots.
+Tune per-cell size via SIDECAR_{LIVE,DEFAULT}_{HIGH,LOW}_TABS.
 
 Endpoints (per the plan's confirmed load-bearing set, plus a debug/vision
 capability added for AI/human troubleshooting -- /tab/* and /restart stay
 out of scope: /tab/* has zero active callers since tab_proxy mode is dead,
 /restart isn't called by any core/web code):
-  POST /capture                              {url, timeout, switch_iframe, priority, debug, click_sequence}
-  POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority}
+  POST /capture                              {url, timeout, switch_iframe, priority, lane, debug, click_sequence}
+  POST /capture/multi-player                 {wrapper_url, candidates, per_candidate_timeout, priority, lane}
   POST /test/watch-channel                   {channel_id, duration_seconds, poll_interval_seconds, priority}
   POST /relay/start                          {url, click_sequence} -> {session_id}
   GET  /relay/{session_id}/chunks            drains accumulated captureStream()+MediaRecorder chunks
@@ -235,7 +239,9 @@ app = FastAPI()
 
 _STARTUP_TIMEOUT = int(os.getenv("CHROME_STARTUP_TIMEOUT", "60"))
 _PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", "/data/chrome-profile")
-_MAX_TABS = int(os.getenv("SIDECAR_MAX_TABS", "3"))
+# Informational only now -- see _DEFAULT_CAPS below for the real, per-cell
+# hard-partitioned capacity (lanes x priority tiers).
+_MAX_TABS = 4
 # channelarr itself, reachable at this address because multiplex shares its
 # network_mode: service:gluetun namespace (confirmed via compose) -- used
 # only by /test/watch-channel to drive channelarr's own /diagnostics-wall
@@ -247,7 +253,7 @@ _CHANNELARR_BASE_URL = os.getenv("CHANNELARR_BASE_URL", "http://localhost:5045")
 # but this is generous headroom over any realistic capture, matching
 # "definitely stale" rather than "might still be working").
 #
-# Lowered from 300s on 2026-09-15: PrioritySemaphore's own docstring already
+# Lowered from 300s on 2026-09-15: the slot limiter's own docstring already
 # says its slot count "has no relationship to how many real Chrome renderer
 # processes are actually still alive" -- this threshold is what actually
 # bounds that gap. Under NORMAL conditions (most tabs close cleanly) that
@@ -294,10 +300,10 @@ _capture_count = 0
 
 # target_id -> opened_at timestamp, for every tab opened via _open_tracked_tab
 # and not yet confirmed closed via _close_tab_safely. See that function's
-# docstring and _sweep_stale_tabs for why this exists: PrioritySemaphore
-# gates how many NEW captures can start, not whether every previously-opened
-# tab actually got closed -- this dict plus the sweeper is what actually
-# bounds real Chrome tab count over a long-running session.
+# docstring and _sweep_stale_tabs for why this exists: LanedSlots gates how
+# many NEW captures can start, not whether every previously-opened tab
+# actually got closed -- this dict plus the sweeper is what actually bounds
+# real Chrome tab count over a long-running session.
 _active_tabs: dict[str, float] = {}
 
 # Long-lived browser-tab-relay sessions (see relay_capture.py) -- a
@@ -336,52 +342,80 @@ _RELAY_SWEEP_INTERVAL = int(os.getenv("SIDECAR_RELAY_SWEEP_INTERVAL", "15"))
 # blanket always-on cost -- applied to the opposite lever here: shrink
 # ephemeral capture concurrency automatically, only while a relay session
 # actually needs the headroom, by having each active relay session reserve
-# real slots out of the SAME _slots pool ephemeral captures draw from.
-_RELAY_RESERVED_TABS = int(os.getenv("SIDECAR_RELAY_RESERVED_TABS", "2"))
+# real slots out of the SAME _slots pool ephemeral captures draw from --
+# specifically one cell of each priority tier in the "default" lane (see
+# relay_start), so a relay session's protection never costs live-event
+# capacity. No longer a tunable count (SIDECAR_RELAY_RESERVED_TABS) since
+# each cell only ever holds 1 slot under the lane split.
 
 
-class PrioritySemaphore:
-    """A counting semaphore where, once every slot is taken, a newly-freed
-    slot goes to the longest-waiting HIGH-priority request before any
-    already-queued LOW-priority one — same no-preemption, FIFO-within-tier
-    semantics as the original sidecar-2.0 plan's §6 (a shared browser lock
-    version of this same idea). Priority is moot whenever a slot is free —
-    which is the actual concurrency win Phase 2 exists for: most requests
-    won't queue at all as long as the tab cap isn't exhausted."""
+_LANES = ("live_event", "default")
+_TIERS = ("high", "low")
 
-    def __init__(self, value: int):
-        self._value = value
-        self._waiters = {"high": deque(), "low": deque()}
+# Hard-partitioned capacity: each (lane, priority) cell has its own fixed
+# slot count and its own FIFO waiter queue -- unlike the old single-pool
+# PrioritySemaphore (where priority only ordered a shared queue once the
+# whole pool was exhausted), tiers here never share capacity or steal from
+# each other. Real, confirmed-live motivation: a live-sports-event capture
+# and a 24/7 background discovery sweep used to compete for the exact same
+# pool, and a single-domain outage's discovery fallback could tie up a slot
+# for the sidecar's longest deadline (150s) at the exact moment a live event
+# needed one. One slot each is what the 8GB host's current memory headroom
+# (confirmed tight -- already swapping) supports; see SIDECAR_*_TABS env
+# vars to retune per cell if that changes.
+_DEFAULT_CAPS = {
+    ("live_event", "high"): int(os.getenv("SIDECAR_LIVE_HIGH_TABS", "1")),
+    ("live_event", "low"): int(os.getenv("SIDECAR_LIVE_LOW_TABS", "1")),
+    ("default", "high"): int(os.getenv("SIDECAR_DEFAULT_HIGH_TABS", "1")),
+    ("default", "low"): int(os.getenv("SIDECAR_DEFAULT_LOW_TABS", "1")),
+}
 
-    async def acquire(self, priority: str = "high"):
-        priority = priority if priority in self._waiters else "high"
-        if self._value > 0:
-            self._value -= 1
-            return
+
+class LanedSlots:
+    """Four independent capacity cells -- (lane, priority) -> slot count.
+    acquire() returns the resolved (lane, priority) key; release() MUST be
+    called with that exact key (not a bare call like the old shared-pool
+    semaphore) since there's no longer a single pool to give a freed slot
+    back to -- each cell only ever hands slots to its own waiters."""
+
+    def __init__(self, caps: dict):
+        self._caps = dict(caps)
+        self._value = dict(caps)
+        self._waiters = {key: deque() for key in caps}
+
+    def _key(self, lane: str, priority: str):
+        lane = lane if lane in _LANES else "default"
+        priority = priority if priority in _TIERS else "high"
+        return (lane, priority)
+
+    async def acquire(self, lane: str = "default", priority: str = "high"):
+        key = self._key(lane, priority)
+        if self._value[key] > 0:
+            self._value[key] -= 1
+            return key
         fut = asyncio.get_running_loop().create_future()
-        self._waiters[priority].append(fut)
+        self._waiters[key].append(fut)
         await fut
+        return key
 
-    def release(self):
-        for tier in ("high", "low"):
-            q = self._waiters[tier]
-            while q:
-                fut = q.popleft()
-                if not fut.done():
-                    fut.set_result(None)
-                    return
-        self._value += 1
+    def release(self, key):
+        q = self._waiters[key]
+        while q:
+            fut = q.popleft()
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._value[key] += 1
 
     def status(self) -> dict:
         return {
-            "free": self._value,
-            "cap": _MAX_TABS,
-            "queued_high": len(self._waiters["high"]),
-            "queued_low": len(self._waiters["low"]),
+            "cap": {f"{lane}_{pri}": cap for (lane, pri), cap in self._caps.items()},
+            "free": {f"{lane}_{pri}": v for (lane, pri), v in self._value.items()},
+            "queued": {f"{lane}_{pri}": len(q) for (lane, pri), q in self._waiters.items()},
         }
 
 
-_slots = PrioritySemaphore(_MAX_TABS)
+_slots = LanedSlots(_DEFAULT_CAPS)
 
 
 def _stop_browser_safely(browser, timeout=8):
@@ -485,7 +519,7 @@ async def _sweep_stale_tabs():
     function), since a normal capture's own try/finally always attempts a
     close well before this threshold. This is the actual fix for the
     tab-leak residual risk found during tonight's code review: without it,
-    PrioritySemaphore's logical slot count has no relationship to how many
+    LanedSlots' logical slot counts have no relationship to how many
     real Chrome renderer processes are actually still alive.
 
     Force-close goes straight through browser.main_tab (always kept alive
@@ -874,9 +908,14 @@ class CaptureRequest(BaseModel):
     switch_iframe: bool = True
     debug: bool = False
     # "low" = background/fallback-warming work; "high" = demand-driven/live-
-    # viewer work. Only matters once every tab slot is in use — see
-    # PrioritySemaphore.
+    # viewer work. Only matters once every tab slot in this (lane, priority)
+    # cell is in use — see LanedSlots.
     priority: str = "high"
+    # "live_event" = channel has event_start/event_end set (a scheduled
+    # sports/event stream); "default" = always-on 24/7 channel or anything
+    # else. Separate capacity pool per lane so a pile-up in one can never
+    # starve the other -- see LanedSlots.
+    lane: str = "default"
     # Optional per-site interaction steps (relay_capture.py's action-keyed
     # vocabulary) run right after the initial settle, before the generic
     # iframe-drilling/click-play fallback -- for sources whose real
@@ -893,7 +932,7 @@ async def capture(req: CaptureRequest):
 
     debug_id = uuid.uuid4().hex[:12] if req.debug else None
 
-    await _slots.acquire(req.priority)
+    slot_key = await _slots.acquire(req.lane, req.priority)
     tab = None
     try:
         browser = await _get_browser()
@@ -901,8 +940,8 @@ async def capture(req: CaptureRequest):
         # does its own navigation to req.url, so open blank here.
         tab = await _open_tracked_tab(browser, "about:blank")
 
-        logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d, priority=%s, debug_id=%s)",
-                    req.url, req.timeout, deadline, _capture_count, req.priority, debug_id)
+        logger.info("Starting capture: %s (timeout=%ds, deadline=%ds, count=%d, lane=%s, priority=%s, debug_id=%s)",
+                    req.url, req.timeout, deadline, _capture_count, req.lane, req.priority, debug_id)
 
         outcome = await asyncio.wait_for(
             nc.run_capture(browser, tab, req.url, timeout=req.timeout,
@@ -938,7 +977,7 @@ async def capture(req: CaptureRequest):
         return {"ok": False, "error": str(e), "debug_id": debug_id}
     finally:
         await _close_tab_safely(tab)
-        _slots.release()
+        _slots.release(slot_key)
         if debug_id:
             _evict_old_debug_dirs()
 
@@ -953,6 +992,7 @@ class MultiPlayerCaptureRequest(BaseModel):
     candidates: list[PlayerCandidate]
     per_candidate_timeout: int = 15
     priority: str = "low"
+    lane: str = "default"
 
 
 @app.post("/capture/multi-player")
@@ -969,13 +1009,13 @@ async def capture_multi_player(req: MultiPlayerCaptureRequest):
     rather than letting len(candidates) x per_candidate_timeout run
     unbounded if the caller passes a long candidate list."""
     deadline = len(req.candidates) * req.per_candidate_timeout + 45
-    await _slots.acquire(req.priority)
+    slot_key = await _slots.acquire(req.lane, req.priority)
     tab = None
     try:
         browser = await _get_browser()
         tab = await _open_tracked_tab(browser, "about:blank")
-        logger.info("Starting multi-player capture: wrapper=%s candidates=%d deadline=%ds",
-                    req.wrapper_url, len(req.candidates), deadline)
+        logger.info("Starting multi-player capture: wrapper=%s candidates=%d deadline=%ds lane=%s priority=%s",
+                    req.wrapper_url, len(req.candidates), deadline, req.lane, req.priority)
         results = await asyncio.wait_for(
             nc.run_multi_player_capture(
                 tab, req.wrapper_url,
@@ -993,7 +1033,7 @@ async def capture_multi_player(req: MultiPlayerCaptureRequest):
         return {"ok": False, "error": str(e), "results": []}
     finally:
         await _close_tab_safely(tab)
-        _slots.release()
+        _slots.release(slot_key)
 
 
 class WatchTestRequest(BaseModel):
@@ -1013,7 +1053,7 @@ async def test_watch_channel(req: WatchTestRequest):
     network_capture.run_watch_test's docstring for the full motivation --
     real browser playback catches things Jellyfin/server-log checks miss."""
     deadline = req.duration_seconds + 45
-    await _slots.acquire(req.priority)
+    slot_key = await _slots.acquire("default", req.priority)
     tab = None
     try:
         browser = await _get_browser()
@@ -1035,15 +1075,15 @@ async def test_watch_channel(req: WatchTestRequest):
         return {"ok": False, "error": str(e), "channel_id": req.channel_id, "samples": []}
     finally:
         await _close_tab_safely(tab)
-        _slots.release()
+        _slots.release(slot_key)
 
 
 async def _close_relay_session(session_id: str):
     session = _relay_sessions.pop(session_id, None)
     if not session:
         return
-    for _ in range(session.get("reserved_slots", 0)):
-        _slots.release()
+    for key in session.get("reserved_slot_keys", []):
+        _slots.release(key)
     try:
         await asyncio.wait_for(rc.stop_relay(session["contexts"]), timeout=10.0)
     except Exception:
@@ -1070,14 +1110,15 @@ async def relay_start(req: RelayStartRequest):
     stays open and playing until /relay/{session_id}/stop is called or the
     idle sweeper decides nobody's polling it anymore.
 
-    Starting itself is NOT gated by the ephemeral-capture PrioritySemaphore
+    Starting itself is NOT gated by the ephemeral-capture LanedSlots
     (_slots) -- that's sized/tuned for short-lived captures that come and
     go in seconds; a relay session occupies a tab for the channel's whole
     runtime, a completely different resource-commitment shape. Gated by
     its own, much smaller cap (_RELAY_MAX_SESSIONS) instead. It DOES,
     however, reserve real capacity out of that same _slots pool once
-    running -- see _RELAY_RESERVED_TABS -- to protect it from CPU
-    contention with ephemeral captures sharing the same browser process."""
+    running -- one cell of each priority tier in the "default" lane -- to
+    protect it from CPU contention with ephemeral captures sharing the
+    same browser process."""
     async with _relay_sessions_lock:
         if len(_relay_sessions) + len(_relay_sessions_starting) >= _RELAY_MAX_SESSIONS:
             return {"ok": False, "error": f"relay session cap reached ({_RELAY_MAX_SESSIONS})"}
@@ -1122,23 +1163,29 @@ async def relay_start(req: RelayStartRequest):
         async with _relay_sessions_lock:
             _relay_sessions[session_id] = {"tab": tab, "contexts": result["contexts"],
                                             "started_at": now, "last_poll_at": now,
-                                            "reserved_slots": 0}
+                                            "reserved_slot_keys": []}
         logger.info("Relay session %s started (contexts=%d, click_log=%s)",
                     session_id, len(result["contexts"]), result.get("click_log"))
         # Reserve capacity out of the ephemeral-capture pool AFTER the
-        # session is already registered/playing -- see _RELAY_RESERVED_TABS.
-        # High priority so this jumps any already-queued background/low
-        # captures once slots free up, rather than waiting behind them
-        # indefinitely. Best-effort: playback already succeeded either way,
-        # this only affects how soon it's protected from future contention.
-        for _ in range(_RELAY_RESERVED_TABS):
-            await _slots.acquire(priority="high")
+        # session is already registered/playing. A relay session is a long-
+        # running 24/7-style channel (segment_sources.ContinuousRelaySource),
+        # not a live-event capture, so it reserves out of the "default" lane
+        # specifically -- one cell of EACH priority tier, since each cell
+        # only ever holds 1 slot (see LanedSlots) and reserving the same
+        # cell twice would just deadlock against itself. This leaves the
+        # live_event lane completely untouched by relay reservation -- a
+        # relay session protecting itself from ephemeral 24/7 contention
+        # should never cost live-sports capacity. Best-effort: playback
+        # already succeeded either way, this only affects how soon it's
+        # protected from future contention.
+        for tier in ("high", "low"):
+            key = await _slots.acquire("default", tier)
             async with _relay_sessions_lock:
                 s = _relay_sessions.get(session_id)
                 if s is None:  # stopped/swept already -- give the slot straight back
-                    _slots.release()
+                    _slots.release(key)
                     break
-                s["reserved_slots"] += 1
+                s["reserved_slot_keys"].append(key)
         return {"ok": True, "session_id": session_id, "click_log": result.get("click_log")}
     except Exception as e:
         logger.exception("Relay session %s start failed", session_id)
@@ -1268,7 +1315,7 @@ async def debug_sniff_network(req: SniffNetworkRequest):
     regardless of MATCH_PATTERNS/JSON_STREAM_PATTERNS (see
     relay_capture.sniff_network's docstring for why /capture itself can't
     already do this)."""
-    await _slots.acquire(req.priority)
+    slot_key = await _slots.acquire("default", req.priority)
     tab = None
     try:
         browser = await _get_browser()
@@ -1285,7 +1332,7 @@ async def debug_sniff_network(req: SniffNetworkRequest):
         return {"ok": False, "error": str(e), "results": []}
     finally:
         await _close_tab_safely(tab)
-        _slots.release()
+        _slots.release(slot_key)
 
 
 def _tracked_tabs_status() -> dict:
@@ -1303,7 +1350,7 @@ async def health():
     """Never hangs (fixed timeout on the probe) — any response, even a
     ready=False one, reads as "sidecar alive" to core's check_selenium()."""
     global _browser
-    reserved_total = sum(s.get("reserved_slots", 0) for s in _relay_sessions.values())
+    reserved_total = sum(len(s.get("reserved_slot_keys", [])) for s in _relay_sessions.values())
     relay_status = {"active": len(_relay_sessions), "starting": len(_relay_sessions_starting),
                      "cap": _RELAY_MAX_SESSIONS, "reserved_tab_slots": reserved_total}
     if _browser is None:
@@ -1330,7 +1377,7 @@ async def cookies_youtube():
     /cookies/youtube, confirmed load-bearing (core/youtube.py calls this).
     Uses its own ephemeral tab rather than main_tab, same reasoning as
     /capture (see module docstring)."""
-    await _slots.acquire("high")
+    slot_key = await _slots.acquire("default", "high")
     tab = None
     try:
         browser = await _get_browser()
@@ -1341,7 +1388,7 @@ async def cookies_youtube():
         return {"ok": False, "error": str(e)}
     finally:
         await _close_tab_safely(tab)
-        _slots.release()
+        _slots.release(slot_key)
 
     lines = ["# Netscape HTTP Cookie File"]
     for c in cookies:

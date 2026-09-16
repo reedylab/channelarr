@@ -206,6 +206,7 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
     source at all (nothing to do)."""
     from core.database import get_session as _get_session
     from core.models import Capture, Manifest
+    from core.models.channel import Channel
 
     native = _native_resolver()
     if native is None or not hasattr(native, "discover_all_players"):
@@ -218,9 +219,15 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
             .filter(Manifest.id == primary_manifest_id)
             .first()
         )
+        event_row = (
+            session.query(Channel.event_start, Channel.event_end)
+            .filter(Channel.id == channel_id)
+            .first()
+        )
     page_url = row[0] if row else None
     if not page_url:
         return None
+    lane = "live_event" if (event_row and (event_row[0] or event_row[1])) else "default"
 
     try:
         if not native.handles(page_url):
@@ -237,7 +244,7 @@ def discover_and_record(channel_id: str, primary_manifest_id: str, timeout: int 
         return None
 
     try:
-        results = native.discover_all_players(page_url, timeout)
+        results = native.discover_all_players(page_url, timeout, lane=lane)
     except Exception as e:
         logger.warning("[PLAYER-HEALTH] discovery failed for channel %s: %s", channel_id, e)
         return None
