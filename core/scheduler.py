@@ -38,6 +38,7 @@ TASK_NAMES = {
     "vpn_sampler": "VPN Latency Sampler",
     "vpn_auto_rotate": "VPN Auto-Rotate Check",
     "vpn_scheduled_rotate": "Scheduled VPN Rotate",
+    "schedule_regenerate": "Schedule Auto-Regenerate",
 }
 
 

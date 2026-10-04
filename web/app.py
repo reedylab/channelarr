@@ -16,7 +16,7 @@ from core.config import get_setting
 from core.logging_setup import setup_logging
 from core.bumps import BumpManager
 from core.media import MediaLibrary
-from core.channels import ChannelManager, materialize_schedule
+from core.channels import ChannelManager, materialize_schedule, materialize_all_channels
 from core.streamer import StreamerManager
 
 from web import shared_state
@@ -275,6 +275,28 @@ async def lifespan(app: FastAPI):
     from core.resolver.manifest_resolver import refresh_due_manifests
     add_job("manifest_refresh", refresh_due_manifests, seconds=60, max_instances=1)
     logging.info("[RESOLVER] Scheduled manifest refresh tick (60s interval)")
+
+    # Schedule auto-regenerate — rebuilds materialized_schedule for every
+    # "scheduled" channel from current media/YouTube state (new episodes,
+    # removed files, dead YouTube links) and re-exports M3U/XMLTV. Before
+    # this job existed, materialize_all_channels() only ran from a manual
+    # UI click (/api/schedule/regenerate) or at startup for channels with
+    # no schedule at all (_materialize_missing) — a channel that already
+    # had a schedule just kept it forever, which is how the 2026-04 build
+    # went 4+ months stale and caused the 2026-09-05 outage. Safe to run
+    # against live channels: StreamWorker re-reads materialized_schedule
+    # from channel_mgr on every loop restart (core/streamer.py), so this
+    # never needs to stop_all() the way the manual "hard" endpoint does.
+    def _schedule_regenerate_tick():
+        try:
+            materialize_all_channels(channel_mgr, bump_mgr, media_lib)
+            shared_state.regenerate_m3u()
+            logging.info("[SCHEDULE] Automatic regeneration complete")
+        except Exception as e:
+            logging.error("[SCHEDULE] Automatic regeneration failed: %s", e)
+
+    add_job("schedule_regenerate", _schedule_regenerate_tick, seconds=86400, max_instances=1)
+    logging.info("[SCHEDULE] Scheduled automatic schedule regeneration (daily)")
 
     # Player-health probe tick -- DISABLED 2026-09-16. This was a periodic
     # (120s) full re-discovery sweep across every TRACKED-but-not-live
